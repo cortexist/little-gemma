@@ -131,3 +131,7 @@ intermediate tensor): dequantization is bit-exact vs the `gguf` Python package;
 the forward pass matches an independent NumPy f32 reference and llama.cpp's logits
 (within the f32-vs-quantized-matmul gap); the tokenizer matches `llama-tokenize`
 exactly. `test/graph_test.c` (a CTest target) checks the graph kernels.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
