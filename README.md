@@ -37,6 +37,17 @@ cmake --build build --config Release
 
 Threading is via OpenMP (auto-detected by CMake); the matmul scales across cores.
 
+### CUDA build (optional)
+
+If the CUDA toolkit is found, CMake also builds a `run-cuda` target:
+
+```
+cmake --build build --config Release --target run-cuda
+```
+
+Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backend
+(`model-cuda.cu`) implement the same `model.h`; only the compute kernels differ.
+
 ## Usage
 
 The CLI is just two flags:
@@ -57,14 +68,19 @@ gen:    2 tokens in 1.48s (1.35 tok/s)
 
 ## On SIMD (AVX2) — intentionally not implemented
 
-The matmul is plain scalar C parallelized with OpenMP; there are **no hand-written
+The CPU matmul is plain scalar C parallelized with OpenMP; there are **no hand-written
 AVX2/FMA intrinsics**. This is deliberate. Hand-vectorizing the CPU kernels would
-be throwaway work, because the next step is **CUDA**: on the GPU the parallelism
+be throwaway work, because the real target is **CUDA**: on the GPU the parallelism
 comes from thousands of threads (replacing OpenMP) and the per-element math runs in
 kernels (replacing what SIMD would do). The weights are already stored quantized
 and unpacked inside the matmul — exactly the shape a GPU kernel wants — so the
-current `model.c` kernels (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
-double as the reference spec for the forthcoming `.cu` versions.
+CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
+double as the reference spec for the CUDA versions in `model-cuda.cu`.
+
+The CUDA backend is in progress. Milestone 1 (the matmul on the GPU, everything
+else still on the host) already runs the E2B model at **~8 tok/s vs ~1.3 on the
+CPU backend — about 6× — with a deliberately naive kernel**, so there is a lot of
+headroom (keep activations resident on the device, coalesce, fuse the dequant).
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -86,8 +102,8 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 6     | 1,498 | 109     | 221   | 1,828 |
-| include   | 5     | 205   | 81      | 55    | 341   |
+| src       | 8     | 1,951 | 147     | 277   | 2,375 |
+| include   | 5     | 209   | 84      | 57    | 350   |
 
 ## Validation
 
