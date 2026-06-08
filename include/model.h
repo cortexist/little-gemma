@@ -21,7 +21,7 @@ struct config {
     int   sliding_window;     // local-attention window
     int   n_embd_per_layer;   // per-layer-input embedding size (PLE)
     int   n_kv_start;         // layers [0, n_kv_start) own KV; later layers reuse
-    float rms_eps;            // RMSNorm epsilon
+    float rms_eps;            // RMS normalization epsilon
     float rope_freq_base;     // RoPE base on full layers
     float rope_freq_base_swa; // RoPE base on sliding-window layers
     float logit_softcap;      // final logit soft-cap (0 if none)

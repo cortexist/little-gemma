@@ -337,7 +337,7 @@ static float *build_per_layer(struct model *m, int token, const float *inp_scale
     float pscale = 1.0f / sqrtf((float)c->n_embd);
     for (int64_t i = 0; i < total; i++) proj[i] *= pscale;
 
-    // RMSNorm each per-layer slice, then combine: (proj + tok) / sqrt(2)
+    // RMS normalization each per-layer slice, then combine: (proj + tok) / sqrt(2)
     const float *pn = fptr(m, "per_layer_proj_norm.weight");
     for (int L = 0; L < c->n_layer; L++) rmsnorm(proj + L * ple, proj + L * ple, pn, ple, c->rms_eps);
     float inv_sqrt2 = 1.0f / sqrtf(2.0f);

@@ -7,34 +7,28 @@ written to *teach* how a modern LLM actually executes, in the spirit of Karpathy
 It is a complete pipeline: parse GGUF → BPE tokenize → run the transformer →
 generate text. Every stage was validated bit-for-bit against `llama.cpp`.
 
-```
-text ──▶ tokenizer ──▶ token ids ──▶ model_forward ──▶ logits ──▶ argmax ──▶ next token
-                          ▲                                                     │
-                          └──────────────────── append, repeat ◀───────────────┘
+```mermaid
+flowchart LR
+    T["text"] --> TK["tokenizer"] --> ID["token ids"] --> F["model_forward"]
+    F --> L["logits"] --> A["argmax"] --> N["next token"]
+    N -- "append, repeat" --> F
 ```
 
 ## Architecture
 
-```
-                          ┌──────────────┐
-                          │    run.c     │   CLI: -m <model> [-p "prompt"]
-                          └──────┬───────┘
-             ┌───────────────────┼────────────────────┐
-             ▼                   ▼                     ▼
-     ┌───────────────┐   ┌───────────────┐    ┌────────────────┐
-     │  tokenizer.c  │   │   model.c     │    │    gguf.c      │
-     │  BPE text↔ids │   │ config+forward│    │ parse → ctx    │
-     └───────────────┘   └──────┬────────┘    │ (hdr, kv,      │
-                                │             │  tensors, data)│
-                                ▼             └────────┬───────┘
-                        ┌───────────────┐              │ borrows
-                        │   quant.c     │◀─────────────┘ quantized
-                        │ dequantize    │  weights
-                        │ q3_K/q4_K/... │
-                        └───────────────┘
-
-     graph.c — a minimal tensor/graph layer (matmul, rmsnorm, softmax, …)
-               kept as the "what a compute graph is" teaching reference.
+```mermaid
+flowchart TD
+    run["run.c<br/>CLI: -m model, -p prompt"]
+    tok["tokenizer.c<br/>BPE text ↔ ids"]
+    model["model.c<br/>config + forward"]
+    gguf["gguf.c<br/>parse → ctx (header, kv, tensors, data)"]
+    quant["quant.c<br/>dequantize q3_K / q4_K / …"]
+    model_graph["graph.c<br/>minimal tensor/graph layer —<br/>'what a compute graph is' teaching reference"]
+    run --> tok
+    run --> model
+    run --> gguf
+    model --> quant
+    gguf -. quantized weights .-> quant
 ```
 
 **Layering:** GGUF/ggml jargon stays in the lower layers (`gguf.c`, `quant.c`);
@@ -44,17 +38,20 @@ quantized there, and each weight row is unpacked to f32 on the fly during matmul
 
 ### What `model_forward` computes (Gemma 4 / E2B)
 
-```
-embed(token) × √d
-for each of 35 layers:
-    ├─ attention:  RMSNorm → Q,K,V → per-head Q/K-norm → NeoX RoPE
-    │              → GQA (8 q-heads, 1 kv-head) with sliding-window OR global mask
-    │              → KV cache (layers ≥15 reuse an earlier layer's KV)
-    │              → output proj → post-norm → residual
-    ├─ feed-forward (GeGLU):  RMSNorm → gelu(gate)·up → down → post-norm → residual
-    │              (elastic FFN: width 6144 for layers 0–14, 12288 for 15–34)
-    └─ per-layer input (PLE) + per-layer output scale
-final RMSNorm → tied logits (× token_embd) → softcap
+```mermaid
+flowchart TD
+    E["embed(token) × √d"] --> B
+    subgraph B["per layer (× N)"]
+        direction TB
+        AN["RMSNorm"] --> QKV["Q, K, V → per-head Q/K-norm → NeoX RoPE"]
+        QKV --> ATT["GQA attention<br/>sliding-window OR global mask<br/>KV cache (later layers reuse earlier KV)"]
+        ATT --> AO["output proj → post-norm → + residual"]
+        AO --> FN["RMSNorm"]
+        FN --> FF["feed-forward (GeGLU): gelu(gate)·up → down<br/>→ post-norm → + residual (elastic FFN)"]
+        FF --> PLE["per-layer input (PLE) + output scale"]
+    end
+    B --> FNL["final RMSNorm"]
+    FNL --> LOG["tied logits (× token_embd) → softcap"]
 ```
 
 ## How to Build
