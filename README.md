@@ -7,29 +7,11 @@ written to *teach* how a modern LLM actually executes, in the spirit of Karpathy
 It is a complete pipeline: parse GGUF → BPE tokenize → run the transformer →
 generate text. Every stage was validated bit-for-bit against `llama.cpp`.
 
-```mermaid
-flowchart LR
-    T["text"] --> TK["tokenizer"] --> ID["token ids"] --> F["model_forward"]
-    F --> L["logits"] --> A["argmax"] --> N["next token"]
-    N -- "append, repeat" --> F
-```
+!["parse GGUF → BPE tokenize → run the transformer → generate text"](media/pipeline.svg)
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    run["run.c<br/>CLI: -m model, -p prompt"]
-    tok["tokenizer.c<br/>BPE text ↔ ids"]
-    model["model.c<br/>config + forward"]
-    gguf["gguf.c<br/>parse → ctx (header, kv, tensors, data)"]
-    quant["quant.c<br/>dequantize q3_K / q4_K / …"]
-    model_graph["graph.c<br/>minimal tensor/graph layer —<br/>'what a compute graph is' teaching reference"]
-    run --> tok
-    run --> model
-    run --> gguf
-    model --> quant
-    gguf -. quantized weights .-> quant
-```
+!["architecture"](media/architecture.svg)
 
 **Layering:** GGUF/ggml jargon stays in the lower layers (`gguf.c`, `quant.c`);
 the model layer (`model.c`) reads like plain transformer code. The file is read
@@ -38,21 +20,7 @@ quantized there, and each weight row is unpacked to f32 on the fly during matmul
 
 ### What `model_forward` computes (Gemma 4 / E2B)
 
-```mermaid
-flowchart TD
-    E["embed(token) × √d"] --> B
-    subgraph B["per layer (× N)"]
-        direction TB
-        AN["RMSNorm"] --> QKV["Q, K, V → per-head Q/K-norm → NeoX RoPE"]
-        QKV --> ATT["GQA attention<br/>sliding-window OR global mask<br/>KV cache (later layers reuse earlier KV)"]
-        ATT --> AO["output proj → post-norm → + residual"]
-        AO --> FN["RMSNorm"]
-        FN --> FF["feed-forward (GeGLU): gelu(gate)·up → down<br/>→ post-norm → + residual (elastic FFN)"]
-        FF --> PLE["per-layer input (PLE) + output scale"]
-    end
-    B --> FNL["final RMSNorm"]
-    FNL --> LOG["tied logits (× token_embd) → softcap"]
-```
+!["forward"](media/forward.svg)
 
 ## How to Build
 
