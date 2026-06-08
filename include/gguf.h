@@ -108,4 +108,17 @@ void gguf_set_max_data_bytes(size_t max_bytes);
 // Print a human-readable summary of a parsed context.
 void gguf_dump(const struct gguf_context *ctx);
 
+// ---- lookup ---------------------------------------------------------------
+
+// Find a metadata pair / tensor by name. NULL if absent.
+const struct gguf_kv     *gguf_find_kv(const struct gguf_context *ctx, const char *key);
+const struct gguf_tensor *gguf_find_tensor(const struct gguf_context *ctx, const char *name);
+
+// Typed metadata accessors. Return `fallback` if the key is missing or the value
+// is not (convertible to) the requested type. Integer getters accept UINT32/INT32.
+uint32_t    gguf_get_u32(const struct gguf_context *ctx, const char *key, uint32_t fallback);
+int32_t     gguf_get_i32(const struct gguf_context *ctx, const char *key, int32_t fallback);
+float       gguf_get_f32(const struct gguf_context *ctx, const char *key, float fallback);
+const char *gguf_get_str(const struct gguf_context *ctx, const char *key, const char *fallback);
+
 #endif // GGUF_H

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "gguf.h"
+#include "quant.h"  // ggml_type_name / ggml_nbytes for the tensor dump
 
 // ---- platform helpers: 64-bit file size/seek and available memory ---------
 
@@ -463,11 +464,58 @@ void gguf_dump(const struct gguf_context *ctx) {
             if (d) printf(", ");
             printf("%llu", (unsigned long long)t->dims[d]);
         }
-        printf("] | type=%s | offset=%llu", gguf_type_name(t->type), (unsigned long long)t->offset);
-        if (t->data) {
-            const unsigned char *b = t->data;   // touch the mapping (first 4 bytes)
-            printf(" | data[0..3]=%02x %02x %02x %02x", b[0], b[1], b[2], b[3]);
-        }
-        printf("\n");
+        int64_t n = 1;
+        for (uint32_t d = 0; d < t->n_dims; d++) n *= (int64_t)t->dims[d];
+        printf("] | type=%s | offset=%llu | nbytes=%zu\n",
+               ggml_type_name(t->type), (unsigned long long)t->offset,
+               ggml_nbytes(t->type, n));
     }
+}
+
+// ---- lookup ---------------------------------------------------------------
+
+const struct gguf_kv *gguf_find_kv(const struct gguf_context *ctx, const char *key) {
+    for (uint64_t i = 0; i < ctx->header.num_kv; i++) {
+        if (strcmp(ctx->kv[i].key, key) == 0) return &ctx->kv[i];
+    }
+    return NULL;
+}
+
+const struct gguf_tensor *gguf_find_tensor(const struct gguf_context *ctx, const char *name) {
+    for (uint64_t i = 0; i < ctx->header.num_tensors; i++) {
+        if (strcmp(ctx->tensors[i].name, name) == 0) return &ctx->tensors[i];
+    }
+    return NULL;
+}
+
+uint32_t gguf_get_u32(const struct gguf_context *ctx, const char *key, uint32_t fallback) {
+    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
+    if (!kv) return fallback;
+    switch (kv->type) {
+        case GGUF_TYPE_UINT32: return kv->value.u32;
+        case GGUF_TYPE_INT32:  return (uint32_t)kv->value.i32;
+        default:               return fallback;
+    }
+}
+
+int32_t gguf_get_i32(const struct gguf_context *ctx, const char *key, int32_t fallback) {
+    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
+    if (!kv) return fallback;
+    switch (kv->type) {
+        case GGUF_TYPE_INT32:  return kv->value.i32;
+        case GGUF_TYPE_UINT32: return (int32_t)kv->value.u32;
+        default:               return fallback;
+    }
+}
+
+float gguf_get_f32(const struct gguf_context *ctx, const char *key, float fallback) {
+    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
+    if (!kv || kv->type != GGUF_TYPE_FLOAT32) return fallback;
+    return kv->value.f32;
+}
+
+const char *gguf_get_str(const struct gguf_context *ctx, const char *key, const char *fallback) {
+    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
+    if (!kv || kv->type != GGUF_TYPE_STRING) return fallback;
+    return kv->value.str;
 }
