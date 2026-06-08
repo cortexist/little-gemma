@@ -77,10 +77,22 @@ and unpacked inside the matmul — exactly the shape a GPU kernel wants — so t
 CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
 double as the reference spec for the CUDA versions in `model-cuda.cu`.
 
-The CUDA backend is in progress. Milestone 1 (the matmul on the GPU, everything
-else still on the host) already runs the E2B model at **~8 tok/s vs ~1.3 on the
-CPU backend — about 6× — with a deliberately naive kernel**, so there is a lot of
-headroom (keep activations resident on the device, coalesce, fuse the dequant).
+The CUDA backend runs the whole forward on the GPU with activations resident in
+VRAM; the matmul uses one warp per output row with the lanes cooperating on each
+quantized block (dequant fused into the dot), output byte-identical to the CPU.
+
+Decode throughput (single token, all layers on GPU):
+
+| model | little-gemma CUDA | llama.cpp CUDA | from CPU backend |
+|-------|------------------:|---------------:|-----------------:|
+| E2B   | ~36 tok/s         | ~146 tok/s     | ~28× (1.3 → 36)  |
+| 12B   | ~16 tok/s         | ~64 tok/s      | ~50×             |
+
+So the GPU port is ~28–50× over the CPU backend and lands within ~4× of
+llama.cpp's heavily-optimized CUDA kernels. The remaining gap is understood —
+an int8-quantized activation with an integer dot, CUDA-graph capture to remove
+per-kernel launch overhead, and tighter memory coalescing — and is left as future
+work for this teaching project.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 

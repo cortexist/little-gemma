@@ -1,7 +1,7 @@
-// CUDA compute backend — milestone 1: matmul_q runs on the GPU (the quantized
-// weight blob lives in VRAM; a kernel unpacks each row and dots it). The other
-// ops stay on the host for now, matching model-cpu.c so results can be compared.
-// Same model.h interface as the CPU backend; model.c provides the host setup.
+// CUDA compute backend — milestone 2: the whole forward runs on the GPU with
+// activations resident in VRAM. Only two host<->device copies remain per token
+// (the dequantized embedding row down, the logits up). The KV cache lives on the
+// device. Same model.h interface as model-cpu.c; model.c provides host setup.
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +18,8 @@ extern "C" {
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
     exit(1); } } while (0)
+
+static inline int gridn(int n) { return (n + 255) / 256; }
 
 // ====================  device-side dequantization  =========================
 // One block per call, mirroring the host kernels in quant.c.
@@ -47,108 +49,175 @@ __device__ static void d_gsm(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     else { *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4); }
 }
 
-__device__ static void d_dq_q4_K(const block_q4_K *x, float *y) {
-    float d = d_fp16(x->d), mn = d_fp16(x->dmin);
-    const uint8_t *q = x->qs; int is = 0;
-    for (int j = 0; j < QK_K; j += 64) {
-        uint8_t sc, m; d_gsm(is + 0, x->scales, &sc, &m); float d1 = d * sc, m1 = mn * m;
-        d_gsm(is + 1, x->scales, &sc, &m); float d2 = d * sc, m2 = mn * m;
-        for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
-        for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4)  - m2;
-        q += 32; is += 2;
+// Accumulate one block's contribution to the dot product: each of the 32 lanes
+// handles elements {lane, lane+32, ...} of the block. The per-block scale factors
+// are computed once (here), and the dequant is fused into the multiply by x — so
+// every lane stays busy and there is no per-row scratch buffer. The per-element
+// index math is derived from the sequential layouts in quant.c.
+
+__device__ static void dot_block_q4_K(const block_q4_K *p, int lane, const float *xb, float &s) {
+    float d = d_fp16(p->d), mn = d_fp16(p->dmin);
+    for (int e = lane; e < QK_K; e += 32) {
+        int g = e >> 6, pp = e & 63, is = 2 * g + (pp >= 32 ? 1 : 0);
+        uint8_t sc, m; d_gsm(is, p->scales, &sc, &m);
+        int qi = (g << 5) + (pp & 31);
+        int q = (pp < 32) ? (p->qs[qi] & 0xF) : (p->qs[qi] >> 4);
+        s += (d * sc * q - mn * m) * xb[e];
     }
 }
-__device__ static void d_dq_q5_K(const block_q5_K *x, float *y) {
-    float d = d_fp16(x->d), mn = d_fp16(x->dmin);
-    const uint8_t *ql = x->qs, *qh = x->qh; int is = 0; uint8_t u1 = 1, u2 = 2;
-    for (int j = 0; j < QK_K; j += 64) {
-        uint8_t sc, m; d_gsm(is + 0, x->scales, &sc, &m); float d1 = d * sc, m1 = mn * m;
-        d_gsm(is + 1, x->scales, &sc, &m); float d2 = d * sc, m2 = mn * m;
-        for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
-        for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2;
-        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+__device__ static void dot_block_q5_K(const block_q5_K *p, int lane, const float *xb, float &s) {
+    float d = d_fp16(p->d), mn = d_fp16(p->dmin);
+    for (int e = lane; e < QK_K; e += 32) {
+        int g = e >> 6, pp = e & 63, pos = pp & 31, is = 2 * g + (pp >= 32 ? 1 : 0);
+        uint8_t sc, m; d_gsm(is, p->scales, &sc, &m);
+        int lo = pp < 32, q = lo ? (p->qs[(g << 5) + pos] & 0xF) : (p->qs[(g << 5) + pos] >> 4);
+        int bit = lo ? (1 << (2 * g)) : (2 << (2 * g));
+        int hi = (p->qh[pos] & bit) ? 16 : 0;
+        s += (d * sc * (q + hi) - mn * m) * xb[e];
     }
 }
-__device__ static void d_dq_q3_K(const block_q3_K *x, float *y) {
+__device__ static void dot_block_q3_K(const block_q3_K *p, int lane, const float *xb, float &s) {
     const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
     uint32_t aux[4]; const int8_t *scales = (const int8_t *)aux;
-    float d_all = d_fp16(x->d); const uint8_t *q = x->qs, *hm = x->hmask; uint8_t m = 1;
-    memcpy(aux, x->scales, 12);
+    memcpy(aux, p->scales, 12);
     uint32_t tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
     aux[0] = ((aux[0] >> 0) & kmask2) | (((tmp >> 0) & kmask1) << 4);
     aux[1] = ((aux[1] >> 0) & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    int is = 0;
-    for (int n = 0; n < QK_K; n += 128) {
-        int shift = 0;
-        for (int j = 0; j < 4; ++j) {
-            float dl = d_all * (scales[is++] - 32);
-            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-            dl = d_all * (scales[is++] - 32);
-            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
-            shift += 2; m <<= 1;
-        }
-        q += 32;
+    float d_all = d_fp16(p->d);
+    for (int e = lane; e < QK_K; e += 32) {
+        int ni = e >> 7, within = e & 127, j = within >> 5, w2 = within & 31, half = w2 >> 4, l = w2 & 15;
+        int is = ni * 8 + j * 2 + half, shift = 2 * j;
+        uint8_t m = (uint8_t)(1u << (ni * 4 + j));
+        int qv = (int)((int8_t)((p->qs[ni * 32 + half * 16 + l] >> shift) & 3)) - ((p->hmask[half * 16 + l] & m) ? 0 : 4);
+        s += (d_all * (scales[is] - 32) * qv) * xb[e];
     }
 }
-__device__ static void d_dq_q6_K(const block_q6_K *x, float *y) {
-    float d = d_fp16(x->d); const uint8_t *ql = x->ql, *qh = x->qh; const int8_t *sc = x->scales;
-    for (int n = 0; n < QK_K; n += 128) {
-        for (int l = 0; l < 32; ++l) {
-            int is = l / 16;
-            int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-            int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-            int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-            y[l +  0] = d * sc[is + 0] * q1; y[l + 32] = d * sc[is + 2] * q2;
-            y[l + 64] = d * sc[is + 4] * q3; y[l + 96] = d * sc[is + 6] * q4;
-        }
-        y += 128; ql += 64; qh += 32; sc += 8;
+__device__ static void dot_block_q6_K(const block_q6_K *p, int lane, const float *xb, float &s) {
+    float d = d_fp16(p->d);
+    for (int e = lane; e < QK_K; e += 32) {
+        int ni = e >> 7, within = e & 127, grp = within >> 5, l = within & 31, is = l >> 4;
+        const uint8_t *ql = p->ql + ni * 64, *qh = p->qh + ni * 32;
+        const int8_t *sc = p->scales + ni * 8;
+        int qlo, sh, scoff;
+        if (grp == 0)      { qlo = ql[l] & 0xF;      sh = 0; scoff = 0; }
+        else if (grp == 1) { qlo = ql[l + 32] & 0xF; sh = 2; scoff = 2; }
+        else if (grp == 2) { qlo = ql[l] >> 4;       sh = 4; scoff = 4; }
+        else               { qlo = ql[l + 32] >> 4;  sh = 6; scoff = 6; }
+        int q = (int)((int8_t)(qlo | (((qh[l] >> sh) & 3) << 4))) - 32;
+        s += (d * sc[is + scoff] * q) * xb[e];
     }
 }
-__device__ static void d_dq_q8_0(const block_q8_0 *x, float *y) {
-    float d = d_fp16(x->d);
-    for (int l = 0; l < 32; ++l) *y++ = d * x->qs[l];
+__device__ static void dot_block_q8_0(const block_q8_0 *p, int lane, const float *xb, float &s) {
+    float d = d_fp16(p->d);
+    for (int e = lane; e < 32; e += 32) s += (d * p->qs[e]) * xb[e];
 }
 
-__device__ static void d_dequant_block(int type, const unsigned char *src, float *buf) {
-    switch (type) {
-        case GGML_TYPE_F32:  buf[0] = *(const float *)src; break;
-        case GGML_TYPE_F16:  buf[0] = d_fp16(*(const uint16_t *)src); break;
-        case GGML_TYPE_BF16: buf[0] = d_bf16(*(const uint16_t *)src); break;
-        case GGML_TYPE_Q8_0: d_dq_q8_0((const block_q8_0 *)src, buf); break;
-        case GGML_TYPE_Q3_K: d_dq_q3_K((const block_q3_K *)src, buf); break;
-        case GGML_TYPE_Q4_K: d_dq_q4_K((const block_q4_K *)src, buf); break;
-        case GGML_TYPE_Q5_K: d_dq_q5_K((const block_q5_K *)src, buf); break;
-        case GGML_TYPE_Q6_K: d_dq_q6_K((const block_q6_K *)src, buf); break;
-    }
-}
+// ====================  compute kernels  ====================================
 
-// ====================  matmul kernel + host wrapper  =======================
-
-// One thread per output row: dequantize the row block-by-block, dot with x.
+// out[i] = W[i,:] . x : one WARP per output row. The whole warp cooperates on
+// each block (32 lanes share its elements), fusing dequant into the dot, then a
+// shuffle reduction. All lanes stay busy regardless of how many blocks the row
+// has, and there is no per-lane scratch buffer.
 __global__ static void matmul_q_kernel(float *out, const unsigned char *wbase,
                                        int type, int ts, int blck, const float *x, int k, int m) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m) return;
-    const unsigned char *row = wbase + (size_t)i * (k / blck) * ts;
-    float buf[QK_K];
-    float s = 0.0f;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= m) return;
+    const unsigned char *row = wbase + (size_t)warp * (k / blck) * ts;
     int nb = k / blck;
+    float s = 0.0f;
     for (int b = 0; b < nb; b++) {
-        d_dequant_block(type, row + (size_t)b * ts, buf);
-        const float *xb = x + b * blck;
-        for (int j = 0; j < blck; j++) s += buf[j] * xb[j];
+        const unsigned char *blk = row + (size_t)b * ts;
+        const float *xb = x + (size_t)b * blck;
+        switch (type) {
+            case GGML_TYPE_Q4_K: dot_block_q4_K((const block_q4_K *)blk, lane, xb, s); break;
+            case GGML_TYPE_Q3_K: dot_block_q3_K((const block_q3_K *)blk, lane, xb, s); break;
+            case GGML_TYPE_Q5_K: dot_block_q5_K((const block_q5_K *)blk, lane, xb, s); break;
+            case GGML_TYPE_Q6_K: dot_block_q6_K((const block_q6_K *)blk, lane, xb, s); break;
+            case GGML_TYPE_Q8_0: dot_block_q8_0((const block_q8_0 *)blk, lane, xb, s); break;
+            case GGML_TYPE_F32:  if (lane == 0) s += (*(const float *)blk) * xb[0]; break;
+            case GGML_TYPE_BF16: if (lane == 0) s += d_bf16(*(const uint16_t *)blk) * xb[0]; break;
+            case GGML_TYPE_F16:  if (lane == 0) s += d_fp16(*(const uint16_t *)blk) * xb[0]; break;
+        }
     }
-    out[i] = s;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) out[warp] = s;
 }
 
-// Device copy of the quantized weight blob, plus reusable activation buffers.
+// RMSNorm over `rows` vectors of length n. w (length n, shared across rows) or NULL.
+// One block (256 threads) per row.
+__global__ static void rmsnorm_kernel(float *out, const float *x, const float *w, int n, float eps) {
+    int row = blockIdx.x;
+    const float *xr = x + (size_t)row * n;
+    float *outr = out + (size_t)row * n;
+    __shared__ float sh[256];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
+    float scale = rsqrtf(sh[0] / (float)n + eps);
+    if (w) for (int i = threadIdx.x; i < n; i += blockDim.x) outr[i] = xr[i] * scale * w[i];
+    else   for (int i = threadIdx.x; i < n; i += blockDim.x) outr[i] = xr[i] * scale;
+}
+
+// GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
+__global__ static void rope_kernel(float *v, int half, int hd, int pos, float base, const float *ff, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int head = idx / half, i = idx % half;
+    float *vh = v + (size_t)head * hd;
+    float freq = powf(base, -2.0f * (float)i / (float)hd);
+    float ang = (float)pos * freq / (ff ? ff[i] : 1.0f);
+    float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
+    vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
+}
+
+// Attention for the current query position: one block per query head.
+// Shared memory holds the (pos-start+1) attention scores. Scale is 1.0 (Gemma4).
+__global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
+                                   int hd, int kv_dim, int gqa, int start, int pos) {
+    int hh = blockIdx.x, kvh = hh / gqa;
+    const float *qh = q + (size_t)hh * hd;
+    int T = pos - start + 1;
+    extern __shared__ float att[];
+    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+        const float *kt = Kc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
+        float s = 0.0f; for (int i = 0; i < hd; i++) s += qh[i] * kt[i];
+        att[t] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mx = att[0]; for (int t = 1; t < T; t++) if (att[t] > mx) mx = att[t];
+        float sum = 0.0f; for (int t = 0; t < T; t++) { att[t] = expf(att[t] - mx); sum += att[t]; }
+        float inv = 1.0f / sum; for (int t = 0; t < T; t++) att[t] *= inv;
+    }
+    __syncthreads();
+    float *outh = xb + (size_t)hh * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < T; t++) { const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd; acc += att[t] * vt[i]; }
+        outh[i] = acc;
+    }
+}
+
+__device__ static float d_gelu(float x) {
+    const float k = 0.7978845608028654f;
+    return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
+}
+__global__ static void add_kernel(float *a, const float *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
+__global__ static void geglu_kernel(float *g, const float *u, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] = d_gelu(g[i]) * u[i]; }
+__global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
+__global__ static void scale_ptr_kernel(float *a, const float *s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s[0]; }
+__global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
+__global__ static void softcap_kernel(float *l, float sc, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) l[i] = sc * tanhf(l[i] / sc); }
+
+// ====================  device state: weights + scratch  =====================
+
 static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
-static float *d_x = NULL, *d_out = NULL;
-static int d_x_cap = 0, d_out_cap = 0;
 
 static void ensure_weights(struct model *m) {
     if (d_blob) return;
@@ -156,244 +225,201 @@ static void ensure_weights(struct model *m) {
     CUDA_CHECK(cudaMalloc(&d_blob, m->ctx->data_size));
     CUDA_CHECK(cudaMemcpy(d_blob, m->ctx->data, m->ctx->data_size, cudaMemcpyHostToDevice));
 }
-
 static const unsigned char *dev_weight(const struct gguf_tensor *t) {
-    size_t off = (const unsigned char *)t->data - (const unsigned char *)g_ctx->data;
-    return d_blob + off;
+    return d_blob + ((const unsigned char *)t->data - (const unsigned char *)g_ctx->data);
 }
-
-static void matmul_q(float *out, const struct gguf_tensor *t, const float *x, int k, int m) {
-    if (k > d_x_cap)   { cudaFree(d_x);   CUDA_CHECK(cudaMalloc(&d_x,   (size_t)k * sizeof(float))); d_x_cap = k; }
-    if (m > d_out_cap) { cudaFree(d_out); CUDA_CHECK(cudaMalloc(&d_out, (size_t)m * sizeof(float))); d_out_cap = m; }
-    CUDA_CHECK(cudaMemcpy(d_x, x, (size_t)k * sizeof(float), cudaMemcpyHostToDevice));
-    int blck = ggml_blck_size(t->type), ts = (int)ggml_type_size(t->type);
-    int threads = 256, blocks = (m + threads - 1) / threads;
-    matmul_q_kernel<<<blocks, threads>>>(d_out, dev_weight(t), (int)t->type, ts, blck, d_x, k, m);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpy(out, d_out, (size_t)m * sizeof(float), cudaMemcpyDeviceToHost));
+// Device pointer to an f32 norm/scale weight, or NULL if the tensor is absent.
+static const float *dW(struct model *m, const char *name) {
+    const struct gguf_tensor *t = gguf_find_tensor(m->ctx, name);
+    return t ? (const float *)dev_weight(t) : NULL;
 }
-
-// ====================  host kernels (unchanged from CPU)  ===================
-
-static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
-    float ss = 0.0f; for (int i = 0; i < n; i++) ss += x[i] * x[i];
-    float s = 1.0f / sqrtf(ss / (float)n + eps);
-    for (int i = 0; i < n; i++) out[i] = x[i] * s * w[i];
+static const float *dW_layer(struct model *m, int L, const char *suffix) {
+    char nm[96]; snprintf(nm, sizeof nm, "blk.%d.%s", L, suffix);
+    return dW(m, nm);
 }
-static void rope_neox(float *v, int d, int pos, float base, const float *ff) {
-    int half = d / 2;
-    for (int i = 0; i < half; i++) {
-        float freq = powf(base, -2.0f * (float)i / (float)d);
-        float ang = (float)pos * freq / (ff ? ff[i] : 1.0f);
-        float c = cosf(ang), s = sinf(ang), a = v[i], b = v[i + half];
-        v[i] = a * c - b * s; v[i + half] = a * s + b * c;
-    }
-}
-static void rmsnorm_plain(float *out, const float *x, int n, float eps) {
-    float ss = 0.0f; for (int i = 0; i < n; i++) ss += x[i] * x[i];
-    float s = 1.0f / sqrtf(ss / (float)n + eps);
-    for (int i = 0; i < n; i++) out[i] = x[i] * s;
-}
-static float gelu(float x) {
-    const float k = 0.7978845608028654f;
-    return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
-}
-static void softmax(float *x, int n) {
-    float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
-    float sum = 0.0f; for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); sum += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= sum;
-}
-
-// ====================  weight access / geometry (host)  =====================
-
 static const struct gguf_tensor *wq(struct model *m, const char *name) { return gguf_find_tensor(m->ctx, name); }
 static const struct gguf_tensor *wq_layer(struct model *m, int L, const char *suffix) {
-    char name[96]; snprintf(name, sizeof name, "blk.%d.%s", L, suffix);
-    return gguf_find_tensor(m->ctx, name);
+    char nm[96]; snprintf(nm, sizeof nm, "blk.%d.%s", L, suffix);
+    return gguf_find_tensor(m->ctx, nm);
 }
-static const float *fptr(struct model *m, const char *name) {
-    const struct gguf_tensor *t = gguf_find_tensor(m->ctx, name);
-    return t ? (const float *)t->data : NULL;
-}
-static const float *fptr_layer(struct model *m, int L, const char *suffix) {
-    char name[96]; snprintf(name, sizeof name, "blk.%d.%s", L, suffix);
-    return fptr(m, name);
-}
-static int head_dim_at(const struct model *m, int L) { return m->head_dim[L]; }
-static int kv_src(const struct model *m, int L) {
+
+// Which layer's KV layer L uses (KV sharing): own for [0,n_kv_start), else reuse
+// the last same-type KV layer (local -> n_kv_start-2, global -> n_kv_start-1).
+static int kv_src_dev(const struct model *m, int L) {
     const struct config *c = &m->cfg;
     if (L < c->n_kv_start) return L;
     return c->n_kv_start - (m->is_local[L] ? 2 : 1);
 }
 
-// ====================  kv cache (host buffers)  =============================
+// Resident device activation scratch (allocated once, reused across tokens).
+static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
+static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
+static int scratch_ok = 0;
+
+static void ensure_scratch(struct model *m) {
+    if (scratch_ok) return;
+    const struct config *c = &m->cfg;
+    int maxhd = 0, maxkv = 0;
+    for (int L = 0; L < c->n_layer; L++) {
+        if (m->head_dim[L] > maxhd) maxhd = m->head_dim[L];
+        int kvd = m->n_head_kv[L] * m->head_dim[L];
+        if (kvd > maxkv) maxkv = kvd;
+    }
+    int q_max = c->n_head * maxhd, ne = c->n_embd, nff = c->n_ff, ple = c->n_embd_per_layer;
+    CUDA_CHECK(cudaMalloc(&dx,  (size_t)ne   * 4)); CUDA_CHECK(cudaMalloc(&dh,  (size_t)ne   * 4));
+    CUDA_CHECK(cudaMalloc(&dout,(size_t)ne   * 4)); CUDA_CHECK(cudaMalloc(&dq,  (size_t)q_max * 4));
+    CUDA_CHECK(cudaMalloc(&dxb, (size_t)q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, (size_t)maxkv * 4));
+    CUDA_CHECK(cudaMalloc(&dvb, (size_t)maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, (size_t)nff * 4));
+    CUDA_CHECK(cudaMalloc(&dg2, (size_t)nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
+    if (ple > 0) {
+        size_t total = (size_t)ple * c->n_layer;
+        CUDA_CHECK(cudaMalloc(&dpg,   (size_t)ple * 4));
+        CUDA_CHECK(cudaMalloc(&d_ipl, total * 4));
+        CUDA_CHECK(cudaMalloc(&d_tok, total * 4));
+        CUDA_CHECK(cudaMalloc(&d_proj,total * 4));
+    }
+    scratch_ok = 1;
+}
+
+// d_out[m] = W . d_x with W quantized (all device pointers). One warp per row,
+// so 256 threads/block handle 8 rows.
+static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    int blck = ggml_blck_size(t->type), ts = (int)ggml_type_size(t->type);
+    int rows_per_block = 256 / 32;
+    int blocks = (m + rows_per_block - 1) / rows_per_block;
+    matmul_q_kernel<<<blocks, 256>>>(d_out, dev_weight(t), (int)t->type, ts, blck, d_x, k, m);
+}
+
+// ====================  kv cache (device buffers)  ===========================
 
 extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer; kv->max_seq = max_seq;
     kv->kv_dim = (int *)calloc((size_t)c->n_layer, sizeof(int));
-    kv->k = (float **)calloc((size_t)c->n_layer, sizeof(float *));
+    kv->k = (float **)calloc((size_t)c->n_layer, sizeof(float *));  // host array of device ptrs
     kv->v = (float **)calloc((size_t)c->n_layer, sizeof(float *));
     if (!kv->kv_dim || !kv->k || !kv->v) return -1;
     for (int L = 0; L < c->n_layer; L++) {
-        kv->kv_dim[L] = m->n_head_kv[L] * head_dim_at(m, L);
-        size_t n = (size_t)max_seq * kv->kv_dim[L];
-        kv->k[L] = (float *)calloc(n, sizeof(float));
-        kv->v[L] = (float *)calloc(n, sizeof(float));
-        if (!kv->k[L] || !kv->v[L]) return -1;
+        kv->kv_dim[L] = m->n_head_kv[L] * m->head_dim[L];
+        size_t bytes = (size_t)max_seq * kv->kv_dim[L] * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&kv->k[L], bytes)); CUDA_CHECK(cudaMemset(kv->k[L], 0, bytes));
+        CUDA_CHECK(cudaMalloc(&kv->v[L], bytes)); CUDA_CHECK(cudaMemset(kv->v[L], 0, bytes));
     }
     return 0;
 }
 extern "C" void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
-    for (int L = 0; L < kv->n_layer; L++) { free(kv->k[L]); free(kv->v[L]); }
+    for (int L = 0; L < kv->n_layer; L++) { cudaFree(kv->k[L]); cudaFree(kv->v[L]); }
     free(kv->k); free(kv->v); free(kv->kv_dim);
     kv->k = kv->v = NULL; kv->kv_dim = NULL;
 }
 
-// ====================  forward pass  =======================================
+// ====================  forward pass (device-resident)  ======================
 
-static float *build_per_layer(struct model *m, int token, const float *inp_scaled) {
+// Build the PLE inputs on the device; returns 1 if present. dx holds the scaled embedding.
+static int build_per_layer(struct model *m, int token) {
     const struct config *c = &m->cfg;
     const int ple = c->n_embd_per_layer;
-    if (ple <= 0) return NULL;
+    if (ple <= 0) return 0;
     const struct gguf_tensor *pte = gguf_find_tensor(m->ctx, "per_layer_token_embd.weight");
-    if (!pte) return NULL;
+    if (!pte) return 0;
     const int64_t total = (int64_t)ple * c->n_layer;
 
-    float *tok = dequantize_row(pte, token, total);
-    if (!tok) return NULL;
+    float *tok = dequantize_row(pte, token, total);   // host
+    if (!tok) return 0;
     float te_scale = sqrtf((float)ple);
     for (int64_t i = 0; i < total; i++) tok[i] *= te_scale;
-
-    float *proj = (float *)malloc((size_t)total * sizeof(float));
-    matmul_q(proj, wq(m, "per_layer_model_proj.weight"), inp_scaled, c->n_embd, (int)total);
-    float pscale = 1.0f / sqrtf((float)c->n_embd);
-    for (int64_t i = 0; i < total; i++) proj[i] *= pscale;
-
-    const float *pn = fptr(m, "per_layer_proj_norm.weight");
-    for (int L = 0; L < c->n_layer; L++) rmsnorm(proj + L * ple, proj + L * ple, pn, ple, c->rms_eps);
-    float inv_sqrt2 = 1.0f / sqrtf(2.0f);
-    for (int64_t i = 0; i < total; i++) proj[i] = (proj[i] + tok[i]) * inv_sqrt2;
+    CUDA_CHECK(cudaMemcpy(d_tok, tok, (size_t)total * 4, cudaMemcpyHostToDevice));
     free(tok);
-    return proj;
+
+    matmul_q(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
+    scale_const_kernel<<<gridn((int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), (int)total);
+    rmsnorm_kernel<<<c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps);
+    combine_kernel<<<gridn((int)total), 256>>>(d_ipl, d_proj, d_tok, 1.0f / sqrtf(2.0f), (int)total);
+    return 1;
 }
 
 extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
     ensure_weights(m);
+    ensure_scratch(m);
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
-    const int n_ff = c->n_ff, ple = c->n_embd_per_layer;
     const float eps = c->rms_eps;
 
-    int maxhd = 0, max_kvdim = 0;
-    for (int L = 0; L < c->n_layer; L++) {
-        if (m->head_dim[L] > maxhd) maxhd = m->head_dim[L];
-        int kvd = m->n_head_kv[L] * m->head_dim[L];
-        if (kvd > max_kvdim) max_kvdim = kvd;
-    }
-    const int q_max = n_head * maxhd, kv_max = max_kvdim;
-
-    float *x   = (float *)malloc((size_t)n_embd * sizeof(float));
-    float *h   = (float *)malloc((size_t)n_embd * sizeof(float));
-    float *q   = (float *)malloc((size_t)q_max  * sizeof(float));
-    float *kb  = (float *)malloc((size_t)kv_max * sizeof(float));
-    float *vb  = (float *)malloc((size_t)kv_max * sizeof(float));
-    float *xb  = (float *)malloc((size_t)q_max  * sizeof(float));
-    float *o   = (float *)malloc((size_t)n_embd * sizeof(float));
-    float *g1  = (float *)malloc((size_t)n_ff   * sizeof(float));
-    float *g2  = (float *)malloc((size_t)n_ff   * sizeof(float));
-    float *att = (float *)malloc((size_t)(pos + 1) * sizeof(float));
-    float *pg  = ple > 0 ? (float *)malloc((size_t)ple * sizeof(float)) : NULL;
-
+    // embedding lookup (host dequant of one row) -> scale -> upload to device
     float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
-    for (int i = 0; i < n_embd; i++) x[i] = erow[i] * sqrtf((float)n_embd);
+    float es = sqrtf((float)n_embd);
+    for (int i = 0; i < n_embd; i++) erow[i] *= es;
+    CUDA_CHECK(cudaMemcpy(dx, erow, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
     free(erow);
 
-    float *inp_per_layer = build_per_layer(m, token, x);
-    const float *rope_freqs = fptr(m, "rope_freqs.weight");
+    int has_ple = build_per_layer(m, token);
+    const float *d_rope_freqs = dW(m, "rope_freqs.weight");
 
     for (int L = 0; L < c->n_layer; L++) {
         const int local = m->is_local[L];
-        const int hd = head_dim_at(m, L);
-        const int n_head_kv = m->n_head_kv[L];
+        const int hd = m->head_dim[L], n_head_kv = m->n_head_kv[L];
         const int q_dim = n_head * hd, kv_dim = n_head_kv * hd;
         const float base = local ? c->rope_freq_base_swa : c->rope_freq_base;
-        const float *ff = local ? NULL : rope_freqs;
+        const float *ff = local ? NULL : d_rope_freqs;
 
-        rmsnorm(h, x, fptr_layer(m, L, "attn_norm.weight"), n_embd, eps);
-        matmul_q(q, wq_layer(m, L, "attn_q.weight"), h, n_embd, q_dim);
-        const float *qn = fptr_layer(m, L, "attn_q_norm.weight");
-        for (int hh = 0; hh < n_head; hh++) rmsnorm(q + hh * hd, q + hh * hd, qn, hd, eps);
-        for (int hh = 0; hh < n_head; hh++) rope_neox(q + hh * hd, hd, pos, base, ff);
+        // ---- attention ----
+        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps);
+        matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps);
+        rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, pos, base, ff, n_head * hd / 2);
 
-        int src = kv_src(m, L);
+        int src = kv_src_dev(m, L);
         if (L < c->n_kv_start) {
-            matmul_q(kb, wq_layer(m, L, "attn_k.weight"), h, n_embd, kv_dim);
+            matmul_q(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) matmul_q(vb, wv, h, n_embd, kv_dim);
-            else    memcpy(vb, kb, (size_t)kv_dim * sizeof(float));
-            const float *kn = fptr_layer(m, L, "attn_k_norm.weight");
-            for (int hh = 0; hh < n_head_kv; hh++) rmsnorm(kb + hh * hd, kb + hh * hd, kn, hd, eps);
-            for (int hh = 0; hh < n_head_kv; hh++) rmsnorm_plain(vb + hh * hd, vb + hh * hd, hd, eps);
-            for (int hh = 0; hh < n_head_kv; hh++) rope_neox(kb + hh * hd, hd, pos, base, ff);
-            memcpy(kv->k[L] + (size_t)pos * kv_dim, kb, (size_t)kv_dim * sizeof(float));
-            memcpy(kv->v[L] + (size_t)pos * kv_dim, vb, (size_t)kv_dim * sizeof(float));
+            if (wv) matmul_q(dvb, wv, dh, n_embd, kv_dim);
+            else    CUDA_CHECK(cudaMemcpy(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
+            rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps);
+            rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps);  // plain V norm
+            rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, pos, base, ff, n_head_kv * hd / 2);
+            CUDA_CHECK(cudaMemcpy(kv->k[L] + (size_t)pos * kv_dim, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(kv->v[L] + (size_t)pos * kv_dim, dvb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
         }
         const float *Kc = kv->k[src], *Vc = kv->v[src];
-
         int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
                   ? pos - c->sliding_window + 1 : 0;
-        const int gqa = n_head / n_head_kv;
-        for (int hh = 0; hh < n_head; hh++) {
-            const float *qh = q + hh * hd; int kvh = hh / gqa;
-            for (int t = start; t <= pos; t++) {
-                const float *kt = Kc + (size_t)t * kv_dim + (size_t)kvh * hd;
-                float s = 0.0f; for (int i = 0; i < hd; i++) s += qh[i] * kt[i];
-                att[t] = s;
-            }
-            softmax(att + start, pos - start + 1);
-            float *outh = xb + hh * hd;
-            for (int i = 0; i < hd; i++) outh[i] = 0.0f;
-            for (int t = start; t <= pos; t++) {
-                const float *vt = Vc + (size_t)t * kv_dim + (size_t)kvh * hd;
-                float a = att[t]; for (int i = 0; i < hd; i++) outh[i] += a * vt[i];
-            }
-        }
+        int gqa = n_head / n_head_kv, T = pos - start + 1;
+        attn_kernel<<<n_head, 128, (size_t)T * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, start, pos);
 
-        matmul_q(o, wq_layer(m, L, "attn_output.weight"), xb, q_dim, n_embd);
-        rmsnorm(o, o, fptr_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
-        for (int i = 0; i < n_embd; i++) x[i] += o[i];
+        matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
+        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
+        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
 
+        // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
-        rmsnorm(h, x, fptr_layer(m, L, "ffn_norm.weight"), n_embd, eps);
-        matmul_q(g1, wq_layer(m, L, "ffn_gate.weight"), h, n_embd, nff);
-        matmul_q(g2, wq_layer(m, L, "ffn_up.weight"),   h, n_embd, nff);
-        for (int i = 0; i < nff; i++) g1[i] = gelu(g1[i]) * g2[i];
-        matmul_q(o, wq_layer(m, L, "ffn_down.weight"), g1, nff, n_embd);
-        rmsnorm(o, o, fptr_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
-        for (int i = 0; i < n_embd; i++) x[i] += o[i];
+        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps);
+        matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"),   dh, n_embd, nff);
+        geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff);
+        matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
+        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
+        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
 
-        if (inp_per_layer) {
-            const float *ile = inp_per_layer + (size_t)L * ple;
-            matmul_q(pg, wq_layer(m, L, "inp_gate.weight"), x, n_embd, ple);
-            for (int i = 0; i < ple; i++) pg[i] = gelu(pg[i]) * ile[i];
-            matmul_q(o, wq_layer(m, L, "proj.weight"), pg, ple, n_embd);
-            rmsnorm(o, o, fptr_layer(m, L, "post_norm.weight"), n_embd, eps);
-            for (int i = 0; i < n_embd; i++) x[i] += o[i];
+        // ---- per-layer input (PLE) ----
+        if (has_ple) {
+            const int ple = c->n_embd_per_layer;
+            matmul_q(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
+            geglu_kernel<<<gridn(ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple);
+            matmul_q(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
+            rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps);
+            add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
         }
 
-        const float *os = fptr_layer(m, L, "layer_output_scale.weight");
-        if (os) { for (int i = 0; i < n_embd; i++) x[i] *= os[0]; }
+        // ---- per-layer output scale ----
+        const float *os = dW_layer(m, L, "layer_output_scale.weight");
+        if (os) scale_ptr_kernel<<<gridn(n_embd), 256>>>(dx, os, n_embd);
     }
 
-    rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
-    matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
-    if (c->logit_softcap > 0.0f) {
-        float sc = c->logit_softcap;
-        for (int v = 0; v < c->n_vocab; v++) logits[v] = sc * tanhf(logits[v] / sc);
-    }
+    rmsnorm_kernel<<<1, 256>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps);
+    matmul_q(dlogits, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
+    if (c->logit_softcap > 0.0f)
+        softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
 
-    free(x); free(h); free(q); free(kb); free(vb); free(xb);
-    free(o); free(g1); free(g2); free(att); free(pg); free(inp_per_layer);
+    CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)c->n_vocab * 4, cudaMemcpyDeviceToHost));
 }
