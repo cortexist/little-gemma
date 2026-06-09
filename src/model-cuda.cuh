@@ -1,12 +1,12 @@
 // Shared CUDA backend: everything except the matmul. Included by exactly one
-// compute file per binary — model-cuda.cu (f32 dequant dot) or model-cuda-i8.cu
+// compute file per binary — model-cuda-f32.cu (f32 dequant dot) or model-cuda-i8.cu
 // (int8 dot) — each of which defines matmul_q. The forward pass, the kv cache, and
 // every non-matmul kernel (rmsnorm, rope, attention, elementwise) are identical
 // across both, so they live here. This is a single-include unit, not a normal
 // header: it holds definitions, and the including file provides matmul_q.
 
-#ifndef MODEL_CUDA_COMMON_CUH
-#define MODEL_CUDA_COMMON_CUH
+#ifndef MODEL_CUDA_CUH
+#define MODEL_CUDA_CUH
 
 #include <cstdio>
 #include <cstdlib>
@@ -383,4 +383,4 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
     CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)c->n_vocab * 4, cudaMemcpyDeviceToHost));
 }
 
-#endif // MODEL_CUDA_COMMON_CUH
+#endif // MODEL_CUDA_CUH

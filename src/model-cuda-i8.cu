@@ -1,5 +1,5 @@
-// CUDA backend, int8 matmul. Same shared forward as model-cuda.cu
-// (model-cuda-common.cuh); only matmul_q differs — this is where the gap to
+// CUDA backend, int8 matmul. Same shared forward as model-cuda-f32.cu
+// (model-cuda.cuh); only matmul_q differs — this is where the gap to
 // llama.cpp closes.
 //
 // Idea (llama.cpp's mul_mat_vec_q, simplified): the activation x is the same for
@@ -12,7 +12,7 @@
 // The Σ q_i·xq_i is a small-integer dot; everything float happens once per
 // sub-block. This is lossy (int8 activation), exactly like llama.cpp's GPU path.
 
-#include "model-cuda-common.cuh"
+#include "model-cuda.cuh"
 
 // Quantize the activation into int8 per 32-element group: xq (int8), xd (scale),
 // xs (sum of the int8 values, used for weight min terms). One thread per group.
@@ -31,7 +31,7 @@ __global__ static void quantize_act_kernel(const float *x, int8_t *xq, float *xd
 
 // ---- one weight sub-block's contribution to the dot, in integer arithmetic ----
 // xqb/xdb/xsb point at the activation int8 / scale / sum for this weight block's
-// elements (group stride 32). The per-element index math mirrors model-cuda.cu.
+// elements (group stride 32). The per-element index math mirrors model-cuda-f32.cu.
 
 __device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb, const float *xdb, const int *xsb) {
     uint8_t sc, mm; d_gsm(sj, p->scales, &sc, &mm);

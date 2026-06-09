@@ -1,12 +1,12 @@
 // CUDA backend, f32-dequant matmul. The whole forward, kv cache, and non-matmul
-// kernels are shared (model-cuda-common.cuh); this file only provides matmul_q.
+// kernels are shared (model-cuda.cuh); this file only provides matmul_q.
 //
 // This is the readable reference: one warp per output row, the lanes cooperate on
 // each quantized block, and the dequant is fused straight into the f32 dot. The
 // int8 variant (model-cuda-i8.cu) is the same forward with a faster matmul — diff
 // the two files to see exactly where the speedup comes from.
 
-#include "model-cuda-common.cuh"
+#include "model-cuda.cuh"
 
 // Accumulate one block's contribution to the dot: each of the 32 lanes handles
 // elements {lane, lane+32, ...}. Per-block scale factors are computed once; the

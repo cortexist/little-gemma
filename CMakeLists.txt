@@ -13,7 +13,7 @@ else()
 endif()
 
 # Shared, backend-agnostic sources. model.c = common host setup; the compute
-# backend is model-cpu.c (CPU) or model-cuda.cu (CUDA), selected per target.
+# backend is model-cpu.c (CPU) or model-cuda-{f32,i8}.cu (CUDA), selected per target.
 set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c)
 
 # --- CPU build -------------------------------------------------------------
@@ -30,9 +30,9 @@ include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
-    # Two CUDA backends behind the same model.h, sharing model-cuda-common.cuh:
+    # Two CUDA backends behind the same model.h, sharing model-cuda.cuh:
     # run-cuda = readable f32-dequant matmul; run-cuda-i8 = int8 matmul.
-    add_executable(run-cuda    ${CORE} src/model-cuda.cu)
+    add_executable(run-cuda    ${CORE} src/model-cuda-f32.cu)
     add_executable(run-cuda-i8 ${CORE} src/model-cuda-i8.cu)
     target_include_directories(run-cuda    PRIVATE include)
     target_include_directories(run-cuda-i8 PRIVATE include)

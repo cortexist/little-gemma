@@ -79,8 +79,8 @@ If the CUDA toolkit is found, CMake also builds a `run-cuda` target:
 cmake --build build --config Release --target run-cuda
 ```
 
-Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backend
-(`model-cuda.cu`) implement the same `model.h`; only the compute kernels differ.
+Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
+(`model-cuda-f32.cu`, `model-cuda-i8.cu`) implement the same `model.h`; only the compute kernels differ.
 
 ## Usage
 
@@ -109,7 +109,7 @@ comes from thousands of threads (replacing OpenMP) and the per-element math runs
 kernels (replacing what SIMD would do). The weights are already stored quantized
 and unpacked inside the matmul — exactly the shape a GPU kernel wants — so the
 CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
-double as the reference spec for the CUDA versions in `model-cuda.cu`.
+double as the reference spec for the CUDA versions in `model-cuda-f32.cu`.
 
 ## On mmap — intentionally not used
 
@@ -125,12 +125,12 @@ load time instead of a mysterious crawl (`load_gguf` checks the size and bails).
 ## On CUDA
 
 The whole forward, the kv cache, and every non-matmul kernel live in
-`model-cuda-common.cuh`; the **matmul is the only thing that differs** between the two
+`model-cuda.cuh`; the **matmul is the only thing that differs** between the two
 GPU backends, so each is a thin file that includes the header and defines just
-`matmul_q`. Diff `model-cuda.cu` against `model-cuda-i8.cu` to see exactly where
+`matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8.cu` to see exactly where
 the speed comes from.
 
-**`model-cuda.cu` — the readable f32 matmul.** Built up in four steps, each diffed
+**`model-cuda-f32.cu` — the readable f32 matmul.** Built up in four steps, each diffed
 against the CPU output (byte-identical) before keeping it (E2B tok/s):
 
 1. **matmul on the GPU, the rest on the host** — upload the quantized weights to

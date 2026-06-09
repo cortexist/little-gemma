@@ -1,6 +1,6 @@
 // CPU backend: the compute kernels and the forward pass. The host-side setup
-// (config, per-layer geometry) lives in model.c; the CUDA backend (model-cuda.cu)
-// is an alternative to this file behind the same model.h interface.
+// (config, per-layer geometry) lives in model.c; the CUDA backends (model-cuda-f32.cu,
+// model-cuda-i8.cu) are alternatives to this file behind the same model.h interface.
 
 #include <stdio.h>
 #include <stdlib.h>

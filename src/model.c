@@ -1,6 +1,6 @@
 // Common (backend-agnostic) model setup: reads hyperparameters and per-layer
 // geometry from the GGUF metadata. The compute (kernels + forward) lives in a
-// backend file picked at build time: model-cpu.c or model-cuda.cu.
+// backend file picked at build time: model-cpu.c or model-cuda-{f32,i8}.cu.
 
 #include <stdio.h>
 #include <stdlib.h>
