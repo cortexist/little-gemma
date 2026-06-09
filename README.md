@@ -124,8 +124,14 @@ load time instead of a mysterious crawl (`load_gguf` checks the size and bails).
 
 ## On CUDA
 
-The CUDA backend (`model-cuda.cu`) is the same forward, built up in four steps —
-each diffed against the CPU output (byte-identical) before keeping it (E2B tok/s):
+The whole forward, the kv cache, and every non-matmul kernel live in
+`model-cuda-common.cuh`; the **matmul is the only thing that differs** between the two
+GPU backends, so each is a thin file that includes the header and defines just
+`matmul_q`. Diff `model-cuda.cu` against `model-cuda-i8.cu` to see exactly where
+the speed comes from.
+
+**`model-cuda.cu` — the readable f32 matmul.** Built up in four steps, each diffed
+against the CPU output (byte-identical) before keeping it (E2B tok/s):
 
 1. **matmul on the GPU, the rest on the host** — upload the quantized weights to
    VRAM once; a kernel unpacks each weight row and dots it. (7.9)
@@ -136,17 +142,25 @@ each diffed against the CPU output (byte-identical) before keeping it (E2B tok/s
 4. **the warp cooperates on each block**, with per-element dequant fused into the
    dot — every lane stays busy and the per-row scratch buffer is gone. (36)
 
+**`model-cuda-i8.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
+simplified). The activation is the same for every output row, so quantize it to
+int8 once per matmul (per 32-element group: a scale, the int8 values, and their
+sum). The per-row dot is then done in **integer arithmetic** per weight sub-block,
+with the float scale applied once per sub-block instead of once per element. This
+is lossy — like every GPU inference engine, the int8 greedy path diverges slightly
+from the f32 one, but the output stays coherent and accurate. (54)
+
 Decode throughput (single token, all layers on GPU):
 
-| model | little-gemma CUDA | llama.cpp CUDA | from CPU backend |
-|-------|------------------:|---------------:|-----------------:|
-| E2B   | ~36 tok/s         | ~146 tok/s     | ~28× (1.3 → 36)  |
-| 12B   | ~16 tok/s         | ~64 tok/s      | ~50×             |
+| model | f32 (`run-cuda`) | int8 (`run-cuda-i8`) | llama.cpp CUDA |
+|-------|-----------------:|---------------------:|---------------:|
+| E2B   | ~35 tok/s        | ~55 tok/s            | ~146 tok/s     |
+| 12B   | ~15 tok/s        | ~21 tok/s            | ~64 tok/s      |
 
-So the GPU port is ~28–50× over the CPU backend and within ~4× of llama.cpp's
-heavily-tuned CUDA kernels. The remaining gap is understood — an int8-quantized
-activation with an integer dot, CUDA-graph capture to cut per-kernel launch
-overhead, and tighter memory coalescing — and is left as future work.
+So the int8 path is ~40× over the CPU backend (E2B) and closes the gap to
+llama.cpp's heavily-tuned kernels from ~4× to ~2.7×. The last lever is `dp4a`
+(packing four int8 into one integer dot-product instruction); we use a scalar
+integer dot, which is the readable version of the same idea.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -168,8 +182,8 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 8     | 1,951 | 147     | 277   | 2,375 |
-| include   | 5     | 209   | 84      | 57    | 350   |
+| src       | 10    | 2,097 | 196     | 290   | 2,583 |
+| include   | 5     | 209   | 82      | 57    | 348   |
 
 ## Validation
 
