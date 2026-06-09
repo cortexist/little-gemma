@@ -7,11 +7,34 @@ written to *teach* how a modern LLM actually executes, in the spirit of Karpathy
 It is a complete pipeline: parse GGUF → BPE tokenize → run the transformer →
 generate text. Every stage was validated bit-for-bit against `llama.cpp`.
 
-!["parse GGUF → BPE tokenize → run the transformer → generate text"](media/pipeline.svg)
+```
+text ──► tokenizer ──► token ids ──► forward ──► logits ──► argmax ──► next token
+                          ▲                                                │
+                          ╰──────────────── append, repeat ◄───────────────╯
+```
 
 ## Architecture
 
-!["architecture"](media/architecture.svg)
+```
+                      ┌──────────────┐
+                      │    run.c     │   CLI: -m <model> [-p "prompt"]
+                      └──────┬───────┘
+         ╭───────────────────┼───────────────────────────────╮
+         ▼                   ▼                               ▼
+ ┌───────────────┐   ┌────────────────┐   ┌──────────────────────────────────────┐
+ │  tokenizer.c  │   │    model.c     │   │               gguf.c                 │
+ │  BPE text↔ids │   │ config+forward │   │ parse → ctx (hdr, kv, tensors, data) │
+ └───────────────┘   └───────┬────────┘   └──────────────────┬───────────────────┘
+                             │                               │  
+                             ▼                               │
+                ┌──────────────────────────┐                 │ borrows
+                │          quant.c         │◄────────────────╯ quantized
+                │ dequantize q3_K/q4_K/... │  weights
+                └──────────────────────────┘
+
+    graph.c — a minimal tensor/graph layer (matmul, rmsnorm, softmax, …)
+            kept as the "what a compute graph is" teaching reference.
+```
 
 **Layering:** GGUF/ggml jargon stays in the lower layers (`gguf.c`, `quant.c`);
 the model layer (`model.c`) reads like plain transformer code. The file is read
@@ -20,7 +43,18 @@ quantized there, and each weight row is unpacked to f32 on the fly during matmul
 
 ### What `model_forward` computes (Gemma 4 / E2B)
 
-!["forward"](media/forward.svg)
+```
+embed(token) × √d
+for each of 35 layers:
+    ├─ attention:  rmsnorm → Q,K,V → per-head Q/K-norm → NeoX RoPE
+    │              → GQA (8 q-heads, 1 kv-head) with sliding-window OR global mask
+    │              → KV cache (layers ≥15 reuse an earlier layer's KV)
+    │              → output proj → post-norm → residual
+    ├─ feed-forward (GeGLU):  rmsnorm → gelu(gate)·up → down → post-norm → residual
+    │              (elastic FFN: width 6144 for layers 0–14, 12288 for 15–34)
+    └─ per-layer input (PLE) + per-layer output scale
+final rmsnorm → tied logits (× token_embd) → softcap
+```
 
 ## How to Build
 
@@ -77,9 +111,17 @@ and unpacked inside the matmul — exactly the shape a GPU kernel wants — so t
 CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
 double as the reference spec for the CUDA versions in `model-cuda.cu`.
 
-The CUDA backend runs the whole forward on the GPU with activations resident in
-VRAM; the matmul uses one warp per output row with the lanes cooperating on each
-quantized block (dequant fused into the dot), output byte-identical to the CPU.
+The CUDA backend (`model-cuda.cu`) is the same forward, built up in four steps —
+each diffed against the CPU output (byte-identical) before keeping it (E2B tok/s):
+
+1. **matmul on the GPU, the rest on the host** — upload the quantized weights to
+   VRAM once; a kernel unpacks each weight row and dots it. (7.9)
+2. **activations resident in VRAM** — the whole forward and the KV cache live on
+   the device, so only the embedding row (down) and the logits (up) cross the bus. (10)
+3. **one warp per output row** instead of one thread — 32× the threads, so the
+   small per-layer matmuls actually fill the GPU. (17)
+4. **the warp cooperates on each block**, with per-element dequant fused into the
+   dot — every lane stays busy and the per-row scratch buffer is gone. (36)
 
 Decode throughput (single token, all layers on GPU):
 
@@ -88,11 +130,10 @@ Decode throughput (single token, all layers on GPU):
 | E2B   | ~36 tok/s         | ~146 tok/s     | ~28× (1.3 → 36)  |
 | 12B   | ~16 tok/s         | ~64 tok/s      | ~50×             |
 
-So the GPU port is ~28–50× over the CPU backend and lands within ~4× of
-llama.cpp's heavily-optimized CUDA kernels. The remaining gap is understood —
-an int8-quantized activation with an integer dot, CUDA-graph capture to remove
-per-kernel launch overhead, and tighter memory coalescing — and is left as future
-work for this teaching project.
+So the GPU port is ~28–50× over the CPU backend and within ~4× of llama.cpp's
+heavily-tuned CUDA kernels. The remaining gap is understood — an int8-quantized
+activation with an integer dot, CUDA-graph capture to cut per-kernel launch
+overhead, and tighter memory coalescing — and is left as future work.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
