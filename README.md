@@ -145,22 +145,25 @@ against the CPU output (byte-identical) before keeping it (E2B tok/s):
 **`model-cuda-i8.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
 simplified). The activation is the same for every output row, so quantize it to
 int8 once per matmul (per 32-element group: a scale, the int8 values, and their
-sum). The per-row dot is then done in **integer arithmetic** per weight sub-block,
-with the float scale applied once per sub-block instead of once per element. This
-is lossy — like every GPU inference engine, the int8 greedy path diverges slightly
-from the f32 one, but the output stays coherent and accurate. (54)
+sum). The per-row dot is then done in **integer arithmetic** per weight sub-block —
+with the float scale applied once per sub-block instead of once per element — and
+each group of four products goes through `__dp4a`, the 4-way int8 dot-product
+instruction. Because an integer dot is order-independent, this is **byte-identical**
+to the scalar version: pure speedup, zero numerical change. (The int8 *activation*
+is lossy, like every GPU inference engine, so the greedy path differs slightly from
+f32, but the output stays coherent and accurate.)
 
 Decode throughput (single token, all layers on GPU):
 
-| model | f32 (`run-cuda`) | int8 (`run-cuda-i8`) | llama.cpp CUDA |
-|-------|-----------------:|---------------------:|---------------:|
-| E2B   | ~35 tok/s        | ~55 tok/s            | ~146 tok/s     |
-| 12B   | ~15 tok/s        | ~21 tok/s            | ~64 tok/s      |
+| model | f32 (`run-cuda`) | int8+dp4a (`run-cuda-i8`) | llama.cpp CUDA |
+|-------|-----------------:|--------------------------:|---------------:|
+| E2B   | ~35 tok/s        | ~63 tok/s                 | ~146 tok/s     |
+| 12B   | ~15 tok/s        | ~32 tok/s                 | ~64 tok/s      |
 
-So the int8 path is ~40× over the CPU backend (E2B) and closes the gap to
-llama.cpp's heavily-tuned kernels from ~4× to ~2.7×. The last lever is `dp4a`
-(packing four int8 into one integer dot-product instruction); we use a scalar
-integer dot, which is the readable version of the same idea.
+So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
+llama.cpp's heavily-tuned kernels from ~4× to ~2×. The remaining ~2× is structural
+(warp specialization, tiling, tighter memory scheduling) — well beyond `dp4a`, and
+left as future work.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -182,7 +185,7 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 10    | 2,097 | 196     | 290   | 2,583 |
+| src       | 10    | 2,115 | 200     | 290   | 2,605 |
 | include   | 5     | 209   | 82      | 57    | 348   |
 
 ## Validation

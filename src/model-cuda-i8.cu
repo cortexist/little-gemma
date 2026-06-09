@@ -38,8 +38,16 @@ __device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb,
     int g = sj >> 1, half = sj & 1;
     const uint8_t *q = p->qs + g * 32;
     const int8_t *xqg = xqb + sj * 32;             // sub-block sj == activation group sj
+    // dp4a: process the 32 elements as 8 groups of 4. Each group packs its 4 weight
+    // nibbles into an int (one byte each) and its 4 activation int8 (a contiguous,
+    // 4-aligned load), then __dp4a does the 4 signed MACs in one instruction.
     int dot = 0;
-    for (int i = 0; i < 32; i++) dot += (half ? (q[i] >> 4) : (q[i] & 0xF)) * xqg[i];
+    for (int u = 0; u < 32; u += 4) {
+        const uint8_t *q4 = q + u;
+        int w = half ? ((q4[0] >> 4) | ((q4[1] >> 4) << 8) | ((q4[2] >> 4) << 16) | ((q4[3] >> 4) << 24))
+                     : ((q4[0] & 0xF) | ((q4[1] & 0xF) << 8) | ((q4[2] & 0xF) << 16) | ((q4[3] & 0xF) << 24));
+        dot = __dp4a(w, *(const int *)(xqg + u), dot);
+    }
     float d = d_fp16(p->d), mn = d_fp16(p->dmin);
     return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
 }
@@ -49,10 +57,14 @@ __device__ static float sub_q5_K(const block_q5_K *p, int sj, const int8_t *xqb,
     const uint8_t *q = p->qs + g * 32;
     int bit = half ? (2 << (2 * g)) : (1 << (2 * g));
     const int8_t *xqg = xqb + sj * 32;
-    int dot = 0;
-    for (int i = 0; i < 32; i++) {
-        int hi = (p->qh[i] & bit) ? 16 : 0;
-        dot += ((half ? (q[i] >> 4) : (q[i] & 0xF)) + hi) * xqg[i];
+    int dot = 0;                                   // 4-bit + high bit -> value 0..31
+    for (int u = 0; u < 32; u += 4) {
+        int w = 0;
+        for (int t = 0; t < 4; t++) {
+            int qq = (half ? (q[u + t] >> 4) : (q[u + t] & 0xF)) + ((p->qh[u + t] & bit) ? 16 : 0);
+            w |= qq << (8 * t);
+        }
+        dot = __dp4a(w, *(const int *)(xqg + u), dot);
     }
     float d = d_fp16(p->d), mn = d_fp16(p->dmin);
     return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
@@ -71,10 +83,15 @@ __device__ static float sub_q3_K(const block_q3_K *p, int sj, const int8_t *xqb,
     const uint8_t *qs = p->qs + ni * 32;
     int g_act = ni * 4 + j;
     const int8_t *xqg = xqb + g_act * 32 + half * 16;
-    int dot = 0;
-    for (int l = 0; l < 16; l++) {
-        int qv = (int)((int8_t)((qs[half * 16 + l] >> shift) & 3)) - ((p->hmask[half * 16 + l] & m) ? 0 : 4);
-        dot += qv * xqg[l];
+    int dot = 0;                                   // 2-bit value minus hmask offset (signed, -4..3)
+    for (int l = 0; l < 16; l += 4) {
+        int w = 0;
+        for (int t = 0; t < 4; t++) {
+            int e = half * 16 + l + t;
+            int qv = (int)((int8_t)((qs[e] >> shift) & 3)) - ((p->hmask[e] & m) ? 0 : 4);
+            w |= (qv & 0xFF) << (8 * t);
+        }
+        dot = __dp4a(w, *(const int *)(xqg + l), dot);
     }
     return xdb[g_act] * d_fp16(p->d) * (scales[sj] - 32) * dot;
 }
@@ -85,12 +102,16 @@ __device__ static float sub_q6_K(const block_q6_K *p, int sj, const int8_t *xqb,
     int sh = grp * 2, off = (grp & 1) ? 32 : 0, hin = (grp >= 2);
     int g_act = ni * 4 + grp;
     const int8_t *xqg = xqb + g_act * 32 + hl * 16;
-    int dot = 0;
-    for (int i = 0; i < 16; i++) {
-        int l = hl * 16 + i;
-        int qlo = hin ? (ql[l + off] >> 4) : (ql[l + off] & 0xF);
-        int qval = (int)((int8_t)(qlo | (((qh[l] >> sh) & 3) << 4))) - 32;
-        dot += qval * xqg[i];
+    int dot = 0;                                   // 6-bit value minus 32 (signed, -32..31)
+    for (int i = 0; i < 16; i += 4) {
+        int w = 0;
+        for (int t = 0; t < 4; t++) {
+            int l = hl * 16 + i + t;
+            int qlo = hin ? (ql[l + off] >> 4) : (ql[l + off] & 0xF);
+            int qval = (int)((int8_t)(qlo | (((qh[l] >> sh) & 3) << 4))) - 32;
+            w |= (qval & 0xFF) << (8 * t);
+        }
+        dot = __dp4a(w, *(const int *)(xqg + i), dot);
     }
     return xdb[g_act] * d_fp16(p->d) * sc[2 * grp + hl] * dot;
 }
