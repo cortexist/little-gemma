@@ -179,12 +179,26 @@ static void ensure_act(int k) {
     g_act_cap = k;
 }
 
-static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+// The int8 matmul against the activation currently in g_xq/g_xd/g_xs. (d_x is still
+// needed for the bf16/f32/f16 fallback path, which dots the raw float activation.)
+static void matmul_run(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     int blck = ggml_blck_size(t->type), ts = (int)ggml_type_size(t->type);
-    int ng = k / 32;
-    ensure_act(k);
-    quantize_act_kernel<<<gridn(ng), 256>>>(d_x, g_xq, g_xd, g_xs, ng);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_i8_kernel<<<blocks, 256>>>(d_out, dev_weight(t), (int)t->type, ts, blck, d_x, g_xq, g_xd, g_xs, k, m);
+}
+
+static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    int ng = k / 32;
+    ensure_act(k);
+    quantize_act_kernel<<<gridn(ng), 256>>>(d_x, g_xq, g_xd, g_xs, ng);
+    matmul_run(d_out, t, d_x, k, m);
+}
+
+// Reuse the activation quantized by the immediately preceding matmul_q. The forward
+// hands the same input vector to q/k/v (and to gate/up), so re-quantizing it each time
+// is pure waste (quantize was ~13% of GPU time). Caller guarantees d_x is unchanged
+// since that matmul_q; the result is bit-identical to calling matmul_q again.
+static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    matmul_run(d_out, t, d_x, k, m);
 }

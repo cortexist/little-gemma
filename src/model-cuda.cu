@@ -105,3 +105,7 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_q_kernel<<<blocks, 256>>>(d_out, dev_weight(t), (int)t->type, ts, blck, d_x, k, m);
 }
+// The f32 backend has no activation quantization to reuse, so "same" is just matmul_q.
+static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    matmul_q(d_out, t, d_x, k, m);
+}

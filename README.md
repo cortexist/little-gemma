@@ -198,9 +198,18 @@ the latency hidden by extra warps. So occupancy wasn't really the limiter at the
 The takeaway: the one-warp-per-row kernel is near a local optimum for incremental changes.
 Closing the last 2× needs a from-scratch MMQ-style kernel (different tiling, the `q8_1`
 activation path, tensor-core-style accumulation) — a large rewrite at odds with this
-codebase's goal of staying readable — and is left as future work. Lower-risk wins remain
-*outside* the matmul: `quantize_act_kernel` is ~13% of GPU time and redundant (q/k/v
-share one activation; gate/up share one), and the bf16 fallback runs lane-0-only.
+codebase's goal of staying readable — and is left as future work.
+
+### What did work: activation-quant dedup
+
+The win that *wasn't* in the matmul. `quantize_act_kernel` (which quantizes the activation
+to int8 before each matmul) was ~13% of GPU time and mostly **redundant**: the forward
+hands the *same* activation vector to q/k/v, and another to gate/up, re-quantizing it each
+time. `matmul_q_same` skips the quantize and reuses the previous result; the k/v and up
+call sites use it. Bit-identical output, and **+2–3% (E2B) / +4% (12B Q4_K_M)** for a few
+lines. The remaining lever is the bf16 fallback (`per_layer_model_proj`), which runs
+lane-0-only. The lesson worth keeping: the cheap, safe win was *removing redundant work
+around* the matmul, not micro-optimizing the matmul itself.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 

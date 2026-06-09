@@ -193,7 +193,10 @@ static void ensure_scratch(struct model *m) {
 
 // The matmul is the one piece that differs between backends; the including .cu
 // defines it. d_out[m] = W . d_x with W the quantized tensor t (all device ptrs).
+// matmul_q_same reuses the activation prepared by the immediately preceding matmul_q
+// (caller guarantees d_x is unchanged) — lets q/k/v and gate/up skip re-quantization.
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 
 // ====================  kv cache (device buffers)  ===========================
 
@@ -276,9 +279,9 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
 
         int src = kv_src_dev(m, L);
         if (L < c->n_kv_start) {
-            matmul_q(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
+            matmul_q_same(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);  // reuses q's dh
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) matmul_q(dvb, wv, dh, n_embd, kv_dim);
+            if (wv) matmul_q_same(dvb, wv, dh, n_embd, kv_dim);                       // reuses q's dh
             else    CUDA_CHECK(cudaMemcpy(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
             rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps);
             rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps);  // plain V norm
@@ -300,7 +303,7 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps);
         matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
-        matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"),   dh, n_embd, nff);
+        matmul_q_same(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);        // reuses gate's dh
         geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff);
         matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
