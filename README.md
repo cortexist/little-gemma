@@ -198,10 +198,13 @@ per row, the fixed per-warp overhead (setup, warp-reduce, shared-mem combine) ou
 the latency hidden by extra warps. So occupancy wasn't really the limiter at these sizes.
 
 The takeaway: the one-warp-per-row kernel is near a local optimum for incremental changes.
-Closing the matmul's remaining ~2× (it runs at ~25% of peak bandwidth) needs a from-scratch
-MMQ-style kernel (different tiling, the `q8_1` activation path, tensor-core-style
-accumulation) — a large rewrite at odds with this codebase's goal of staying readable — and
-is left as future work. The wins that *did* land (next) are elsewhere.
+Closing the matmul's remaining ~2× (it runs at ~25% of peak bandwidth) needs a fully tuned
+`mul_mat_vec_q` (MMVQ) — coalesced vectorized loads that saturate bandwidth, multiple rows
+per warp for latency hiding, arch-specific thread mapping. Decode is batch-1 and
+bandwidth-bound, so the int8 *tensor cores* that accelerate llama.cpp's batched matrix×matrix
+kernel (`mul_mat_q`, MMQ — used for prompt processing) don't apply here; the win is memory
+efficiency, not compute. A real rewrite, at odds with this codebase's goal of staying
+readable, left as future work. The wins that *did* land (next) are elsewhere.
 
 ### What did work: activation-quant dedup
 
@@ -246,7 +249,7 @@ in re-optimizing the matmul kernel, where every attempt regressed.
 
 **Net, with dedup + graph: E2B ~80 tok/s, 12B Q4_K_M ~35 tok/s** — the gap to llama.cpp
 CUDA is now ~1.8× (from the ~2× dp4a starting point above). The rest is the matmul
-efficiency that an MMQ rewrite would address.
+efficiency that a fully tuned `mul_mat_vec_q` would address.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
