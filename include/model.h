@@ -32,9 +32,8 @@ struct config {
 int  config_load(struct config *c, const struct gguf_context *ctx);
 void config_print(const struct config *c);
 
-// A loaded model ready to run. Weights stay quantized in `ctx` and are
-// dequantized per layer inside forward(); only the token embedding table is kept
-// in f32 (it is needed whole for the tied output projection).
+// A loaded model ready to run. Weights stay quantized in `ctx`; each row is
+// dequantized on the fly inside forward() (nothing is cached in f32).
 struct model {
     struct config              cfg;
     const struct gguf_context *ctx;       // borrowed; holds the quantized weights
@@ -61,10 +60,9 @@ int  kvcache_init(struct kvcache *kv, const struct model *m, int max_seq);
 void kvcache_free(struct kvcache *kv);
 
 // Run one token at sequence position `pos` (0-based). Reads/writes the kv cache
-// and writes cfg.n_vocab logits into `logits` (caller-allocated).
-//
-// NOTE: this is the standard Gemma decoder. The per-layer-input (PLE) tensors of
-// this checkpoint are NOT applied, so logits will not match a full reference.
+// and writes cfg.n_vocab logits into `logits` (caller-allocated). This is the
+// full Gemma 4 decoder (per-layer-input embeddings, elastic FFN, KV sharing,
+// softcap); logits match the llama.cpp reference.
 void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits);
 
 #endif // MODEL_H

@@ -111,6 +111,19 @@ and unpacked inside the matmul — exactly the shape a GPU kernel wants — so t
 CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
 double as the reference spec for the CUDA versions in `model-cuda.cu`.
 
+## On mmap — intentionally not used
+
+Most GGUF runners memory-map the model file and let the OS page weights in on
+demand. little-gemma instead reads the whole file into RAM up front and refuses to
+start if it does not fit. This avoids the complexity — and the silent failure mode —
+of paging: with mmap a model that is slightly too large still "loads", then thrashes
+as the OS evicts weight pages and re-reads them from disk every token, so the
+slowdown is invisible and hard to reason about. The rule here is deliberately
+simple: if you have enough memory, you run; if you don't, you get a clear error at
+load time instead of a mysterious crawl (`load_gguf` checks the size and bails).
+
+## On CUDA
+
 The CUDA backend (`model-cuda.cu`) is the same forward, built up in four steps —
 each diffed against the CPU output (byte-identical) before keeping it (E2B tok/s):
 
