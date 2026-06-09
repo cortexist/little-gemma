@@ -73,14 +73,15 @@ Threading is via OpenMP (auto-detected by CMake); the matmul scales across cores
 
 ### CUDA build (optional)
 
-If the CUDA toolkit is found, CMake also builds a `run-cuda` target:
+If the CUDA toolkit is found, CMake also builds `run-cuda` (readable f32 matmul)
+and `run-cuda-i8r` (int8 matmul, the fast one):
 
 ```
-cmake --build build --config Release --target run-cuda
+cmake --build build --config Release --target run-cuda-i8r
 ```
 
 Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
-(`model-cuda-f32.cu`, `model-cuda-i8.cu`) implement the same `model.h`; only the compute kernels differ.
+(`model-cuda-f32.cu`, `model-cuda-i8r.cu`) implement the same `model.h`; only the compute kernels differ.
 
 ## Usage
 
@@ -127,8 +128,8 @@ load time instead of a mysterious crawl (`load_gguf` checks the size and bails).
 The whole forward, the kv cache, and every non-matmul kernel live in
 `model-cuda.cuh`; the **matmul is the only thing that differs** between the two
 GPU backends, so each is a thin file that includes the header and defines just
-`matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8.cu` to see exactly where
-the speed comes from.
+`matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8r.cu` to see exactly
+where the speed comes from.
 
 **`model-cuda-f32.cu` — the readable f32 matmul.** Built up in four steps, each diffed
 against the CPU output (byte-identical) before keeping it (E2B tok/s):
@@ -142,7 +143,7 @@ against the CPU output (byte-identical) before keeping it (E2B tok/s):
 4. **the warp cooperates on each block**, with per-element dequant fused into the
    dot — every lane stays busy and the per-row scratch buffer is gone. (36)
 
-**`model-cuda-i8.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
+**`model-cuda-i8r.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
 simplified). The activation is the same for every output row, so quantize it to
 int8 once per matmul (per 32-element group: a scale, the int8 values, and their
 sum). The per-row dot is then done in **integer arithmetic** per weight sub-block —
@@ -151,21 +152,24 @@ each group of four products goes through `__dp4a`, the 4-way int8 dot-product
 instruction. Because an integer dot is order-independent, this is **byte-identical**
 to the scalar version: pure speedup, zero numerical change. (The int8 *activation*
 is lossy, like every GPU inference engine, so the greedy path differs slightly from
-f32, but the output stays coherent and accurate.)
+f32, but the output stays coherent and accurate.) The int8 idea first shipped as a
+byte-load backend, `model-cuda-i8.cu`; the wide-load rework documented below replaced
+it — bit-identical output, strictly faster — and the original now lives in git history.
 
-Decode throughput (single token, all layers on GPU):
+Decode throughput at that first int8 milestone (single token, all layers on GPU):
 
-| model | f32 (`run-cuda`) | int8+dp4a (`run-cuda-i8`) | llama.cpp CUDA |
-|-------|-----------------:|--------------------------:|---------------:|
-| E2B   | ~35 tok/s        | ~63 tok/s                 | ~146 tok/s     |
-| 12B   | ~15 tok/s        | ~32 tok/s                 | ~64 tok/s      |
+| model | f32 (`run-cuda`) | int8+dp4a | llama.cpp CUDA |
+|-------|-----------------:|----------:|---------------:|
+| E2B   | ~35 tok/s        | ~63 tok/s | ~146 tok/s     |
+| 12B   | ~15 tok/s        | ~32 tok/s | ~64 tok/s      |
 
 So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
 llama.cpp's heavily-tuned kernels from ~4× to ~2×. (Those `int8+dp4a` numbers are the
-starting point; the optimizations documented below — activation-quant dedup and a CUDA
-graph — then take E2B to ~80 and 12B to ~35 tok/s.) The rest of this section walks the
-attempts to close the remaining gap: first two that **did not work**, then the two that
-did — the negative results are as instructive as the wins.
+starting point; the optimizations documented below — activation-quant dedup, a CUDA
+graph, and wide weight loads (`run-cuda-i8r`) — then take E2B to ~91 and 12B to
+~47 tok/s.) The rest of this section walks the attempts to close the remaining gap:
+first two that **did not work**, then the three that did — the negative results are
+as instructive as the wins.
 
 ### What didn't work (and why)
 
@@ -203,8 +207,9 @@ Closing the matmul's remaining ~2× (it runs at ~25% of peak bandwidth) needs a 
 per warp for latency hiding, arch-specific thread mapping. Decode is batch-1 and
 bandwidth-bound, so the int8 *tensor cores* that accelerate llama.cpp's batched matrix×matrix
 kernel (`mul_mat_q`, MMQ — used for prompt processing) don't apply here; the win is memory
-efficiency, not compute. A real rewrite, at odds with this codebase's goal of staying
-readable, left as future work. The wins that *did* land (next) are elsewhere.
+efficiency, not compute. A full rewrite stayed off the table, but the next two wins were
+elsewhere entirely — and then a thin slice of the MMVQ idea (just its wide loads, none of
+its restructuring) turned out to fit in ~30 changed lines: `model-cuda-i8r.cu`, below.
 
 ### What did work: activation-quant dedup
 
@@ -243,13 +248,66 @@ Two things make this work:
    Both backends use the same single graph path — `run-cuda` (f32) gains less (~+5%)
    because it is more compute-bound, but the forward stays genuinely *common*.
 
-The recurring lesson of this whole section: the cheap, safe wins were *outside* the
-matmul — removing redundant work (dedup) and removing launch overhead (the graph) — not
-in re-optimizing the matmul kernel, where every attempt regressed.
-
 **Net, with dedup + graph: E2B ~80 tok/s, 12B Q4_K_M ~35 tok/s** — the gap to llama.cpp
-CUDA is now ~1.8× (from the ~2× dp4a starting point above). The rest is the matmul
-efficiency that a fully tuned `mul_mat_vec_q` would address.
+CUDA at this point was ~1.8× (from the ~2× dp4a starting point above), all of it matmul
+memory efficiency.
+
+### What did work in the matmul after all: wide loads (`model-cuda-i8r.cu`)
+
+The matmul win that finally landed — `run-cuda-i8r` ("r" = repacked) — and the failed
+attempts above pointed straight at it. The kernel keeps the byte-load backend's exact
+structure (one warp per row, same lane→sub-block mapping, same integer dots, same float
+order — the output was verified **bit-identical** against `run-cuda-i8` on both models
+before that backend was retired); the only change is *how the weight bytes are read*. Each `__dp4a` group was built from 4–16 single-byte loads
+plus shift/or assembly; now it is **one aligned `uint32` load** with the packed values
+extracted by SIMD-in-word masks (all four q4_K nibbles at once: `q32 & 0x0F0F0F0F`).
+That is 4–16× fewer load instructions — aimed at the `lg_throttle` LSU saturation the
+profile showed on the large matmuls, and it shortens the stall chain on the small ones too.
+
+Wide loads need 4-byte alignment. q4_K (144 B) and q5_K (176 B) blocks already have it
+and are read in place; q3_K (110 B) and q6_K (210 B) do not, so those tensors are
+**repacked once on the host at upload** into padded, 4-aligned twins (116/212 B, +5.5%/+1%
+bytes). The repack also pre-unpacks q3_K's twisted 6-bit scales into flat int8 — the file
+format's layout quirks are paid once per model, not per sub-block per row per token.
+
+Result: **E2B 80→91.5 tok/s (+14%), 12B Q4_K_M 35→47.5 (+35%)**, bit-identical output.
+Why this worked when "coalescing" regressed three times: those variants restructured
+*which lane reads what* (and paid for it in divergence and shuffles); this keeps the
+proven mapping and only widens each load. The lesson is a sharper version of the old one:
+the enemy was never the access *pattern* alone — it was the per-byte load instruction
+count. (A fourth lever, 2 rows per warp for extra loads-in-flight on the small matmuls,
+was tried on top — uniform, adaptive, and template-specialized — and regressed every
+time, joining coalescing-remap and split-k as confirmed dead ends.)
+
+**Net, with dedup + graph + wide loads: E2B ~91 tok/s, 12B Q4_K_M ~47 tok/s** — the gap
+to llama.cpp CUDA is now ~1.6× on E2B and ~1.35× on 12B (from ~4× at the first f32
+kernel). The recurring lesson of this whole section, amended: the cheap, safe wins were
+the ones that *removed work* — redundant quantization (dedup), launch overhead (the
+graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
+rearranged work.
+
+### The whole arc, in numbers
+
+Decode throughput (tok/s, single-token generation, greedy) after each step, on the same
+machine (RTX A5000, Windows/WDDM). Steps 1–4 built up `model-cuda-f32.cu`; steps 5–9 are
+the int8 line that became `model-cuda-i8r.cu`. Numbers were measured as each step landed,
+in different sessions, so adjacent baselines drift by a tok/s or two (e.g. step 4 f32
+re-measured 34.7 later) — each step's delta was verified against its immediate
+predecessor at the time. "—" = not measured at that step.
+
+| # | step                                            | E2B Q3_K_M | 12B Q4_K_M |
+|---|-------------------------------------------------|-----------:|-----------:|
+| 0 | CPU, scalar + OpenMP (`run`)                    |        1.3 |       0.32 |
+| 1 | matmul on GPU, rest on host                     |        7.9 |          — |
+| 2 | whole forward device-resident                   |       10.3 |          — |
+| 3 | one warp per output row                         |       16.7 |          — |
+| 4 | warp cooperates per block, fused dequant (f32)  |         36 |         16 |
+| 5 | int8 activation, integer sub-block dot          |       54.5 |       20.7 |
+| 6 | `__dp4a`                                        |         63 |       31.7 |
+| 7 | activation-quant dedup                          |        ~65 |        ~33 |
+| 8 | CUDA graph (capture once, replay per token)     |       80.5 |       35.2 |
+| 9 | wide weight loads + q3/q6 repack (`i8r`)        |       91.5 |       47.5 |
+|   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 

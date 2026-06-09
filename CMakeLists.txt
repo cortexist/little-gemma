@@ -31,17 +31,19 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     # Two CUDA backends behind the same model.h, sharing model-cuda.cuh:
-    # run-cuda = readable f32-dequant matmul; run-cuda-i8 = int8 matmul.
-    add_executable(run-cuda    ${CORE} src/model-cuda-f32.cu)
-    add_executable(run-cuda-i8 ${CORE} src/model-cuda-i8.cu)
-    target_include_directories(run-cuda    PRIVATE include)
-    target_include_directories(run-cuda-i8 PRIVATE include)
-    set_target_properties(run-cuda run-cuda-i8 PROPERTIES CUDA_ARCHITECTURES "86")
-    # per-thread default stream: required to stream-capture the forward into a CUDA graph
-    # (the legacy default stream is not capturable). model_forward always replays a graph.
-    target_compile_options(run-cuda    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
-    target_compile_options(run-cuda-i8 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
-    message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8")
+    # run-cuda = readable f32-dequant matmul; run-cuda-i8r = int8 matmul with
+    # wide loads from (re)aligned weights. (The intermediate byte-load int8
+    # backend, model-cuda-i8.cu, lives in git history — see the README.)
+    add_executable(run-cuda     ${CORE} src/model-cuda-f32.cu)
+    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu)
+    foreach(tgt run-cuda run-cuda-i8r)
+        target_include_directories(${tgt} PRIVATE include)
+        set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "86")
+        # per-thread default stream: required to stream-capture the forward into a CUDA graph
+        # (the legacy default stream is not capturable). model_forward always replays a graph.
+        target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+    endforeach()
+    message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8r")
 else()
     message(STATUS "CUDA not found — skipping run-cuda")
 endif()
