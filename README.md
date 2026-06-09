@@ -161,9 +161,46 @@ Decode throughput (single token, all layers on GPU):
 | 12B   | ~15 tok/s        | ~32 tok/s                 | ~64 tok/s      |
 
 So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
-llama.cpp's heavily-tuned kernels from ~4× to ~2×. The remaining ~2× is structural
-(warp specialization, tiling, tighter memory scheduling) — well beyond `dp4a`, and
-left as future work.
+llama.cpp's heavily-tuned kernels from ~4× to ~2×. The remaining ~2× is structural,
+and the rest of this section documents two attempts to close it that **did not work** —
+kept here because the negative results are more instructive than the wins.
+
+### What didn't work (and why)
+
+Profiling the matmul (`matmul_i8_kernel`, one warp per output row) with Nsight Compute
+on an RTX A5000 shows it runs at only ~25% of peak memory bandwidth, with **two
+distinct bottleneck regimes**:
+
+- **Large matmuls** (`lm_head`, late-layer ffn): the load/store unit's issue queue is
+  saturated (`lg_throttle`) at ~88% occupancy — too many tiny, *uncoalesced* byte loads.
+- **Small matmuls** (most of them, `m ≤ 2048`): bound by raw memory latency
+  (`long_scoreboard`) at only ~46% occupancy — one warp per row underfills the GPU.
+
+**Attempt 1 — coalesced loads (`mul_mat_vec_q`-style).** Remap so consecutive lanes read
+consecutive bytes (`((uint32_t*)qs)[lane]`) instead of scattered sub-blocks. This *worked*
+at the hardware level: global load efficiency went 7→66%, sectors/request 16.9→1.57,
+`lg_throttle` essentially vanished. But **tok/s got slightly worse** (E2B 64→62, 12B
+Q4_K_M 31→29) across three variants (per-element scaling; segmented reduction; scales
+hoisted via shuffle). The catch: the matmuls that are cleanly coalesce-able (q4_K, whose
+144-byte blocks are 16-aligned) are the *small, latency-bound* ones — after coalescing,
+`long_scoreboard` still dominates at 46% occupancy, so the duration doesn't move. The
+large matmuls that *would* benefit are q3_K, whose 110-byte block stride isn't 4-aligned,
+so `uint32` loads of its `qs` fault. Lesson: **load efficiency is not the objective
+function — wall-clock is.** It improved 9× while tok/s regressed, three times.
+
+**Attempt 2 — split-k for occupancy.** Have `nsplit` warps cooperate on each row (each
+summing a strided subset of the k-blocks, combined in shared memory) to raise occupancy
+on the small matmuls. Also regressed (uniform `nsplit=2`: E2B 64→60; adaptive, leaving
+large matmuls untouched: 60). The split (small) matmuls got *slower*: at a few k-blocks
+per row, the fixed per-warp overhead (setup, warp-reduce, shared-mem combine) outweighs
+the latency hidden by extra warps. So occupancy wasn't really the limiter at these sizes.
+
+The takeaway: the one-warp-per-row kernel is near a local optimum for incremental changes.
+Closing the last 2× needs a from-scratch MMQ-style kernel (different tiling, the `q8_1`
+activation path, tensor-core-style accumulation) — a large rewrite at odds with this
+codebase's goal of staying readable — and is left as future work. Lower-risk wins remain
+*outside* the matmul: `quantize_act_kernel` is ~13% of GPU time and redundant (q/k/v
+share one activation; gate/up share one), and the bf16 fallback runs lane-0-only.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
