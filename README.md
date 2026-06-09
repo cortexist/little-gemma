@@ -161,9 +161,11 @@ Decode throughput (single token, all layers on GPU):
 | 12B   | ~15 tok/s        | ~32 tok/s                 | ~64 tok/s      |
 
 So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
-llama.cpp's heavily-tuned kernels from ~4× to ~2×. The remaining ~2× is structural,
-and the rest of this section documents two attempts to close it that **did not work** —
-kept here because the negative results are more instructive than the wins.
+llama.cpp's heavily-tuned kernels from ~4× to ~2×. (Those `int8+dp4a` numbers are the
+starting point; the optimizations documented below — activation-quant dedup and a CUDA
+graph — then take E2B to ~80 and 12B to ~35 tok/s.) The rest of this section walks the
+attempts to close the remaining gap: first two that **did not work**, then the two that
+did — the negative results are as instructive as the wins.
 
 ### What didn't work (and why)
 
@@ -196,9 +198,10 @@ per row, the fixed per-warp overhead (setup, warp-reduce, shared-mem combine) ou
 the latency hidden by extra warps. So occupancy wasn't really the limiter at these sizes.
 
 The takeaway: the one-warp-per-row kernel is near a local optimum for incremental changes.
-Closing the last 2× needs a from-scratch MMQ-style kernel (different tiling, the `q8_1`
-activation path, tensor-core-style accumulation) — a large rewrite at odds with this
-codebase's goal of staying readable — and is left as future work.
+Closing the matmul's remaining ~2× (it runs at ~25% of peak bandwidth) needs a from-scratch
+MMQ-style kernel (different tiling, the `q8_1` activation path, tensor-core-style
+accumulation) — a large rewrite at odds with this codebase's goal of staying readable — and
+is left as future work. The wins that *did* land (next) are elsewhere.
 
 ### What did work: activation-quant dedup
 
@@ -210,6 +213,40 @@ call sites use it. Bit-identical output, and **+2–3% (E2B) / +4% (12B Q4_K_M)*
 lines. The remaining lever is the bf16 fallback (`per_layer_model_proj`), which runs
 lane-0-only. The lesson worth keeping: the cheap, safe win was *removing redundant work
 around* the matmul, not micro-optimizing the matmul itself.
+
+### What did work most: a CUDA graph
+
+The biggest single win, and it isn't in any kernel. Profiling showed **~30% of each
+token's wall-clock is GPU-*idle*** — the forward issues ~1,000 kernel launches per token
+(35 layers × ~29 kernels), and on Windows/WDDM the per-launch latency leaves the GPU
+waiting between them (GPU-busy ~10.6 ms vs ~15.4 ms wall → a ~94 tok/s ceiling). The fix
+is to **capture the forward into a CUDA graph once and replay it** — ~1,000 launches
+collapse into a single graph launch. Result: **E2B 67→80 tok/s (+19%), 12B Q4_K_M
+32→35 (+13% over the un-graphed baseline)**, bit-identical output. E2B gains more because
+it is more launch-bound; the larger 12B spends relatively more time in actual compute.
+
+Two things make this work:
+
+1. **The graph must be static.** A naive "re-capture every token + `cudaGraphExecUpdate`"
+   was *flat* — recording 1,000 nodes costs as much as launching them. The win requires
+   capture-*once*, replay-*many*. So every per-token-varying input — the position (which
+   drives the KV-cache write offset, the RoPE angle, and the attention range) — is read
+   on-device from a one-int `d_pos` buffer that the host updates before each launch. The
+   nodes themselves never change. (Attention shared memory is fixed at `max_seq` floats,
+   which caps context at ~12k tokens without an online-softmax rewrite.)
+2. **Capture needs the per-thread default stream** (`--default-stream=per-thread`; the
+   legacy default stream can't be captured), and no `cudaMalloc`/sync mid-capture (two
+   tokens run un-captured first so the activation-scratch allocation is already done).
+   Both backends use the same single graph path — `run-cuda` (f32) gains less (~+5%)
+   because it is more compute-bound, but the forward stays genuinely *common*.
+
+The recurring lesson of this whole section: the cheap, safe wins were *outside* the
+matmul — removing redundant work (dedup) and removing launch overhead (the graph) — not
+in re-optimizing the matmul kernel, where every attempt regressed.
+
+**Net, with dedup + graph: E2B ~80 tok/s, 12B Q4_K_M ~35 tok/s** — the gap to llama.cpp
+CUDA is now ~1.8× (from the ~2× dp4a starting point above). The rest is the matmul
+efficiency that an MMQ rewrite would address.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 

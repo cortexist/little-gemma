@@ -74,9 +74,10 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
 }
 
 // GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
-__global__ static void rope_kernel(float *v, int half, int hd, int pos, float base, const float *ff, int total) {
+__global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
+    int pos = *d_pos;                                  // device-resident: lets the forward be a static graph
     int head = idx / half, i = idx % half;
     float *vh = v + (size_t)head * hd;
     float freq = powf(base, -2.0f * (float)i / (float)hd);
@@ -85,12 +86,16 @@ __global__ static void rope_kernel(float *v, int half, int hd, int pos, float ba
     vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
 }
 
-// Attention for the current query position: one block per query head.
-// Shared memory holds the (pos-start+1) attention scores. Scale is 1.0 (Gemma4).
+// Attention for the current query position: one block per query head. pos is device-
+// resident and start is derived in-kernel (so the launch params never change across
+// tokens -> the forward captures into a static CUDA graph). window=0 means full causal.
+// Shared memory holds the (pos-start+1) scores; the launch sizes it for max_seq. Scale 1.0.
 __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
-                                   int hd, int kv_dim, int gqa, int start, int pos) {
+                                   int hd, int kv_dim, int gqa, const int *d_pos, int window) {
     int hh = blockIdx.x, kvh = hh / gqa;
     const float *qh = q + (size_t)hh * hd;
+    int pos = *d_pos;
+    int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
     int T = pos - start + 1;
     extern __shared__ float att[];
     for (int t = threadIdx.x; t < T; t += blockDim.x) {
@@ -111,6 +116,13 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
         for (int t = 0; t < T; t++) { const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd; acc += att[t] * vt[i]; }
         outh[i] = acc;
     }
+}
+
+// Write one row (length n) into the kv cache at the device-resident position. Replaces
+// a pos-offset cudaMemcpy so the node is static (constant args) and graph-capturable.
+__global__ static void kv_write_kernel(float *dst, const float *src, const int *d_pos, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[(size_t)(*d_pos) * n + i] = src[i];
 }
 
 __device__ static float d_gelu(float x) {
@@ -164,6 +176,7 @@ static int kv_src_dev(const struct model *m, int L) {
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
+static int *d_pos;                      // device-resident token position (for static graph)
 static int scratch_ok = 0;
 
 static void ensure_scratch(struct model *m) {
@@ -181,6 +194,7 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&dxb, (size_t)q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, (size_t)maxkv * 4));
     CUDA_CHECK(cudaMalloc(&dvb, (size_t)maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, (size_t)nff * 4));
     CUDA_CHECK(cudaMalloc(&dg2, (size_t)nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
+    CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     if (ple > 0) {
         size_t total = (size_t)ple * c->n_layer;
         CUDA_CHECK(cudaMalloc(&dpg,   (size_t)ple * 4));
@@ -247,21 +261,17 @@ static int build_per_layer(struct model *m, int token) {
     return 1;
 }
 
-extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
-    ensure_weights(m);
-    ensure_scratch(m);
+// Device-only slice of the forward — the part a CUDA graph will capture: all layers
+// plus the final norm and output projection. dx already holds the scaled embedding and
+// d_ipl the PLE inputs; every op runs on the (per-thread) default stream with no host
+// work or sync, so it is stream-capturable. KV-cache writes use async copies for the
+// same reason (a synchronous cudaMemcpy is illegal mid-capture).
+static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
-
-    // embedding lookup (host dequant of one row) -> scale -> upload to device
-    float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
-    float es = sqrtf((float)n_embd);
-    for (int i = 0; i < n_embd; i++) erow[i] *= es;
-    CUDA_CHECK(cudaMemcpy(dx, erow, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
-    free(erow);
-
-    int has_ple = build_per_layer(m, token);
+    const int has_ple = c->n_embd_per_layer > 0 &&
+                        gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;
     const float *d_rope_freqs = dW(m, "rope_freqs.weight");
 
     for (int L = 0; L < c->n_layer; L++) {
@@ -275,25 +285,24 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
         rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps);
         matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps);
-        rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, pos, base, ff, n_head * hd / 2);
+        rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2);
 
         int src = kv_src_dev(m, L);
         if (L < c->n_kv_start) {
             matmul_q_same(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);  // reuses q's dh
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
             if (wv) matmul_q_same(dvb, wv, dh, n_embd, kv_dim);                       // reuses q's dh
-            else    CUDA_CHECK(cudaMemcpy(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
+            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice, 0));
             rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps);
             rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps);  // plain V norm
-            rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, pos, base, ff, n_head_kv * hd / 2);
-            CUDA_CHECK(cudaMemcpy(kv->k[L] + (size_t)pos * kv_dim, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(kv->v[L] + (size_t)pos * kv_dim, dvb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice));
+            rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2);
+            kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim);    // dst offset from d_pos
+            kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim);
         }
         const float *Kc = kv->k[src], *Vc = kv->v[src];
-        int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
-                  ? pos - c->sliding_window + 1 : 0;
-        int gqa = n_head / n_head_kv, T = pos - start + 1;
-        attn_kernel<<<n_head, 128, (size_t)T * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, start, pos);
+        int gqa = n_head / n_head_kv;
+        int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
+        attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window);
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
@@ -328,6 +337,48 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
+}
+
+// Capture the device-only forward into a CUDA graph once, then replay it every token:
+// ~1000 per-token kernel launches collapse into one graph launch, erasing the WDDM
+// launch latency that leaves the GPU idle ~30% of each token. The graph is fully STATIC
+// because every per-token-varying input (token position, hence the kv-write offset, the
+// rope angle, and the attention range) is read on-device from d_pos, which model_forward
+// updates before each launch — so node parameters never change and one exec graph serves
+// all tokens. The first two tokens run un-captured so ensure_act's one-time cudaMalloc
+// (illegal mid-capture) is already done before capture. (Requires the per-thread default
+// stream — see CMakeLists — since the legacy default stream cannot be captured.)
+static cudaGraphExec_t g_graph_exec = NULL;
+static int g_graph_warmups = 0;
+static void forward_graph(struct model *m, struct kvcache *kv) {
+    if (g_graph_warmups < 2) { g_graph_warmups++; forward_layers_and_head(m, kv); return; }
+    if (!g_graph_exec) {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        forward_layers_and_head(m, kv);
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&g_graph_exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaGraphLaunch(g_graph_exec, cudaStreamPerThread));
+}
+
+extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
+    ensure_weights(m);
+    ensure_scratch(m);
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+
+    // embedding lookup (host dequant of one row) -> scale -> upload to device
+    float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
+    float es = sqrtf((float)n_embd);
+    for (int i = 0; i < n_embd; i++) erow[i] *= es;
+    CUDA_CHECK(cudaMemcpy(dx, erow, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
+    free(erow);
+
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));  // graph reads pos from here
+    build_per_layer(m, token);
+    forward_graph(m, kv);               // capture once, then replay the forward each token
 
     CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)c->n_vocab * 4, cudaMemcpyDeviceToHost));
 }

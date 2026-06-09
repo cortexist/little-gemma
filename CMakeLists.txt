@@ -37,6 +37,10 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(run-cuda    PRIVATE include)
     target_include_directories(run-cuda-i8 PRIVATE include)
     set_target_properties(run-cuda run-cuda-i8 PROPERTIES CUDA_ARCHITECTURES "86")
+    # per-thread default stream: required to stream-capture the forward into a CUDA graph
+    # (the legacy default stream is not capturable). model_forward always replays a graph.
+    target_compile_options(run-cuda    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+    target_compile_options(run-cuda-i8 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
     message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8")
 else()
     message(STATUS "CUDA not found — skipping run-cuda")
