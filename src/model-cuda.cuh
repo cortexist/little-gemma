@@ -64,10 +64,12 @@ __device__ static void d_gsm(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
 // output as an epilogue. The f32 backend passes AQ0 (all NULL) and the branch
 // vanishes; the int8 backend hands out its buffers via actq_for (seam, below).
 
-struct actq { int8_t *xq; float *xd; int *xs; };
-static const struct actq AQ0 = { NULL, NULL, NULL };
+// Per 32-element group: the int8 values, plus scale and value-sum packed as one
+// float2 — a single load serves both (the sum is ≤ 32·127, exact as a float).
+struct actq { int8_t *xq; float2 *xds; };
+static const struct actq AQ0 = { NULL, NULL };
 
-// Quantize one 32-element group g (global index) of x into int8 + scale + sum.
+// Quantize one 32-element group g (global index) of x into int8 + (scale, sum).
 __device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
     float amax = 0.0f;
     for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xb[i]));
@@ -75,7 +77,7 @@ __device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
     int8_t *q = aq.xq + (size_t)g * 32;
     int sum = 0;
     for (int i = 0; i < 32; i++) { int v = __float2int_rn(xb[i] * id); q[i] = (int8_t)v; sum += v; }
-    aq.xd[g] = d; aq.xs[g] = sum;
+    aq.xds[g] = make_float2(d, (float)sum);
 }
 
 // ====================  non-matmul compute kernels  =========================
@@ -233,6 +235,25 @@ __global__ static void scale_const_kernel(float *a, float s, int n) { int i = bl
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
 __global__ static void softcap_kernel(float *l, float sc, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) l[i] = sc * tanhf(l[i] / sc); }
 
+// Greedy pick on the device: one 1024-thread block scans the logits. Ties break
+// toward the lower index, matching the CPU's first-max scan exactly.
+__global__ static void argmax_kernel(const float *x, int n, int *out) {
+    __shared__ float bv[1024]; __shared__ int bi[1024];
+    float v = -INFINITY; int idx = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (x[i] > v) { v = x[i]; idx = i; }
+    bv[threadIdx.x] = v; bi[threadIdx.x] = idx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && (bv[threadIdx.x + s] > bv[threadIdx.x] ||
+            (bv[threadIdx.x + s] == bv[threadIdx.x] && bi[threadIdx.x + s] < bi[threadIdx.x]))) {
+            bv[threadIdx.x] = bv[threadIdx.x + s]; bi[threadIdx.x] = bi[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = bi[0];
+}
+
 // ====================  device state: weights + scratch  =====================
 
 static const struct gguf_context *g_ctx = NULL;
@@ -274,7 +295,28 @@ static int kv_src_dev(const struct model *m, int L) {
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
 static int *d_pos;                      // device-resident token position (for static graph)
+static int *d_best;                     // device-side argmax result
 static int scratch_ok = 0;
+
+// Fork/join: a graph is a dependency DAG, not a tape. Independent matmuls that
+// read the same activation (k+v beside q; up beside gate) are recorded on a side
+// stream between two events, so they run CONCURRENTLY in the replayed graph —
+// the small latency-bound matmuls hide under the bigger one for free. matmul_q
+// launches on g_launch; the forward points it at the side stream inside a fork.
+static cudaStream_t g_launch = cudaStreamPerThread, g_side;
+static cudaEvent_t g_fork, g_join;
+static void side_begin(void) {                          // side stream branches off here
+    CUDA_CHECK(cudaEventRecord(g_fork, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamWaitEvent(g_side, g_fork, 0));
+    g_launch = g_side;
+}
+static void side_end(void) {                            // side work recorded; main runs on
+    CUDA_CHECK(cudaEventRecord(g_join, g_side));
+    g_launch = cudaStreamPerThread;
+}
+static void side_sync(void) {                           // main needs the side results now
+    CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, g_join, 0));
+}
 
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
@@ -292,6 +334,7 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&dvb, (size_t)maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, (size_t)nff * 4));
     CUDA_CHECK(cudaMalloc(&dg2, (size_t)nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
         size_t total = (size_t)ple * c->n_layer;
         CUDA_CHECK(cudaMalloc(&dpg,   (size_t)ple * 4));
@@ -299,6 +342,9 @@ static void ensure_scratch(struct model *m) {
         CUDA_CHECK(cudaMalloc(&d_tok, total * 4));
         CUDA_CHECK(cudaMalloc(&d_proj,total * 4));
     }
+    CUDA_CHECK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
     scratch_ok = 1;
 }
 
@@ -387,16 +433,22 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
 
         // ---- attention ----
         rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(n_embd));
-        matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
-        rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
-        rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2);
 
         int src = kv_src_dev(m, L);
-        if (L < c->n_kv_start) {
+        const int has_kv = L < c->n_kv_start;
+        if (has_kv) {                                   // k+v matmuls run beside q's
+            side_begin();
             matmul_q(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);   // dh still quantized
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
             if (wv) matmul_q(dvb, wv, dh, n_embd, kv_dim);
-            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice, 0));
+            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice, g_side));
+            side_end();
+        }
+        matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
+        rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2);
+        if (has_kv) {
+            side_sync();
             rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);  // plain V norm
             rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2);
@@ -414,8 +466,11 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(n_embd));
-        matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        side_begin();
         matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);          // dh still quantized
+        side_end();
+        matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        side_sync();
         geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff, actq_for(nff));
         matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
@@ -461,7 +516,7 @@ static void forward_graph(struct model *m, struct kvcache *kv) {
     CUDA_CHECK(cudaGraphLaunch(g_graph_exec, cudaStreamPerThread));
 }
 
-extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
+static void forward_token(struct model *m, struct kvcache *kv, int token, int pos) {
     ensure_weights(m);
     ensure_scratch(m);
     const struct config *c = &m->cfg;
@@ -477,8 +532,19 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));  // graph reads pos from here
     build_per_layer(m, token);
     forward_graph(m, kv);               // capture once, then replay the forward each token
+}
 
-    CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)c->n_vocab * 4, cudaMemcpyDeviceToHost));
+extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
+    forward_token(m, kv, token, pos);
+    CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
+}
+
+extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) {
+    forward_token(m, kv, token, pos);
+    argmax_kernel<<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
+    int best;
+    CUDA_CHECK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
+    return best;
 }
 
 #endif // MODEL_CUDA_CUH

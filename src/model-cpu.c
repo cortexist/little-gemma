@@ -313,3 +313,17 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
     free(o); free(g1); free(g2); free(att); free(pg);
     free(inp_per_layer);   // rope_freqs and all weights are owned by the cache
 }
+
+// Forward + greedy pick. On the CPU this is just a scan over the logits; the
+// CUDA backends do the argmax on the device so the logits never cross the bus.
+int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) {
+    static float *lbuf = NULL;
+    if (!lbuf) {
+        lbuf = malloc((size_t)m->cfg.n_vocab * sizeof(float));
+        if (!lbuf) return -1;
+    }
+    model_forward(m, kv, token, pos, lbuf);
+    int best = 0;
+    for (int v = 1; v < m->cfg.n_vocab; v++) if (lbuf[v] > lbuf[best]) best = v;
+    return best;
+}

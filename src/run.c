@@ -44,7 +44,6 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     if (kvcache_init(&kv, &m, n_prompt + N_GEN + 1) != 0) {
         model_free(&m); tokenizer_free(tk); return;
     }
-    float *logits = malloc((size_t)m.cfg.n_vocab * sizeof(float));
     int pos = 0;
     // Stop at end-of-turn. gemma4's turn end is <turn|>; the gguf eos_token_id is
     // <turn|> on E2B but <eos> on 12B, so stop on either.
@@ -60,17 +59,16 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     printf("%s\n", prompt);
     fflush(stdout);
 
-    // prefill
+    // prefill: the last prompt token's forward also picks the first generated token
     clock_t tp = clock();
-    for (int i = 0; i < n_prompt; i++) model_forward(&m, &kv, promptv[i], pos++, logits);
+    for (int i = 0; i + 1 < n_prompt; i++) model_forward_next(&m, &kv, promptv[i], pos++);
+    int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = (double)(clock() - tp) / CLOCKS_PER_SEC;
 
     // greedy generation
     clock_t tg = clock();
     int g = 0;
     for (; g < N_GEN; g++) {
-        int best = 0;
-        for (int v = 1; v < m.cfg.n_vocab; v++) if (logits[v] > logits[best]) best = v;
         if (best == eot || best == eos) break;               // end of turn
         if (best == ch_open)  in_thought = 1;                // channel name starts
         else if (best == ch_close) in_thought = 0;           // channel name ends
@@ -78,7 +76,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
             print_piece(tokenizer_token_text(tk, best));
             fflush(stdout);
         }
-        model_forward(&m, &kv, best, pos++, logits);
+        best = model_forward_next(&m, &kv, best, pos++);
     }
     double t_gen = (double)(clock() - tg) / CLOCKS_PER_SEC;
 
@@ -88,7 +86,6 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     fprintf(stderr, "gen:    %d tokens in %.2fs (%.2f tok/s)\n",
             g, t_gen, g / (t_gen > 0 ? t_gen : 1e-9));
 
-    free(logits);
     kvcache_free(&kv);
     model_free(&m);
     tokenizer_free(tk);

@@ -71,8 +71,24 @@ __device__ static uint32_t ld32(const void *p) { return *(const uint32_t *)p; }
 // further than uint32: one 128-bit vector load replaces four word loads.
 __device__ static int nib4(uint32_t w, int half) { return (int)(half ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu); }
 
-__device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb, const float *xdb, const int *xsb) {
-    uint8_t sc, mm; d_gsm(sj, p->scales, &sc, &mm);
+// d_gsm with the 12 scale bytes read as 3 words instead of 2-3 scattered bytes
+// (same bits, fewer and wider loads); s must be 4-aligned (it is: offset 4).
+__device__ static void d_gsm32(int j, const uint32_t *s, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = (s[0] >> (8 * j)) & 63; *m = (s[1] >> (8 * j)) & 63; }
+    else {
+        int b = 8 * (j - 4);
+        *d = ((s[2] >> b) & 0x0F) | (((s[0] >> (b + 6)) & 3) << 4);
+        *m = (((s[2] >> b) >> 4) & 0x0F) | (((s[1] >> (b + 6)) & 3) << 4);
+    }
+}
+// d and dmin are adjacent fp16 — one word load covers both.
+__device__ static void d_dm(const ggml_half *dp, float *d, float *mn) {
+    uint32_t w = ld32(dp);
+    *d = d_fp16((uint16_t)w); *mn = d_fp16((uint16_t)(w >> 16));
+}
+
+__device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb, const float2 *xds) {
+    uint8_t sc, mm; d_gsm32(sj, (const uint32_t *)p->scales, &sc, &mm);
     int g = sj >> 1, half = sj & 1;
     const uint4 *q = (const uint4 *)(p->qs + g * 32);
     const int4  *a = (const int4 *)(xqb + sj * 32);  // sub-block sj == activation group sj
@@ -84,11 +100,11 @@ __device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb,
         dot = __dp4a(nib4(q4.z, half), a4.z, dot);
         dot = __dp4a(nib4(q4.w, half), a4.w, dot);
     }
-    float d = d_fp16(p->d), mn = d_fp16(p->dmin);
-    return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
+    float d, mn; d_dm(&p->d, &d, &mn);
+    return xds[sj].x * (d * sc * dot - mn * mm * xds[sj].y);
 }
-__device__ static float sub_q5_K(const block_q5_K *p, int sj, const int8_t *xqb, const float *xdb, const int *xsb) {
-    uint8_t sc, mm; d_gsm(sj, p->scales, &sc, &mm);
+__device__ static float sub_q5_K(const block_q5_K *p, int sj, const int8_t *xqb, const float2 *xds) {
+    uint8_t sc, mm; d_gsm32(sj, (const uint32_t *)p->scales, &sc, &mm);
     int g = sj >> 1, half = sj & 1;
     const uint4 *q = (const uint4 *)(p->qs + g * 32);
     const uint4 *qh = (const uint4 *)p->qh;
@@ -102,10 +118,10 @@ __device__ static float sub_q5_K(const block_q5_K *p, int sj, const int8_t *xqb,
         dot = __dp4a(nib4(q4.z, half) | (int)(((h4.z >> bitpos) & 0x01010101u) << 4), a4.z, dot);
         dot = __dp4a(nib4(q4.w, half) | (int)(((h4.w >> bitpos) & 0x01010101u) << 4), a4.w, dot);
     }
-    float d = d_fp16(p->d), mn = d_fp16(p->dmin);
-    return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
+    float d, mn; d_dm(&p->d, &d, &mn);
+    return xds[sj].x * (d * sc * dot - mn * mm * xds[sj].y);
 }
-__device__ static float sub_q3_Kr(const block_q3_Kr *p, int sj, const int8_t *xqb, const float *xdb) {
+__device__ static float sub_q3_Kr(const block_q3_Kr *p, int sj, const int8_t *xqb, const float2 *xds) {
     int ni = sj >> 3, rem = sj & 7, j = rem >> 1, half = rem & 1;
     int shift = 2 * j, bitpos = ni * 4 + j;
     const uint8_t *qs = p->qs + ni * 32 + half * 16;
@@ -119,9 +135,9 @@ __device__ static float sub_q3_Kr(const block_q3_Kr *p, int sj, const int8_t *xq
         int w = (int)__vsub4(q32, __vsub4(0x04040404u, h32 << 2));  // q - 4*(1 - hbit), per byte
         dot = __dp4a(w, *(const int *)(xqg + l), dot);
     }
-    return xdb[g_act] * d_fp16(p->d) * p->scales[sj] * dot;
+    return xds[g_act].x * d_fp16(p->d) * p->scales[sj] * dot;
 }
-__device__ static float sub_q6_Kr(const block_q6_Kr *p, int sj, const int8_t *xqb, const float *xdb) {
+__device__ static float sub_q6_Kr(const block_q6_Kr *p, int sj, const int8_t *xqb, const float2 *xds) {
     int ni = sj >> 3, rem = sj & 7, grp = rem >> 1, hl = rem & 1;
     int sh = grp * 2, off = (grp & 1) ? 32 : 0, hin = (grp >= 2);
     const uint8_t *ql = p->ql + ni * 64 + off + hl * 16;
@@ -136,12 +152,12 @@ __device__ static float sub_q6_Kr(const block_q6_Kr *p, int sj, const int8_t *xq
         int w = (int)__vsub4(lo | hi, 0x20202020u);
         dot = __dp4a(w, *(const int *)(xqg + i), dot);
     }
-    return xdb[g_act] * d_fp16(p->d) * p->scales[ni * 8 + 2 * grp + hl] * dot;
+    return xds[g_act].x * d_fp16(p->d) * p->scales[ni * 8 + 2 * grp + hl] * dot;
 }
-__device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const float *xdb) {
+__device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const float2 *xds) {
     int dot = 0;                                   // not in the test models; kept scalar
     for (int i = 0; i < 32; i++) dot += (int)p->qs[i] * xqb[i];
-    return xdb[0] * d_fp16(p->d) * dot;
+    return xds[0].x * d_fp16(p->d) * dot;
 }
 
 // out[i] = W[i,:] . x : one warp per output row. For K-quant/q8_0 weights the
@@ -153,7 +169,7 @@ __device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const f
 // alike; the one-row shape stays.)
 __global__ static void __launch_bounds__(256, 6)
 matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
-                  const float *x, const int8_t *xq, const float *xd, const int *xs, int k, int m) {
+                  const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (warp >= m) return;
@@ -172,14 +188,13 @@ matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int 
             int b = si / nsub, sj = si % nsub;
             const unsigned char *blk = row + (size_t)b * ts;
             const int8_t *xqb = xq + (size_t)b * blck;
-            const float  *xdb = xd + (size_t)b * gpb;
-            const int    *xsb = xs + (size_t)b * gpb;
+            const float2 *xdsb = xds + (size_t)b * gpb;
             switch (type) {
-                case GGML_TYPE_Q4_K: s += sub_q4_K((const block_q4_K *)blk, sj, xqb, xdb, xsb); break;
-                case GGML_TYPE_Q5_K: s += sub_q5_K((const block_q5_K *)blk, sj, xqb, xdb, xsb); break;
-                case GGML_TYPE_Q3_K: s += sub_q3_Kr((const block_q3_Kr *)blk, sj, xqb, xdb); break;
-                case GGML_TYPE_Q6_K: s += sub_q6_Kr((const block_q6_Kr *)blk, sj, xqb, xdb); break;
-                case GGML_TYPE_Q8_0: s += sub_q8_0((const block_q8_0 *)blk, xqb, xdb); break;
+                case GGML_TYPE_Q4_K: s += sub_q4_K((const block_q4_K *)blk, sj, xqb, xdsb); break;
+                case GGML_TYPE_Q5_K: s += sub_q5_K((const block_q5_K *)blk, sj, xqb, xdsb); break;
+                case GGML_TYPE_Q3_K: s += sub_q3_Kr((const block_q3_Kr *)blk, sj, xqb, xdsb); break;
+                case GGML_TYPE_Q6_K: s += sub_q6_Kr((const block_q6_Kr *)blk, sj, xqb, xdsb); break;
+                case GGML_TYPE_Q8_0: s += sub_q8_0((const block_q8_0 *)blk, xqb, xdsb); break;
             }
         }
     } else if (type == GGML_TYPE_F32) {                  // float fallbacks: lanes split the row
@@ -261,33 +276,47 @@ static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
 }
 
 // Quantized activation scratch (grows as needed; reused across matmuls).
-static int8_t *g_xq = NULL; static float *g_xd = NULL; static int *g_xs = NULL;
+static int8_t *g_xq = NULL; static float2 *g_xds = NULL;
 static int g_act_cap = 0;
 static void ensure_act(int k) {
     if (k <= g_act_cap) return;
-    cudaFree(g_xq); cudaFree(g_xd); cudaFree(g_xs);
+    cudaFree(g_xq); cudaFree(g_xds);
     CUDA_CHECK(cudaMalloc(&g_xq, (size_t)k));
-    CUDA_CHECK(cudaMalloc(&g_xd, (size_t)(k / 32) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&g_xs, (size_t)(k / 32) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_xds, (size_t)(k / 32) * sizeof(float2)));
     g_act_cap = k;
 }
 
-// The backend seam. The activation's int8 form is already in g_xq/g_xd/g_xs —
+// The backend seam. The activation's int8 form is already in g_xq/g_xds —
 // put there by the producer kernel's epilogue (actq_for) or by act_quantize.
 // (d_x is still needed for the bf16/f32/f16 fallback path, which dots floats.)
 static struct actq actq_for(int k) {
     ensure_act(k);
-    struct actq aq = { g_xq, g_xd, g_xs };
+    struct actq aq = { g_xq, g_xds };
     return aq;
 }
 static void act_quantize(const float *d_x, int k) {
     int ng = k / 32;
     quantize_act_kernel<<<gridn(ng), 256>>>(d_x, actq_for(k), ng);
 }
+// Repack/upload every quantized tensor up front: lazy per-tensor uploads would
+// otherwise happen between fork events, unordered against the side stream.
+static void rweight_init_all(void) {
+    static int done = 0;
+    if (done) return;
+    for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
+        const struct gguf_tensor *t = &g_ctx->tensors[i];
+        int ts;
+        if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0) rweight(t, &ts);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    done = 1;
+}
+
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    matmul_i8r_kernel<<<blocks, 256>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xd, g_xs, k, m);
+    matmul_i8r_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }

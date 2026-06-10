@@ -65,4 +65,9 @@ void kvcache_free(struct kvcache *kv);
 // softcap); logits match the llama.cpp reference.
 void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits);
 
+// Same forward, but returns argmax(logits) — the greedy next token — instead of
+// the logits themselves. On the GPU backends the argmax runs on the device, so
+// 4 bytes cross the bus per token instead of the whole vocabulary's logits.
+int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos);
+
 #endif // MODEL_H

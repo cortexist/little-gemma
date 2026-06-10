@@ -289,7 +289,7 @@ the ones that *removed work* — redundant quantization (dedup), launch overhead
 graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
 rearranged work.
 
-### The long tail: seven more wins
+### The long tail: ten more wins
 
 With the matmul's loads fixed, an nsys re-profile showed the new cost structure:
 matmul 64.8% (its small instances still latency-bound), `quantize_act` 13.9%
@@ -340,13 +340,46 @@ gated on tok/s and on unchanged output:
    per timestep dots with coalesced lane-split loads, and the softmax max/sum are
    block-parallel reductions. **12B +4.9%, E2B +10.4%** at ~200 context — and the
    win grows with context length, which is what vision/audio token streams will need.
+8. **Wide scale fetches.** The last loads still issued one byte at a time were the
+   q4_K/q5_K sub-block scales (`d_gsm`) and the `d`/`dmin` halves; reading the
+   12 scale bytes as 3 words and `d`+`dmin` as one (`d_gsm32`/`d_dm`), plus packing
+   the activation's per-group (scale, sum) as a single `float2`, is bit-identical
+   and worth ~+1% (12B). A fourth dead-end fell out of the same investigation:
+   processing both nibble halves of a q4_K/q5_K sub-block pair in one lane (they
+   share the same 32 qs bytes, so it halves the weight loads!) *regressed* ~3-5%
+   on both models — the doubled register live-range and halved work-item count
+   cost more than the loads saved. Same family as split-k and rows-per-warp:
+   in latency-bound kernels, restructuring who-does-what keeps losing to simply
+   making each load wider.
+9. **Fork/join in the graph.** A graph is a dependency DAG, not a tape — but the
+   forward recorded k, v, q (and gate, up) serially, even though k+v read the
+   same activation as q and write elsewhere. Recording k+v on a side stream
+   between two events makes them genuinely concurrent in the replayed graph: the
+   tiny latency-bound k/v matmuls (grid 64 — 12% of one GPU) hide under q for
+   free. 12B +2.5%, E2B +2.9%, bit-identical. **The bug that almost shipped:**
+   the first version was nondeterministic — the lazy per-tensor weight upload
+   (`rweight`) could land *between* the fork events, unordered against the side
+   stream, so token 0's k/v occasionally read half-uploaded weights and poisoned
+   the KV cache. Five bisection steps (fork without work, work without
+   concurrency, hard barriers, pure reorder) cornered it; the fix — repack and
+   upload *everything eagerly* before the first forward — also moved that cost
+   out of the measured prompt phase. Concurrency bugs don't announce themselves;
+   determinism checks (same binary, twice) are part of the gate now.
+10. **Greedy pick on the device.** Every token ended with a synchronous download
+   of all 262k logits (1 MB) and a CPU scan, serialized with the GPU. A new
+   `model_forward_next` runs a 1024-thread argmax kernel and downloads 4 bytes;
+   ties break low-index to match the CPU scan exactly, so it is bit-identical.
+   The CPU backend implements it as the same scan it always did. **E2B +14.9%,
+   12B +4.7%** — the WDDM sync round-trip was worth far more than the bytes.
 
-**Net: E2B ~153 tok/s — little-gemma now decodes E2B *faster* than llama.cpp CUDA
-(146) on this machine. 12B Q4_K_M ~56 tok/s, gap 1.14×.** The lesson of the day:
-profile again after every structural change — and profile the model you actually
-care about, in steady state, not just at token 0; each fix exposes the next
-bottleneck somewhere new, and repeatedly the big one was *outside* the kernel
-everyone stares at.
+**Net: E2B ~182 tok/s — 26% *faster* than llama.cpp CUDA (145.0 ± 5.2, re-measured
+the same day on the same machine). 12B Q4_K_M ~60 tok/s against llama.cpp's
+63.5 ± 0.6: 4.8% behind, on a measurement that pays for longer context than
+`llama-bench tg32` does.** The lesson of the
+day: profile again after every structural change — and profile the model you
+actually care about, in steady state, not just at token 0; each fix exposes the
+next bottleneck somewhere new, and repeatedly the big one was *outside* the
+kernel everyone stares at.
 
 ### The whole arc, in numbers
 
@@ -357,26 +390,35 @@ in different sessions, so adjacent baselines drift by a tok/s or two (e.g. step 
 re-measured 34.7 later) — each step's delta was verified against its immediate
 predecessor at the time. "—" = not measured at that step.
 
-| # | step                                            | E2B Q3_K_M | 12B Q4_K_M |
-|---|-------------------------------------------------|-----------:|-----------:|
-| 0 | CPU, scalar + OpenMP (`run`)                    |        1.3 |       0.32 |
-| 1 | matmul on GPU, rest on host                     |        7.9 |          — |
-| 2 | whole forward device-resident                   |       10.3 |          — |
-| 3 | one warp per output row                         |       16.7 |          — |
-| 4 | warp cooperates per block, fused dequant (f32)  |         36 |         16 |
-| 5 | int8 activation, integer sub-block dot          |       54.5 |       20.7 |
-| 6 | `__dp4a`                                        |         63 |       31.7 |
-| 7 | activation-quant dedup                          |        ~65 |        ~33 |
-| 8 | CUDA graph (capture once, replay per token)     |       80.5 |       35.2 |
-| 9 | wide weight loads + q3/q6 repack (`i8r`)        |       91.5 |       47.5 |
-| 10 | 128-bit q4_K/q5_K loads                        |       91.2 |       49.4 |
-| 11 | warp-parallel float fallback (PLE bf16)        |      124.3 |        ~49 |
-| 12 | `__launch_bounds__` (6 blocks/SM)              |      126.6 |       49.2 |
-| 13 | quantize where born (producer epilogues)       |      134.5 |       50.1 |
-| 14 | fused post-norm chain (rmsnorm+add+scale)      |      134.9 |       50.9 |
-| 15 | 1024-thread full-width norms                   |      138.8 |       53.3 |
-| 16 | warp-parallel attention (coalesced K, par. softmax) | 153.2 |       55.9 |
-|   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
+| #  | step                                                 | E2B Q3_K_M  | 12B Q4_K_M |
+|----|------------------------------------------------------|------------:|-----------:|
+| 0  | CPU, scalar + OpenMP (`run`)                         |         1.3 |       0.32 |
+| 1  | matmul on GPU, rest on host                          |         7.9 |          — |
+| 2  | whole forward device-resident                        |        10.3 |          — |
+| 3  | one warp per output row                              |        16.7 |          — |
+| 4  | warp cooperates per block, fused dequant (f32)       |          36 |         16 |
+| 5  | int8 activation, integer sub-block dot               |        54.5 |       20.7 |
+| 6  | `__dp4a`                                             |          63 |       31.7 |
+| 7  | activation-quant dedup                               |         ~65 |        ~33 |
+| 8  | CUDA graph (capture once, replay per token)          |        80.5 |       35.2 |
+| 9  | wide weight loads + q3/q6 repack (`i8r`)             |        91.5 |       47.5 |
+| 10 | 128-bit q4_K/q5_K loads                              |        91.2 |       49.4 |
+| 11 | warp-parallel float fallback (PLE bf16)              |       124.3 |        ~49 |
+| 12 | `__launch_bounds__` (6 blocks/SM)                    |       126.6 |       49.2 |
+| 13 | quantize where born (producer epilogues)             |       134.5 |       50.1 |
+| 14 | fused post-norm chain (rmsnorm+add+scale)            |       134.9 |       50.9 |
+| 15 | 1024-thread full-width norms                         |       138.8 |       53.3 |
+| 16 | warp-parallel attention (coalesced K, par. softmax)  |       153.2 |       55.9 |
+| 17 | wide scale fetches + packed (scale,sum) float2       |       154.5 |       56.3 |
+| 18 | graph fork/join (k+v beside q, up beside gate)       |       158.9 |       57.7 |
+| 19 | greedy argmax on the device (4 B/token, not 1 MB)    |       182.5 |       60.4 |
+|    | llama.cpp CUDA, same machine, re-measured at step 19 | 145.0 ± 5.2 | 63.5 ± 0.6 |
+
+One asymmetry to keep in mind when reading the last two rows: `llama-bench tg32`
+generates 32 tokens from an empty context (the cheapest attention possible), while
+the little-gemma numbers are measured over ~187 generated tokens at positions
+23–210, paying attention's per-position growth the whole way. On an identical
+workload the comparison shifts slightly further in little-gemma's favor.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -398,8 +440,23 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 10    | 2,115 | 200     | 290   | 2,605 |
-| include   | 5     | 209   | 82      | 57    | 348   |
+| src       | 10    | 2,365 | 291     | 313   | 2,969 |
+| include   | 5     | 210   | 85      | 58    | 353   |
+
+2,575 lines of code in the repository (self-imposed ceiling while exploring: 3,000) —
+but the backends are mutually exclusive, so no single program is anywhere near that.
+Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config, CLI —
+1,353 lines) plus exactly one backend:
+
+| binary        | backend on top of the shared 1,353        | code lines |
+|---------------|-------------------------------------------|-----------:|
+| `run`         | `model-cpu.c`                             |      1,600 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      1,859 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,005 |
+
+(`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
+only.) So the program that decodes E2B 26% faster than llama.cpp CUDA is **2,005
+lines of C end to end** — tokenizer included.
 
 ## Validation
 
