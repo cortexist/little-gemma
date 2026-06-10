@@ -144,9 +144,19 @@ the second turn (or pin the clocks while measuring with
 
 AF_UNIX works on Windows 10+ with the same code (`afunix.h`); the socket path's
 directory must exist (`/tmp/...` is a Linux path — on Windows use e.g.
-`%TEMP%\lg.sock`). Native Windows has no socat, so the binary doubles as a
-minimal client: `run -c <socket>` pumps stdin lines to the server and prints
-each streamed turn.
+`%TEMP%\lg.sock`). On native Windows, the usual clients are simply not there:
+no socat, `ncat` can't speak AF_UNIX, and even Python's `socket` module doesn't
+expose it. The build therefore ships its own:
+
+```
+socket_cat %TEMP%\lg.sock                          # the wire, verbatim
+run -c %TEMP%\lg.sock                              # the conversation, cleaned up
+```
+
+`socket_cat` (`tools/socket_cat.c`) is the missing netcat: stdin to the socket,
+socket to stdout, no protocol — you see the raw token stream exactly as sent,
+`<turn|>` markers and all. `run -c` is the protocol-aware client: it pumps
+stdin lines as turns and knows where each streamed reply ends.
 
 ## On SIMD (AVX2) — intentionally not implemented
 
