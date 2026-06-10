@@ -128,6 +128,20 @@ join it later without breaking anything:
   in flight; only a hard reset aborts generation early — checked between
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.
 
+**Don't read benchmark numbers out of one-question sessions.** The per-turn
+tok/s will swing wildly for the same question — 13, then 61, then 134, then 60
+tok/s — and that is the GPU, not the server. The first session after load pays
+one-time warmup (weight repack and upload, CUDA graph capture). After that the
+variance is clock ramping: an idle GPU parks at its floor (210 of 2100 MHz on
+the A5000 here), and a one-question session is only ~25–35 forwards — ~0.2 s
+of work at full clock — so the whole session can fit inside the ramp, and the
+reported rate is just where in the ramp it landed. Run sessions back-to-back
+fast enough and some catch the previous session's still-raised clocks, hence
+the up-and-down. The numbers in the tables below are steady state: pipeline
+several turns into one connection and the rate reaches the table's value by
+the second turn (or pin the clocks while measuring with
+`nvidia-smi --lock-gpu-clocks`, which needs an elevated shell).
+
 AF_UNIX works on Windows 10+ with the same code (`afunix.h`); the socket path's
 directory must exist (`/tmp/...` is a Linux path — on Windows use e.g.
 `%TEMP%\lg.sock`). Native Windows has no socat, so the binary doubles as a
