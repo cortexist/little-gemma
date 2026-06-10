@@ -420,6 +420,24 @@ the little-gemma numbers are measured over ~187 generated tokens at positions
 23–210, paying attention's per-position growth the whole way. On an identical
 workload the comparison shifts slightly further in little-gemma's favor.
 
+### Where things stand, across the whole Gemma 4 family
+
+Same machine, same day, both sides re-measured (little-gemma = `run-cuda-i8r`,
+~166–187 generated tokens; llama.cpp = `llama-bench tg32`):
+
+| model | size | params | little-gemma | llama.cpp CUDA | ratio |
+|-------|-----:|-------:|-------------:|---------------:|------:|
+| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.5 | 145.0 ± 5.2 | **1.26×** |
+| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.4 | 112.9 ± 1.8 | **1.01×** |
+| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.4 |  63.5 ± 0.6 | 0.95× |
+
+The pattern is the project's thesis in one table. The smaller the model, the more
+decode speed is about everything *around* the matmul — launch overhead, sync
+round-trips, norms, the PLE path — which 2,000 readable lines can do leanly. The
+bigger the model, the more it reduces to one number: sustained DRAM bandwidth
+through the quantized matmul, where llama.cpp's arch-tuned kernels still hold a
+few percent. The crossover for this codebase currently sits right around E4B.
+
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
 Both **no CUDA, no SIMD intrinsics, 12 threads**, single-token generation:
