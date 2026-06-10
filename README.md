@@ -289,7 +289,7 @@ the ones that *removed work* — redundant quantization (dedup), launch overhead
 graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
 rearranged work.
 
-### The long tail: five more wins
+### The long tail: six more wins
 
 With the matmul's loads fixed, an nsys re-profile showed the new cost structure:
 matmul 64.8% (its small instances still latency-bound), `quantize_act` 13.9%
@@ -325,11 +325,18 @@ gated on tok/s and on unchanged output:
    *visibly* diverged (163→162 generated tokens). One `__fadd_rn` restores the
    unfused rounding and the bit-identical guarantee. 12B +1.6%; E2B neutral but
    ~100 fewer graph nodes per token.
+6. **1024-thread norms.** Profiling the *12B* (not E2B — its 48 dense layers and
+   n_embd 3840 weight the costs differently) showed the norms at 16.5% of GPU
+   time: every full-width rmsnorm ran as a single 256-thread block — one quarter
+   of one SM working, 63 SMs idle. The single-row norms now launch 1024 threads
+   (per-head rows stay at 256). Changes the reduction tree, so like the fallback
+   fix it is numerically equivalent rather than bit-identical. **12B +4.7%,
+   E2B +2.9%.**
 
-**Net: E2B ~135 tok/s, 12B Q4_K_M ~51 tok/s — gaps of 1.08× and 1.26× to llama.cpp
-CUDA.** The lesson of the day: profile again after every structural change; each fix
-exposes the next bottleneck somewhere new, and twice now the big one was *outside*
-the kernel everyone stares at.
+**Net: E2B ~139 tok/s, 12B Q4_K_M ~53 tok/s — gaps of 1.05× and 1.20× to llama.cpp
+CUDA.** The lesson of the day: profile again after every structural change — and
+profile the model you actually care about; each fix exposes the next bottleneck
+somewhere new, and twice now the big one was *outside* the kernel everyone stares at.
 
 ### The whole arc, in numbers
 
@@ -357,6 +364,7 @@ predecessor at the time. "—" = not measured at that step.
 | 12 | `__launch_bounds__` (6 blocks/SM)              |      126.6 |       49.2 |
 | 13 | quantize where born (producer epilogues)       |      134.5 |       50.1 |
 | 14 | fused post-norm chain (rmsnorm+add+scale)      |      134.9 |       50.9 |
+| 15 | 1024-thread full-width norms                   |      138.8 |       53.3 |
 |   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)

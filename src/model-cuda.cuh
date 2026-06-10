@@ -81,12 +81,15 @@ __device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
 // ====================  non-matmul compute kernels  =========================
 
 // RMSNorm over `rows` vectors of length n. w (length n, shared across rows) or NULL.
-// One block (256 threads) per row.
+// One block per row — 1024 threads for the lone full-width row (a 256-thread
+// block leaves the SM mostly idle and every other SM entirely idle), 256 for
+// the small per-head rows.
+#define NORM_THREADS(n) ((n) >= 1024 ? 1024 : 256)
 __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w, int n, float eps, struct actq aq) {
     int row = blockIdx.x;
     const float *xr = x + (size_t)row * n;
     float *outr = out + (size_t)row * n;
-    __shared__ float sh[256];
+    __shared__ float sh[1024];
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     sh[threadIdx.x] = ss;
@@ -108,7 +111,7 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
 // optional per-layer output scale os, and (epilogue) quantizes the result.
 __global__ static void rmsnorm_add_kernel(float *acc, const float *x, const float *w, int n, float eps,
                                           const float *os, struct actq aq) {
-    __shared__ float sh[256];
+    __shared__ float sh[1024];
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
     sh[threadIdx.x] = ss;
@@ -365,7 +368,7 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const float *os = dW_layer(m, L, "layer_output_scale.weight");  // applied by the layer's last rmsnorm_add
 
         // ---- attention ----
-        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(n_embd));
+        rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(n_embd));
         matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2);
@@ -388,16 +391,16 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
-        rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
+        rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
-        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(n_embd));
+        rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(n_embd));
         matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
         matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);          // dh still quantized
         geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff, actq_for(nff));
         matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
-        rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
+        rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
                                        has_ple ? NULL : os, has_ple ? actq_for(n_embd) : AQ0);  // PLE reads dx next
 
         // ---- per-layer input (PLE) ----
@@ -406,11 +409,11 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
             matmul_q(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
             geglu_kernel<<<gridn(ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, actq_for(ple));
             matmul_q(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
-            rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
+            rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
         }
     }
 
-    rmsnorm_kernel<<<1, 256>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps, actq_for(n_embd));
+    rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps, actq_for(n_embd));
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
