@@ -19,6 +19,9 @@ set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c)
 # --- CPU build -------------------------------------------------------------
 add_executable(run ${CORE} src/model-cpu.c)
 target_include_directories(run PRIVATE include)
+if(WIN32)
+    target_link_libraries(run PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+endif()
 
 find_package(OpenMP)
 if(OpenMP_C_FOUND)
@@ -38,6 +41,9 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu)
     foreach(tgt run-cuda run-cuda-i8r)
         target_include_directories(${tgt} PRIVATE include)
+        if(WIN32)
+            target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+        endif()
         set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "86")
         # per-thread default stream: required to stream-capture the forward into a CUDA graph
         # (the legacy default stream is not capturable). model_forward always replays a graph.

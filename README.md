@@ -85,14 +85,13 @@ Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
 
 ## Usage
 
-The CLI is just two flags:
-
 ```
-run -m <model.gguf> [-p "prompt"]
+run -m <model.gguf> [-p "prompt" | -s <socket>]
+run -c <socket>
 ```
 
 - `-m` only → prints the GGUF dump + config, then exits.
-- `-m` + `-p` → also tokenizes the prompt, generates, and reports tok/s.
+- `-m` + `-p` → one-shot demo: tokenizes the prompt, generates, reports tok/s.
 
 ```
 > run -m model.gguf -p "The capital of France is"
@@ -100,6 +99,38 @@ The capital of France is Paris.
 prompt: 6 tokens in 4.68s (1.28 tok/s)
 gen:    2 tokens in 1.48s (1.35 tok/s)
 ```
+
+### Serving over a Unix-domain socket (`-s`)
+
+`-s` turns the runner into a tiny conversation server — no HTTP, no JSON, no web
+security surface; transport concerns (TCP exposure, TLS, auth) belong to `socat`
+and to whatever chat server or agent sits downstream:
+
+```
+run-cuda-i8r -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
+echo "What is the capital of France?" | socat - UNIX-CONNECT:/tmp/lg.sock
+```
+
+The protocol is the simplest thing that works, designed so raw media frames can
+join it later without breaking anything:
+
+- **A connection is a conversation.** The kv cache lives for the connection, so
+  multi-turn context is free; close the connection (or just stop typing into
+  socat) to end the session. One conversation is served at a time — decode is
+  batch-1, and the listen backlog is the queue.
+- **A line is a user turn.** Each newline-terminated line is wrapped in the
+  Gemma chat template and prefilled.
+- **The reply is the raw token stream**, special tokens included — the thinking
+  channel, the markers, and the closing `<turn|>` that downstream tools can
+  split turns on. The server filters nothing; presentation is the client's job.
+- stdout/stderr are logging only; per-turn stats go to stderr.
+- A clean half-close (e.g. socat after stdin EOF) still receives the full turn
+  in flight; only a hard reset aborts generation early — checked between
+  tokens, so one ~5–17 ms forward is the most work a dead client can waste.
+
+AF_UNIX works on Windows 10+ with the same code (`afunix.h`). Native Windows has
+no socat, so the binary doubles as a minimal client: `run -c <socket>` pumps
+stdin lines to the server and prints each streamed turn.
 
 ## On SIMD (AVX2) — intentionally not implemented
 
@@ -458,23 +489,23 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 10    | 2,365 | 291     | 313   | 2,969 |
+| src       | 10    | 2,520 | 316     | 323   | 3,159 |
 | include   | 5     | 210   | 85      | 58    | 353   |
 
-2,575 lines of code in the repository (self-imposed ceiling while exploring: 3,000) —
+2,730 lines of code in the repository (self-imposed ceiling while exploring: 3,000) —
 but the backends are mutually exclusive, so no single program is anywhere near that.
-Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config, CLI —
-1,353 lines) plus exactly one backend:
+Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config, CLI +
+socket server — 1,508 lines) plus exactly one backend:
 
-| binary        | backend on top of the shared 1,353        | code lines |
+| binary        | backend on top of the shared 1,508        | code lines |
 |---------------|-------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                             |      1,600 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      1,859 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,005 |
+| `run`         | `model-cpu.c`                             |      1,755 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,014 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,160 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
-only.) So the program that decodes E2B 26% faster than llama.cpp CUDA is **2,005
-lines of C end to end** — tokenizer included.
+only.) So the program that decodes E2B 26% faster than llama.cpp CUDA — multi-turn
+socket serving included — is **2,160 lines of C end to end**, tokenizer and all.
 
 ## Validation
 
