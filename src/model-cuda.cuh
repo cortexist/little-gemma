@@ -102,6 +102,31 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
     }
 }
 
+// The tail of every sub-layer is "rmsnorm the output, add it to the residual,
+// maybe scale" — three round-trips through global memory as separate kernels.
+// Fused: one block normalizes x (length n), accumulates into acc, applies the
+// optional per-layer output scale os, and (epilogue) quantizes the result.
+__global__ static void rmsnorm_add_kernel(float *acc, const float *x, const float *w, int n, float eps,
+                                          const float *os, struct actq aq) {
+    __shared__ float sh[256];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
+    float scale = rsqrtf(sh[0] / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        // __fadd_rn keeps the separately-rounded mul-then-add of the unfused
+        // kernels (an FMA here would change the last bit, and the greedy path).
+        float v = __fadd_rn(acc[i], x[i] * scale * w[i]);
+        acc[i] = os ? v * os[0] : v;
+    }
+    if (aq.xq) {
+        __syncthreads();
+        for (int g = threadIdx.x; g < n / 32; g += blockDim.x) d_quant_group(acc + g * 32, g, aq);
+    }
+}
+
 // GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
 __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -184,7 +209,6 @@ __global__ static void geglu_kernel(float *g, const float *u, int n, struct actq
     d_quant_block(g, n, aq);
 }
 __global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
-__global__ static void scale_ptr_kernel(float *a, const float *s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s[0]; }
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
 __global__ static void softcap_kernel(float *l, float sc, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) l[i] = sc * tanhf(l[i] / sc); }
 
@@ -338,6 +362,7 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const int q_dim = n_head * hd, kv_dim = n_head_kv * hd;
         const float base = local ? c->rope_freq_base_swa : c->rope_freq_base;
         const float *ff = local ? NULL : d_rope_freqs;
+        const float *os = dW_layer(m, L, "layer_output_scale.weight");  // applied by the layer's last rmsnorm_add
 
         // ---- attention ----
         rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(n_embd));
@@ -363,8 +388,7 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
-        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, AQ0);
-        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, AQ0);
+        rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
@@ -373,8 +397,8 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);          // dh still quantized
         geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff, actq_for(nff));
         matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
-        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps, AQ0);
-        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, has_ple ? actq_for(n_embd) : AQ0);  // PLE reads dx next
+        rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
+                                       has_ple ? NULL : os, has_ple ? actq_for(n_embd) : AQ0);  // PLE reads dx next
 
         // ---- per-layer input (PLE) ----
         if (has_ple) {
@@ -382,13 +406,8 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
             matmul_q(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
             geglu_kernel<<<gridn(ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, actq_for(ple));
             matmul_q(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
-            rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, AQ0);
-            add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, AQ0);
+            rmsnorm_add_kernel<<<1, 256>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
         }
-
-        // ---- per-layer output scale ----
-        const float *os = dW_layer(m, L, "layer_output_scale.weight");
-        if (os) scale_ptr_kernel<<<gridn(n_embd), 256>>>(dx, os, n_embd);
     }
 
     rmsnorm_kernel<<<1, 256>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps, actq_for(n_embd));

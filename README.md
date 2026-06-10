@@ -289,7 +289,7 @@ the ones that *removed work* — redundant quantization (dedup), launch overhead
 graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
 rearranged work.
 
-### The long tail: four more wins
+### The long tail: five more wins
 
 With the matmul's loads fixed, an nsys re-profile showed the new cost structure:
 matmul 64.8% (its small instances still latency-bound), `quantize_act` 13.9%
@@ -317,8 +317,16 @@ gated on tok/s and on unchanged output:
    vanishes. `matmul_q_same` is gone — every matmul input is pre-quantized by its
    producer, and the embedding (the one activation no kernel produces) gets an
    explicit `act_quantize`. E2B +3.6%, 12B +1.7%, bit-identical.
+5. **Fused post-norm chain.** Every sub-layer ends "rmsnorm → residual add →
+   (output scale)" — up to three kernels and three global-memory round-trips.
+   `rmsnorm_add_kernel` does all of it (plus the quantize epilogue) in one. A catch
+   worth recording: the naive fusion let nvcc contract the norm-multiply and the
+   residual-add into an FMA — different in the last bit, and the greedy path
+   *visibly* diverged (163→162 generated tokens). One `__fadd_rn` restores the
+   unfused rounding and the bit-identical guarantee. 12B +1.6%; E2B neutral but
+   ~100 fewer graph nodes per token.
 
-**Net: E2B ~134 tok/s, 12B Q4_K_M ~50 tok/s — gaps of 1.09× and 1.28× to llama.cpp
+**Net: E2B ~135 tok/s, 12B Q4_K_M ~51 tok/s — gaps of 1.08× and 1.26× to llama.cpp
 CUDA.** The lesson of the day: profile again after every structural change; each fix
 exposes the next bottleneck somewhere new, and twice now the big one was *outside*
 the kernel everyone stares at.
@@ -348,6 +356,7 @@ predecessor at the time. "—" = not measured at that step.
 | 11 | warp-parallel float fallback (PLE bf16)        |      124.3 |        ~49 |
 | 12 | `__launch_bounds__` (6 blocks/SM)              |      126.6 |       49.2 |
 | 13 | quantize where born (producer epilogues)       |      134.5 |       50.1 |
+| 14 | fused post-norm chain (rmsnorm+add+scale)      |      134.9 |       50.9 |
 |   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
