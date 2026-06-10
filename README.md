@@ -128,9 +128,11 @@ join it later without breaking anything:
   in flight; only a hard reset aborts generation early — checked between
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.
 
-AF_UNIX works on Windows 10+ with the same code (`afunix.h`). Native Windows has
-no socat, so the binary doubles as a minimal client: `run -c <socket>` pumps
-stdin lines to the server and prints each streamed turn.
+AF_UNIX works on Windows 10+ with the same code (`afunix.h`); the socket path's
+directory must exist (`/tmp/...` is a Linux path — on Windows use e.g.
+`%TEMP%\lg.sock`). Native Windows has no socat, so the binary doubles as a
+minimal client: `run -c <socket>` pumps stdin lines to the server and prints
+each streamed turn.
 
 ## On SIMD (AVX2) — intentionally not implemented
 

@@ -10,6 +10,7 @@
 typedef SOCKET sock_t;
 #define sock_close closesocket
 static int sock_init(void) { WSADATA w; return WSAStartup(MAKEWORD(2, 2), &w); }
+static int sock_err(void) { return WSAGetLastError(); }
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -21,6 +22,7 @@ typedef int sock_t;
 #define sock_close close
 // A dead client must surface as a send() error, not a fatal signal.
 static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
+static int sock_err(void) { return errno; }
 #endif
 
 #include "gguf.h"
@@ -127,9 +129,11 @@ static void serve(const struct gguf_context *ctx, const char *path) {
     strcpy(sa.sun_path, path);
     remove(path);                                       // stale socket from a previous run
     if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 4) != 0) {
-        fprintf(stderr, "bind/listen on %s failed\n", path); return;
+        fprintf(stderr, "bind/listen on %s failed (error %d) - note the socket's directory must exist\n",
+                path, sock_err());
+        return;
     }
-    fprintf(stderr, "listening on %s — one conversation per connection, Ctrl-C to stop\n", path);
+    fprintf(stderr, "listening on %s - one conversation per connection, Ctrl-C to stop\n", path);
 
     for (;;) {
         sock_t c = accept(ls, NULL, NULL);

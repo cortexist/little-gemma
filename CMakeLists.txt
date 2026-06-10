@@ -54,6 +54,17 @@ else()
     message(STATUS "CUDA not found — skipping run-cuda")
 endif()
 
+# --- tools -------------------------------------------------------------------
+# socket_cat: AF_UNIX stdin/stdout client for talking to `run -s` on systems
+# without socat (native Windows, most of all).
+add_executable(socket_cat tools/socket_cat.c)
+if(WIN32)
+    target_link_libraries(socket_cat PRIVATE ws2_32)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(socket_cat PRIVATE Threads::Threads)
+endif()
+
 # --- tensor/graph self-test ------------------------------------------------
 add_executable(graph_test test/graph_test.c src/graph.c)
 target_include_directories(graph_test PRIVATE include)
