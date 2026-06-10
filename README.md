@@ -289,7 +289,7 @@ the ones that *removed work* — redundant quantization (dedup), launch overhead
 graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
 rearranged work.
 
-### The long tail: six more wins
+### The long tail: seven more wins
 
 With the matmul's loads fixed, an nsys re-profile showed the new cost structure:
 matmul 64.8% (its small instances still latency-bound), `quantize_act` 13.9%
@@ -332,11 +332,21 @@ gated on tok/s and on unchanged output:
    (per-head rows stay at 256). Changes the reduction tree, so like the fallback
    fix it is numerically equivalent rather than bit-identical. **12B +4.7%,
    E2B +2.9%.**
+7. **Warp-parallel attention.** A steady-state profile (nsys `--cuda-graph-trace=node`,
+   so the graph-replayed kernels are itemized — the default trace only shows warmup)
+   put attention at 14.9% and *growing with position*: each score was one thread
+   serially dotting a K row (a warp touched 32 different rows — ~1 useful float per
+   memory sector), and the whole softmax ran serially on thread 0. Now one **warp**
+   per timestep dots with coalesced lane-split loads, and the softmax max/sum are
+   block-parallel reductions. **12B +4.9%, E2B +10.4%** at ~200 context — and the
+   win grows with context length, which is what vision/audio token streams will need.
 
-**Net: E2B ~139 tok/s, 12B Q4_K_M ~53 tok/s — gaps of 1.05× and 1.20× to llama.cpp
-CUDA.** The lesson of the day: profile again after every structural change — and
-profile the model you actually care about; each fix exposes the next bottleneck
-somewhere new, and twice now the big one was *outside* the kernel everyone stares at.
+**Net: E2B ~153 tok/s — little-gemma now decodes E2B *faster* than llama.cpp CUDA
+(146) on this machine. 12B Q4_K_M ~56 tok/s, gap 1.14×.** The lesson of the day:
+profile again after every structural change — and profile the model you actually
+care about, in steady state, not just at token 0; each fix exposes the next
+bottleneck somewhere new, and repeatedly the big one was *outside* the kernel
+everyone stares at.
 
 ### The whole arc, in numbers
 
@@ -365,6 +375,7 @@ predecessor at the time. "—" = not measured at that step.
 | 13 | quantize where born (producer epilogues)       |      134.5 |       50.1 |
 | 14 | fused post-norm chain (rmsnorm+add+scale)      |      134.9 |       50.9 |
 | 15 | 1024-thread full-width norms                   |      138.8 |       53.3 |
+| 16 | warp-parallel attention (coalesced K, par. softmax) | 153.2 |       55.9 |
 |   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)

@@ -155,17 +155,35 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
     int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
     int T = pos - start + 1;
     extern __shared__ float att[];
-    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+    __shared__ float red[256];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    // scores: one WARP per timestep — the lanes split the dot, so the K row is
+    // read with coalesced 128-byte loads (one thread per timestep made each warp
+    // touch 32 different rows: ~1 useful float per memory sector).
+    for (int t = warp; t < T; t += nwarp) {
         const float *kt = Kc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
-        float s = 0.0f; for (int i = 0; i < hd; i++) s += qh[i] * kt[i];
-        att[t] = s;
+        float s = 0.0f;
+        for (int i = lane; i < hd; i += 32) s += qh[i] * kt[i];
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) att[t] = s;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float mx = att[0]; for (int t = 1; t < T; t++) if (att[t] > mx) mx = att[t];
-        float sum = 0.0f; for (int t = 0; t < T; t++) { att[t] = expf(att[t] - mx); sum += att[t]; }
-        float inv = 1.0f / sum; for (int t = 0; t < T; t++) att[t] *= inv;
-    }
+    // softmax over att[0..T): block-parallel max, then exp+sum, then scale
+    // (was a serial thread-0 loop — 3*T dependent ops once T grows).
+    float mx = -INFINITY;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) mx = fmaxf(mx, att[t]);
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    mx = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) { float e = expf(att[t] - mx); att[t] = e; sum += e; }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    float inv = 1.0f / red[0];
+    for (int t = threadIdx.x; t < T; t += blockDim.x) att[t] *= inv;
     __syncthreads();
     float *outh = xb + (size_t)hh * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
@@ -388,7 +406,7 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const float *Kc = kv->k[src], *Vc = kv->v[src];
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
-        attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
+        attn_kernel<<<n_head, 256, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
