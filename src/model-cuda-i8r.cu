@@ -30,19 +30,13 @@
 
 #include "model-cuda.cuh"
 
-// Quantize the activation into int8 per 32-element group: xq (int8), xd (scale),
-// xs (sum of the int8 values, used for weight min terms). One thread per group.
-__global__ static void quantize_act_kernel(const float *x, int8_t *xq, float *xd, int *xs, int ng) {
+// Quantize a whole activation in one kernel (one thread per 32-element group).
+// Almost every activation is quantized by its producer's epilogue instead (see
+// model-cuda.cuh); this remains for the one with no producer kernel, the
+// host-uploaded embedding (act_quantize).
+__global__ static void quantize_act_kernel(const float *x, struct actq aq, int ng) {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= ng) return;
-    const float *xb = x + (size_t)g * 32;
-    float amax = 0.0f;
-    for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xb[i]));
-    float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
-    int8_t *q = xq + (size_t)g * 32;
-    int sum = 0;
-    for (int i = 0; i < 32; i++) { int v = __float2int_rn(xb[i] * id); q[i] = (int8_t)v; sum += v; }
-    xd[g] = d; xs[g] = sum;
+    if (g < ng) d_quant_group(x + (size_t)g * 32, g, aq);
 }
 
 // ---- repacked block layouts (4-aligned strides; built on host, read on device) ----
@@ -73,16 +67,22 @@ __device__ static uint32_t ld32(const void *p) { return *(const uint32_t *)p; }
 // The per-element index math mirrors model-cuda-f32.cu; each dp4a's weight int
 // comes from one uint32 load + masks instead of 4 byte loads + shifts.
 
+// q4_K/q5_K block strides (144/176) are multiples of 16, so their qs/qh can go
+// further than uint32: one 128-bit vector load replaces four word loads.
+__device__ static int nib4(uint32_t w, int half) { return (int)(half ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu); }
+
 __device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb, const float *xdb, const int *xsb) {
     uint8_t sc, mm; d_gsm(sj, p->scales, &sc, &mm);
     int g = sj >> 1, half = sj & 1;
-    const uint8_t *q = p->qs + g * 32;
-    const int8_t *xqg = xqb + sj * 32;             // sub-block sj == activation group sj
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    const int4  *a = (const int4 *)(xqb + sj * 32);  // sub-block sj == activation group sj
     int dot = 0;
-    for (int u = 0; u < 32; u += 4) {
-        uint32_t q32 = ld32(q + u);                // 4 bytes = 4 nibbles of each half
-        int w = (int)(half ? (q32 >> 4) & 0x0F0F0F0Fu : q32 & 0x0F0F0F0Fu);
-        dot = __dp4a(w, *(const int *)(xqg + u), dot);
+    for (int h = 0; h < 2; h++) {
+        uint4 q4 = q[h]; int4 a4 = a[h];           // 16 weight bytes + 16 activation int8
+        dot = __dp4a(nib4(q4.x, half), a4.x, dot);
+        dot = __dp4a(nib4(q4.y, half), a4.y, dot);
+        dot = __dp4a(nib4(q4.z, half), a4.z, dot);
+        dot = __dp4a(nib4(q4.w, half), a4.w, dot);
     }
     float d = d_fp16(p->d), mn = d_fp16(p->dmin);
     return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
@@ -90,15 +90,17 @@ __device__ static float sub_q4_K(const block_q4_K *p, int sj, const int8_t *xqb,
 __device__ static float sub_q5_K(const block_q5_K *p, int sj, const int8_t *xqb, const float *xdb, const int *xsb) {
     uint8_t sc, mm; d_gsm(sj, p->scales, &sc, &mm);
     int g = sj >> 1, half = sj & 1;
-    const uint8_t *q = p->qs + g * 32;
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    const uint4 *qh = (const uint4 *)p->qh;
+    const int4  *a = (const int4 *)(xqb + sj * 32);
     int bitpos = 2 * g + half;                     // which qh bit holds this sub-block's 5th bit
-    const int8_t *xqg = xqb + sj * 32;
     int dot = 0;                                   // 4-bit + high bit -> value 0..31
-    for (int u = 0; u < 32; u += 4) {
-        uint32_t q32 = ld32(q + u), h32 = ld32(p->qh + u);
-        uint32_t nib = half ? (q32 >> 4) & 0x0F0F0F0Fu : q32 & 0x0F0F0F0Fu;
-        uint32_t hi  = ((h32 >> bitpos) & 0x01010101u) << 4;
-        dot = __dp4a((int)(nib | hi), *(const int *)(xqg + u), dot);
+    for (int h = 0; h < 2; h++) {
+        uint4 q4 = q[h], h4 = qh[h]; int4 a4 = a[h];
+        dot = __dp4a(nib4(q4.x, half) | (int)(((h4.x >> bitpos) & 0x01010101u) << 4), a4.x, dot);
+        dot = __dp4a(nib4(q4.y, half) | (int)(((h4.y >> bitpos) & 0x01010101u) << 4), a4.y, dot);
+        dot = __dp4a(nib4(q4.z, half) | (int)(((h4.z >> bitpos) & 0x01010101u) << 4), a4.z, dot);
+        dot = __dp4a(nib4(q4.w, half) | (int)(((h4.w >> bitpos) & 0x01010101u) << 4), a4.w, dot);
     }
     float d = d_fp16(p->d), mn = d_fp16(p->dmin);
     return xdb[sj] * (d * sc * dot - mn * mm * xsb[sj]);
@@ -149,8 +151,9 @@ __device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const f
 // (2 rows per warp — an ILP twist on the empirically-dead split-k idea — was
 // tried here and also regressed, uniform, adaptive, and template-specialized
 // alike; the one-row shape stays.)
-__global__ static void matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
-                                         const float *x, const int8_t *xq, const float *xd, const int *xs, int k, int m) {
+__global__ static void __launch_bounds__(256, 6)
+matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
+                  const float *x, const int8_t *xq, const float *xd, const int *xs, int k, int m) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (warp >= m) return;
@@ -179,13 +182,16 @@ __global__ static void matmul_i8r_kernel(float *out, const unsigned char *wbase,
                 case GGML_TYPE_Q8_0: s += sub_q8_0((const block_q8_0 *)blk, xqb, xdb); break;
             }
         }
-    } else if (lane == 0) {                              // bf16 / f32 / f16 fallback
-        for (int b = 0; b < nb; b++) {
-            const unsigned char *blk = row + (size_t)b * ts;
-            float xb0 = x[(size_t)b * blck];
-            if (type == GGML_TYPE_F32)       s += (*(const float *)blk) * xb0;
-            else if (type == GGML_TYPE_BF16) s += d_bf16(*(const uint16_t *)blk) * xb0;
-            else if (type == GGML_TYPE_F16)  s += d_fp16(*(const uint16_t *)blk) * xb0;
+    } else if (type == GGML_TYPE_F32) {                  // float fallbacks: lanes split the row
+        const float *wr = (const float *)row;
+        for (int i = lane; i < k; i += 32) s += wr[i] * x[i];
+    } else {                                             // bf16 / f16: one uint32 = 2 elements (k is even)
+        const uint16_t *wr = (const uint16_t *)row;
+        for (int i = 2 * lane; i < k; i += 64) {
+            uint32_t two = ld32(wr + i);
+            float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
+            float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
+            s += w0 * x[i] + w1 * x[i + 1];
         }
     }
     for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
@@ -266,27 +272,22 @@ static void ensure_act(int k) {
     g_act_cap = k;
 }
 
-// The int8 matmul against the activation currently in g_xq/g_xd/g_xs. (d_x is still
-// needed for the bf16/f32/f16 fallback path, which dots the raw float activation.)
-static void matmul_run(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+// The backend seam. The activation's int8 form is already in g_xq/g_xd/g_xs —
+// put there by the producer kernel's epilogue (actq_for) or by act_quantize.
+// (d_x is still needed for the bf16/f32/f16 fallback path, which dots floats.)
+static struct actq actq_for(int k) {
+    ensure_act(k);
+    struct actq aq = { g_xq, g_xd, g_xs };
+    return aq;
+}
+static void act_quantize(const float *d_x, int k) {
+    int ng = k / 32;
+    quantize_act_kernel<<<gridn(ng), 256>>>(d_x, actq_for(k), ng);
+}
+static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_i8r_kernel<<<blocks, 256>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xd, g_xs, k, m);
-}
-
-static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    int ng = k / 32;
-    ensure_act(k);
-    quantize_act_kernel<<<gridn(ng), 256>>>(d_x, g_xq, g_xd, g_xs, ng);
-    matmul_run(d_out, t, d_x, k, m);
-}
-
-// Reuse the activation quantized by the immediately preceding matmul_q. The forward
-// hands the same input vector to q/k/v (and to gate/up), so re-quantizing it each time
-// is pure waste (quantize was ~13% of GPU time). Caller guarantees d_x is unchanged
-// since that matmul_q; the result is bit-identical to calling matmul_q again.
-static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    matmul_run(d_out, t, d_x, k, m);
 }

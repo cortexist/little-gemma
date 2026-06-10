@@ -55,11 +55,34 @@ __device__ static void d_gsm(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     else { *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4); }
 }
 
+// ---- activation quantization epilogue --------------------------------------
+// The int8 backend wants every matmul input quantized (per 32-element group: a
+// scale, the int8 values, and their sum). Rather than launching a separate
+// quantize kernel per matmul (~300 launches/token re-reading vectors that some
+// kernel just wrote), each activation is quantized where it is BORN: the kernels
+// below take a `struct actq` and, when its pointers are set, quantize their own
+// output as an epilogue. The f32 backend passes AQ0 (all NULL) and the branch
+// vanishes; the int8 backend hands out its buffers via actq_for (seam, below).
+
+struct actq { int8_t *xq; float *xd; int *xs; };
+static const struct actq AQ0 = { NULL, NULL, NULL };
+
+// Quantize one 32-element group g (global index) of x into int8 + scale + sum.
+__device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xb[i]));
+    float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t *q = aq.xq + (size_t)g * 32;
+    int sum = 0;
+    for (int i = 0; i < 32; i++) { int v = __float2int_rn(xb[i] * id); q[i] = (int8_t)v; sum += v; }
+    aq.xd[g] = d; aq.xs[g] = sum;
+}
+
 // ====================  non-matmul compute kernels  =========================
 
 // RMSNorm over `rows` vectors of length n. w (length n, shared across rows) or NULL.
 // One block (256 threads) per row.
-__global__ static void rmsnorm_kernel(float *out, const float *x, const float *w, int n, float eps) {
+__global__ static void rmsnorm_kernel(float *out, const float *x, const float *w, int n, float eps, struct actq aq) {
     int row = blockIdx.x;
     const float *xr = x + (size_t)row * n;
     float *outr = out + (size_t)row * n;
@@ -72,6 +95,11 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
     float scale = rsqrtf(sh[0] / (float)n + eps);
     if (w) for (int i = threadIdx.x; i < n; i += blockDim.x) outr[i] = xr[i] * scale * w[i];
     else   for (int i = threadIdx.x; i < n; i += blockDim.x) outr[i] = xr[i] * scale;
+    if (aq.xq) {
+        __syncthreads();
+        for (int g = threadIdx.x; g < n / 32; g += blockDim.x)
+            d_quant_group(outr + g * 32, row * (n / 32) + g, aq);
+    }
 }
 
 // GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
@@ -92,7 +120,7 @@ __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos,
 // tokens -> the forward captures into a static CUDA graph). window=0 means full causal.
 // Shared memory holds the (pos-start+1) scores; the launch sizes it for max_seq. Scale 1.0.
 __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
-                                   int hd, int kv_dim, int gqa, const int *d_pos, int window) {
+                                   int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
     int hh = blockIdx.x, kvh = hh / gqa;
     const float *qh = q + (size_t)hh * hd;
     int pos = *d_pos;
@@ -117,6 +145,11 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
         for (int t = 0; t < T; t++) { const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd; acc += att[t] * vt[i]; }
         outh[i] = acc;
     }
+    if (aq.xq) {
+        __syncthreads();
+        for (int g = threadIdx.x; g < hd / 32; g += blockDim.x)
+            d_quant_group(outh + g * 32, (hh * hd) / 32 + g, aq);
+    }
 }
 
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
@@ -130,8 +163,26 @@ __device__ static float d_gelu(float x) {
     const float k = 0.7978845608028654f;
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
-__global__ static void add_kernel(float *a, const float *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
-__global__ static void geglu_kernel(float *g, const float *u, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] = d_gelu(g[i]) * u[i]; }
+// Elementwise epilogue: each block covers blockDim.x contiguous elements, so
+// after a sync the first few threads can quantize the block's own groups.
+__device__ static void d_quant_block(const float *a, int n, struct actq aq) {
+    if (!aq.xq) return;
+    __syncthreads();
+    int base = blockIdx.x * blockDim.x;
+    int left = n - base, ng = (left < (int)blockDim.x ? left : (int)blockDim.x) / 32;
+    for (int t = threadIdx.x; t < ng; t += blockDim.x)
+        d_quant_group(a + base + t * 32, base / 32 + t, aq);
+}
+__global__ static void add_kernel(float *a, const float *b, int n, struct actq aq) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+    d_quant_block(a, n, aq);
+}
+__global__ static void geglu_kernel(float *g, const float *u, int n, struct actq aq) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) g[i] = d_gelu(g[i]) * u[i];
+    d_quant_block(g, n, aq);
+}
 __global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
 __global__ static void scale_ptr_kernel(float *a, const float *s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s[0]; }
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
@@ -206,12 +257,17 @@ static void ensure_scratch(struct model *m) {
     scratch_ok = 1;
 }
 
-// The matmul is the one piece that differs between backends; the including .cu
-// defines it. d_out[m] = W . d_x with W the quantized tensor t (all device ptrs).
-// matmul_q_same reuses the activation prepared by the immediately preceding matmul_q
-// (caller guarantees d_x is unchanged) — lets q/k/v and gate/up skip re-quantization.
+// The backend seam — the including .cu defines these three.
+// matmul_q: d_out[m] = W . d_x with W the quantized tensor t (all device ptrs).
+//   The int8 backend reads d_x's quantization from its buffers, already filled
+//   by a producer kernel's epilogue (actq_for) or by act_quantize.
+// actq_for(k): the backend's epilogue buffers for a k-length activation that is
+//   about to feed matmul_q (the f32 backend returns AQ0 — no quantization).
+// act_quantize: quantize d_x explicitly — for the one activation no kernel
+//   produces (the host-uploaded embedding); no-op for f32.
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
-static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static struct actq actq_for(int k);
+static void act_quantize(const float *d_x, int k);
 
 // ====================  kv cache (device buffers)  ===========================
 
@@ -255,9 +311,10 @@ static int build_per_layer(struct model *m, int token) {
     CUDA_CHECK(cudaMemcpy(d_tok, tok, (size_t)total * 4, cudaMemcpyHostToDevice));
     free(tok);
 
+    act_quantize(dx, c->n_embd);                      // dx came from the host, no producer kernel
     matmul_q(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
     scale_const_kernel<<<gridn((int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), (int)total);
-    rmsnorm_kernel<<<c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps);
+    rmsnorm_kernel<<<c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps, AQ0);
     combine_kernel<<<gridn((int)total), 256>>>(d_ipl, d_proj, d_tok, 1.0f / sqrtf(2.0f), (int)total);
     return 1;
 }
@@ -283,19 +340,19 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const float *ff = local ? NULL : d_rope_freqs;
 
         // ---- attention ----
-        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps);
+        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(n_embd));
         matmul_q(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
-        rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps);
+        rmsnorm_kernel<<<n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_kernel<<<gridn(n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2);
 
         int src = kv_src_dev(m, L);
         if (L < c->n_kv_start) {
-            matmul_q_same(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);  // reuses q's dh
+            matmul_q(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);   // dh still quantized
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) matmul_q_same(dvb, wv, dh, n_embd, kv_dim);                       // reuses q's dh
+            if (wv) matmul_q(dvb, wv, dh, n_embd, kv_dim);
             else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)kv_dim * 4, cudaMemcpyDeviceToDevice, 0));
-            rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps);
-            rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps);  // plain V norm
+            rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
+            rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);  // plain V norm
             rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2);
             kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim);    // dst offset from d_pos
             kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim);
@@ -303,30 +360,30 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const float *Kc = kv->k[src], *Vc = kv->v[src];
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
-        attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window);
+        attn_kernel<<<n_head, 128, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
-        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
-        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
+        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, AQ0);
+        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, AQ0);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
-        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps);
+        rmsnorm_kernel<<<1, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(n_embd));
         matmul_q(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
-        matmul_q_same(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);        // reuses gate's dh
-        geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff);
+        matmul_q(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);          // dh still quantized
+        geglu_kernel<<<gridn(nff), 256>>>(dg1, dg2, nff, actq_for(nff));
         matmul_q(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
-        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
-        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
+        rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps, AQ0);
+        add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, has_ple ? actq_for(n_embd) : AQ0);  // PLE reads dx next
 
         // ---- per-layer input (PLE) ----
         if (has_ple) {
             const int ple = c->n_embd_per_layer;
             matmul_q(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
-            geglu_kernel<<<gridn(ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple);
+            geglu_kernel<<<gridn(ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, actq_for(ple));
             matmul_q(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
-            rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps);
-            add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd);
+            rmsnorm_kernel<<<1, 256>>>(dout, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, AQ0);
+            add_kernel<<<gridn(n_embd), 256>>>(dx, dout, n_embd, AQ0);
         }
 
         // ---- per-layer output scale ----
@@ -334,7 +391,7 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         if (os) scale_ptr_kernel<<<gridn(n_embd), 256>>>(dx, os, n_embd);
     }
 
-    rmsnorm_kernel<<<1, 256>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps);
+    rmsnorm_kernel<<<1, 256>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps, actq_for(n_embd));
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);

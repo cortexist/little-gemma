@@ -3,7 +3,7 @@
 //
 // This is the readable reference: one warp per output row, the lanes cooperate on
 // each quantized block, and the dequant is fused straight into the f32 dot. The
-// int8 variant (model-cuda-i8.cu) is the same forward with a faster matmul — diff
+// int8 variant (model-cuda-i8r.cu) is the same forward with a faster matmul — diff
 // the two files to see exactly where the speedup comes from.
 
 #include "model-cuda.cuh"
@@ -105,7 +105,6 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_q_kernel<<<blocks, 256>>>(d_out, dev_weight(t), (int)t->type, ts, blck, d_x, k, m);
 }
-// The f32 backend has no activation quantization to reuse, so "same" is just matmul_q.
-static void matmul_q_same(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    matmul_q(d_out, t, d_x, k, m);
-}
+// The f32 backend dots the float activation directly — no quantize epilogues.
+static struct actq actq_for(int k) { (void)k; return AQ0; }
+static void act_quantize(const float *d_x, int k) { (void)d_x; (void)k; }

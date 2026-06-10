@@ -166,10 +166,10 @@ Decode throughput at that first int8 milestone (single token, all layers on GPU)
 So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
 llama.cpp's heavily-tuned kernels from ~4× to ~2×. (Those `int8+dp4a` numbers are the
 starting point; the optimizations documented below — activation-quant dedup, a CUDA
-graph, and wide weight loads (`run-cuda-i8r`) — then take E2B to ~91 and 12B to
-~47 tok/s.) The rest of this section walks the attempts to close the remaining gap:
-first two that **did not work**, then the three that did — the negative results are
-as instructive as the wins.
+graph, wide weight loads, and the long-tail wins (`run-cuda-i8r`) — then take E2B to
+~134 and 12B to ~50 tok/s.) The rest of this section walks the attempts to close the
+remaining gap: first two that **did not work**, then those that did — the negative
+results are as instructive as the wins.
 
 ### What didn't work (and why)
 
@@ -218,9 +218,12 @@ to int8 before each matmul) was ~13% of GPU time and mostly **redundant**: the f
 hands the *same* activation vector to q/k/v, and another to gate/up, re-quantizing it each
 time. `matmul_q_same` skips the quantize and reuses the previous result; the k/v and up
 call sites use it. Bit-identical output, and **+2–3% (E2B) / +4% (12B Q4_K_M)** for a few
-lines. The remaining lever is the bf16 fallback (`per_layer_model_proj`), which runs
-lane-0-only. The lesson worth keeping: the cheap, safe win was *removing redundant work
-around* the matmul, not micro-optimizing the matmul itself.
+lines. The lesson worth keeping: the cheap, safe win was *removing redundant work
+around* the matmul, not micro-optimizing the matmul itself. (Both threads of this
+paragraph pay off again later: `matmul_q_same` was eventually generalized into producer
+epilogues that quantize *every* activation exactly once, and the lane-0-only bf16
+fallback flagged here as "the remaining lever" turned out to be the single biggest win
+of the whole effort — see "The long tail" below.)
 
 ### What did work most: a CUDA graph
 
@@ -280,16 +283,50 @@ was tried on top — uniform, adaptive, and template-specialized — and regress
 time, joining coalescing-remap and split-k as confirmed dead ends.)
 
 **Net, with dedup + graph + wide loads: E2B ~91 tok/s, 12B Q4_K_M ~47 tok/s** — the gap
-to llama.cpp CUDA is now ~1.6× on E2B and ~1.35× on 12B (from ~4× at the first f32
+to llama.cpp CUDA down to ~1.6× on E2B and ~1.35× on 12B (from ~4× at the first f32
 kernel). The recurring lesson of this whole section, amended: the cheap, safe wins were
 the ones that *removed work* — redundant quantization (dedup), launch overhead (the
 graph), per-byte loads and per-block scale untwisting (i8r) — never the ones that
 rearranged work.
 
+### The long tail: four more wins
+
+With the matmul's loads fixed, an nsys re-profile showed the new cost structure:
+matmul 64.8% (its small instances still latency-bound), `quantize_act` 13.9%
+(~290 launches/token), rmsnorm 10.5%, attention 4.4%. Four changes followed, each
+gated on tok/s and on unchanged output:
+
+1. **128-bit loads for q4_K/q5_K.** Their block strides (144/176 B) are 16-byte
+   multiples, so one `uint4` load replaces four `uint32` loads. 12B (q4_K-heavy)
+   +4%; E2B neutral. Bit-identical.
+2. **Warp-parallel float fallback.** The bf16 `per_layer_model_proj` (E2B's PLE
+   path) was still dotted by lane 0 alone — ~18M *serial* MACs per token hiding in
+   a "fallback". All 32 lanes now split the row, two bf16 per `uint32` load.
+   **E2B 91→124 tok/s (+36%)** — the biggest single win of the whole CUDA effort,
+   and it wasn't in the quantized matmul at all. (12B has no PLE; unaffected.
+   Reassociates an f32 sum, so not bit-identical in principle — the generated text
+   was unchanged in practice.)
+3. **`__launch_bounds__(256, 6)`** on the matmul kernel caps registers so six
+   256-thread blocks (48 warps — the sm_86 maximum) fit per SM: the one occupancy
+   lever that helps the latency-bound small matmuls without restructuring them.
+   E2B +2%. Bit-identical.
+4. **Quantize activations where they are born.** ~290 `quantize_act` launches per
+   token re-read vectors some kernel had *just written*. The producer kernels
+   (rmsnorm, geglu, add, attention) now take a `struct actq` and quantize their own
+   output as an epilogue; the f32 backend passes an empty one and the branch
+   vanishes. `matmul_q_same` is gone — every matmul input is pre-quantized by its
+   producer, and the embedding (the one activation no kernel produces) gets an
+   explicit `act_quantize`. E2B +3.6%, 12B +1.7%, bit-identical.
+
+**Net: E2B ~134 tok/s, 12B Q4_K_M ~50 tok/s — gaps of 1.09× and 1.28× to llama.cpp
+CUDA.** The lesson of the day: profile again after every structural change; each fix
+exposes the next bottleneck somewhere new, and twice now the big one was *outside*
+the kernel everyone stares at.
+
 ### The whole arc, in numbers
 
 Decode throughput (tok/s, single-token generation, greedy) after each step, on the same
-machine (RTX A5000, Windows/WDDM). Steps 1–4 built up `model-cuda-f32.cu`; steps 5–9 are
+machine (RTX A5000, Windows/WDDM). Steps 1–4 built up `model-cuda-f32.cu`; steps 5–13 are
 the int8 line that became `model-cuda-i8r.cu`. Numbers were measured as each step landed,
 in different sessions, so adjacent baselines drift by a tok/s or two (e.g. step 4 f32
 re-measured 34.7 later) — each step's delta was verified against its immediate
@@ -307,6 +344,10 @@ predecessor at the time. "—" = not measured at that step.
 | 7 | activation-quant dedup                          |        ~65 |        ~33 |
 | 8 | CUDA graph (capture once, replay per token)     |       80.5 |       35.2 |
 | 9 | wide weight loads + q3/q6 repack (`i8r`)        |       91.5 |       47.5 |
+| 10 | 128-bit q4_K/q5_K loads                        |       91.2 |       49.4 |
+| 11 | warp-parallel float fallback (PLE bf16)        |      124.3 |        ~49 |
+| 12 | `__launch_bounds__` (6 blocks/SM)              |      126.6 |       49.2 |
+| 13 | quantize where born (producer epilogues)       |      134.5 |       50.1 |
 |   | llama.cpp CUDA, same machine (reference)        |        146 |         64 |
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
