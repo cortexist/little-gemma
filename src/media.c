@@ -20,37 +20,7 @@
 #include "gguf.h"
 #include "quant.h"
 #include "media.h"
-
-// One block of the legacy (gemma4v) vision transformer.
-struct vlayer {
-    const float *ln1, *ln2, *attn_post, *ffn_post;   // rms norm weights [768]
-    const float *qn, *kn;                            // per-head q/k norms [64]
-    const struct gguf_tensor *q, *k, *v, *o;         // [768 -> 768], no biases
-    const struct gguf_tensor *gate, *up, *down;      // gated FFN, 768<->3072
-};
-
-struct media {
-    struct gguf_context *ctx;
-    int n_embd;                    // LLM width; every output row is this long
-    // vision, unified (gemma4uv): one linear over patch x patch pixel blocks
-    int patch;                     // pixels per patch side (48: 16 x merge 3)
-    int pos_size;                  // rows in each axis of the position table
-    const struct gguf_tensor *v_patch_w;       // [patch*patch*3 -> n_embd]
-    const float *v_patch_b;
-    const float *vn1w, *vn1b;                  // LayerNorm before the embed
-    const float *vn2w, *vn2b;                  // LayerNorm after it
-    const float *vn3w, *vn3b;                  // LayerNorm after the pos add
-    const float *v_pos;                        // [n_embd, pos_size, 2]: x table, then y
-    const struct gguf_tensor *mm_v;            // [enc_width -> n_embd]
-    // audio, unified (gemma4ua): one linear over raw 640-sample frames
-    int frame;                                 // samples per frame (640 = 40 ms @ 16 kHz)
-    const struct gguf_tensor *mm_a;            // [frame -> n_embd]
-    // vision, legacy (gemma4v, E2B/E4B): a 16-block ViT + 3x3 average pool
-    int legacy_v;
-    int v_embd, v_head, v_layer, v_merge;      // 768, 12, 16, 3
-    const struct gguf_tensor *v_patch16;       // [16,16,3 -> 768] conv, no bias
-    struct vlayer *vl;
-};
+#include "media-internal.h"      // struct media/vlayer + the GPU encoder hooks
 
 // ---- small math (f32 host) --------------------------------------------------
 
@@ -267,6 +237,9 @@ struct media *media_open(const char *path, int n_embd) {
 
 void media_free(struct media *md) {
     if (!md) return;
+#ifdef LG_MEDIA_CUDA
+    v_cuda_free(md);
+#endif
     free_gguf(md->ctx);
     free(md->vl);
     free(md);
@@ -530,8 +503,25 @@ float *media_embed_image(struct media *md, const uint8_t *rgb, int w, int h, int
         fprintf(stderr, "media: image %dx%d is not a multiple of the %d-pixel patch\n", w, h, P);
         return NULL;
     }
-    return md->legacy_v ? v_embed_image(md, rgb, w, h, n_tokens)
-                        : uv_embed_image(md, rgb, w, h, n_tokens);
+    if (!md->legacy_v)
+        return uv_embed_image(md, rgb, w, h, n_tokens);
+#ifdef LG_MEDIA_CUDA
+    float *rows = v_embed_image_cuda(md, rgb, w, h, n_tokens);
+    if (rows && getenv("LG_MEDIA_VERIFY")) {        // host path as numeric oracle
+        int n2 = 0;
+        float *ref = v_embed_image(md, rgb, w, h, &n2);
+        double mx = 0;
+        if (ref && n2 == *n_tokens)
+            for (size_t i = 0; i < (size_t)n2 * md->n_embd; i++) {
+                double d = fabs((double)rows[i] - ref[i]);
+                if (d > mx) mx = d;
+            }
+        fprintf(stderr, "media: gpu vs host max |diff| %.3g over %d rows\n", mx, n2);
+        free(ref);
+    }
+    if (rows) return rows;                          // NULL: CUDA unusable -> host
+#endif
+    return v_embed_image(md, rgb, w, h, n_tokens);
 }
 
 // ---- audio ------------------------------------------------------------------

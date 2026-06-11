@@ -61,10 +61,14 @@ if(CMAKE_CUDA_COMPILER)
     # run-cuda = readable f32-dequant matmul; run-cuda-i8r = int8 matmul with
     # wide loads from (re)aligned weights. (The intermediate byte-load int8
     # backend, model-cuda-i8.cu, lives in git history — see the README.)
-    add_executable(run-cuda     ${CORE} src/model-cuda-f32.cu)
-    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu)
+    # media-cuda.cu: the gemma4v encoder on the GPU (~1 TFLOP/image — ~15 s on
+    # a good CPU, well under a second on the GPU). The host encoder stays in as
+    # oracle and fallback; LG_MEDIA_CUDA switches media.c's dispatch.
+    add_executable(run-cuda     ${CORE} src/model-cuda-f32.cu src/media-cuda.cu)
+    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu src/media-cuda.cu)
     foreach(tgt run-cuda run-cuda-i8r)
         target_include_directories(${tgt} PRIVATE include)
+        target_compile_definitions(${tgt} PRIVATE LG_MEDIA_CUDA)
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
         elseif(UNIX)
