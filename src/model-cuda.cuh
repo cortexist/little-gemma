@@ -28,14 +28,8 @@ extern "C" {
 // in-progress follow-up — until it lands, drafting on this backend declines.
 extern "C" const int model_kv_host = 0;
 
-extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
-                                int token, int pos) {
-    (void)t; (void)m; (void)kv; (void)token; (void)pos;
-    static int warned = 0;
-    if (!warned) { fprintf(stderr, "mtp: device draft not implemented yet on this backend\n"); warned = 1; }
-    return -1;
-}
-extern "C" void mtp_free_device(struct mtp *t) { (void)t; }
+// The device draft is implemented at the end of this file (it needs d_attn,
+// the norm/geglu/argmax kernels and g_hidden, all defined below).
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
@@ -982,6 +976,222 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
         if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row
         forward_graph(m, kv, 0);
     }
+}
+
+// ==== MTP: the draft head, on the device =====================================
+// The gemma4-assistant forward from src/mtp.c as ~30 kernel launches per
+// draft. Almost everything is REUSE: rmsnorm_kernel (pre/post norms and, with
+// grid = heads, the per-head q norm — exactly how decode uses it),
+// geglu_kernel, softcap_kernel, argmax_kernel, and above all the d_attn
+// template: a draft for position `pos` sees the cache exactly as a query at
+// pos-1 with the window shrunk by one — [pos-window+1, pos-1] sliding,
+// [0, pos-1] full — so two NEW wrappers below pin those arguments and the
+// frozen decode entry points stay untouched. Assistant weights are dequantized
+// once to f16 on the device (77M params, ~150 MB); h_prev is g_hidden, which
+// the decode graph already maintains. Sync and un-captured for now — the
+// async overlap (draft on g_side while the target verifies) is step 2c.
+
+__global__ static void mtp_matvec_h(float *out, const __half *W, const float *x, int k, int m) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= m) return;
+    const __half2 *w2 = (const __half2 *)(const void *)(W + (size_t)row * k);
+    float s = 0.0f;
+    for (int i = lane; i < k / 2; i += 32) {
+        float2 wf = __half22float2(w2[i]);
+        s += wf.x * x[2 * i] + wf.y * x[2 * i + 1];
+    }
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (!lane) out[row] = s;
+}
+
+// NeoX rope at a plain host-int position (the draft is not graph-captured, so
+// nothing needs to be device-resident). No freq factors: the assistant has none.
+__global__ static void mtp_rope(float *v, int half, int hd, int pos, float base, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int head = idx / half, i = idx % half;
+    float *vh = v + (size_t)head * hd;
+    float freq = powf(base, -2.0f * (float)i / (float)hd);
+    float ang = (float)pos * freq;
+    float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
+    vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
+}
+
+__global__ static void mtp_add_scale(float *x, const float *o, int n, float sc) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = (x[i] + o[i]) * sc;
+}
+
+__global__ static void mtp_attn_h(float *xb, const float *q, const __half *Kc, const __half *Vc,
+                                  int hd, int kv_dim, int gqa, int pos, struct actq aq) {
+    d_attn<false, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, pos, 0, 0, 0, aq);
+}
+__global__ static void mtp_attn_swa(float *xb, const float *q, const float *Kc, const float *Vc,
+                                    int hd, int kv_dim, int gqa, int pos, int window, int seq, struct actq aq) {
+    d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, pos, 0, window, seq, aq);
+}
+
+struct mtp_ld {
+    float *attn_norm, *q_norm, *post_attn, *ffn_norm, *post_ffw;   // f32, device
+    float out_scale;                                               // scalar, by value
+    __half *q, *o, *gate, *up, *down;
+};
+struct mtp_cuda {
+    struct mtp_ld *l;
+    __half *pre, *head;
+    float *out_norm;
+    float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *logits;            // device scratch
+    int *d_tok;
+};
+
+static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type -> device f16
+    size_t n = 1;
+    for (uint32_t i = 0; i < t->n_dims; i++) n *= t->dims[i];
+    float *f = (float *)malloc(n * 4);
+    __half *hh = (__half *)malloc(n * 2);
+    __half *d = NULL;
+    int ok = f && hh && dequantize_into(t->type, t->data, f, (int64_t)n) &&
+             cudaMalloc(&d, n * 2) == cudaSuccess;
+    if (ok) {
+        for (size_t i = 0; i < n; i++) hh[i] = __float2half(f[i]);
+        ok = cudaMemcpy(d, hh, n * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    free(f); free(hh);
+    return ok ? d : NULL;
+}
+static float *mtp_up_f(const float *src, size_t n) {
+    float *d = NULL;
+    if (cudaMalloc(&d, n * 4) != cudaSuccess) return NULL;
+    return cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) == cudaSuccess ? d : NULL;
+}
+
+static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
+    struct mtp_cuda *mc = (struct mtp_cuda *)calloc(1, sizeof *mc);
+    if (!mc) return NULL;
+    mc->l = (struct mtp_ld *)calloc((size_t)t->n_layer, sizeof *mc->l);
+    mc->pre  = mtp_up_h(t->pre);
+    mc->head = mtp_up_h(t->head);
+    mc->out_norm = mtp_up_f(t->out_norm, (size_t)t->n_inner);
+    int ok = mc->l && mc->pre && mc->head && mc->out_norm;
+    int q_max = 0;
+    for (int L = 0; ok && L < t->n_layer; L++) {
+        const struct mtp_layer *s = &t->l[L];
+        struct mtp_ld *d = &mc->l[L];
+        if (t->n_head * s->hd > q_max) q_max = t->n_head * s->hd;
+        d->out_scale = s->out_scale ? s->out_scale[0] : 1.0f;
+        ok = (d->attn_norm = mtp_up_f(s->attn_norm, t->n_inner)) &&
+             (d->q_norm = mtp_up_f(s->q_norm, s->hd)) &&
+             (d->post_attn = mtp_up_f(s->post_attn, t->n_inner)) &&
+             (d->ffn_norm = mtp_up_f(s->ffn_norm, t->n_inner)) &&
+             (d->post_ffw = mtp_up_f(s->post_ffw, t->n_inner)) &&
+             (d->q = mtp_up_h(s->q)) && (d->o = mtp_up_h(s->o)) &&
+             (d->gate = mtp_up_h(s->gate)) && (d->up = mtp_up_h(s->up)) &&
+             (d->down = mtp_up_h(s->down)) != NULL;
+    }
+    ok = ok && cudaMalloc(&mc->cat, (size_t)2 * t->n_bb * 4) == cudaSuccess
+            && cudaMalloc(&mc->x, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->h, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->q, (size_t)q_max * 4) == cudaSuccess
+            && cudaMalloc(&mc->xb, (size_t)q_max * 4) == cudaSuccess
+            && cudaMalloc(&mc->o, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->g1, (size_t)t->n_ff * 4) == cudaSuccess
+            && cudaMalloc(&mc->g2, (size_t)t->n_ff * 4) == cudaSuccess
+            && cudaMalloc(&mc->logits, (size_t)t->n_vocab * 4) == cudaSuccess
+            && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess;
+    if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-cuda
+        fprintf(stderr, "mtp: device upload failed, drafting disabled\n");
+        free(mc->l); free(mc);
+        return NULL;
+    }
+    return mc;
+}
+
+extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                                int token, int pos) {
+    if (t->cuda == (void *)-1) return -1;
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc) {
+        mc = mtp_cuda_init(t);
+        t->cuda = mc ? (void *)mc : (void *)-1;
+        if (!mc) return -1;
+    }
+    const struct config *c = &m->cfg;
+    const int ni = t->n_inner, nb = t->n_bb, nff = t->n_ff;
+    const float eps = t->eps;
+
+    // input: the target's sqrt-scaled embedding of `token` ++ g_hidden
+    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
+    if (!erow) return -1;
+    float sc = sqrtf((float)nb);
+    for (int i = 0; i < nb; i++) erow[i] *= sc;
+    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
+    free(erow);
+    CUDA_CHECK(cudaMemcpyAsync(mc->cat + nb, g_hidden, (size_t)nb * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+
+    mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->x, mc->pre, mc->cat, 2 * nb, ni);
+
+    for (int L = 0; L < t->n_layer; L++) {
+        const struct mtp_layer *bl = &t->l[L];
+        const struct mtp_ld *dl = &mc->l[L];
+        const int hd = bl->hd, src = bl->src, q_dim = t->n_head * hd;
+        const int gqa = t->n_head / m->n_head_kv[src];
+
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->h, mc->x, dl->attn_norm, ni, eps, AQ0);
+        mtp_matvec_h<<<gridn(q_dim * 32), 256>>>(mc->q, dl->q, mc->h, ni, q_dim);
+        rmsnorm_kernel<<<t->n_head, 256>>>(mc->q, mc->q, dl->q_norm, hd, eps, AQ0);
+        mtp_rope<<<gridn(t->n_head * (hd / 2)), 256>>>(mc->q, hd / 2, hd, pos,
+                                                       bl->local ? t->base_swa : t->base_full,
+                                                       t->n_head * (hd / 2));
+        // the draft at `pos` sees the cache as a query at pos-1, window-1
+        if (bl->local)
+            mtp_attn_swa<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
+                    (const float *)kv->k[src], (const float *)kv->v[src],
+                    hd, kv->kv_dim[src], gqa, pos - 1,
+                    c->sliding_window > 0 ? c->sliding_window - 1 : 0, kv->seq[src], AQ0);
+        else
+            mtp_attn_h<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
+                    (const __half *)kv->k[src], (const __half *)kv->v[src],
+                    hd, kv->kv_dim[src], gqa, pos - 1, AQ0);
+        mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->o, dl->o, mc->xb, q_dim, ni);
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->o, mc->o, dl->post_attn, ni, eps, AQ0);
+        mtp_add_scale<<<gridn(ni), 256>>>(mc->x, mc->o, ni, 1.0f);
+
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->h, mc->x, dl->ffn_norm, ni, eps, AQ0);
+        mtp_matvec_h<<<gridn(nff * 32), 256>>>(mc->g1, dl->gate, mc->h, ni, nff);
+        mtp_matvec_h<<<gridn(nff * 32), 256>>>(mc->g2, dl->up, mc->h, ni, nff);
+        geglu_kernel<<<gridn(nff), 256>>>(mc->g1, mc->g2, nff, AQ0);
+        mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->o, dl->down, mc->g1, nff, ni);
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->o, mc->o, dl->post_ffw, ni, eps, AQ0);
+        mtp_add_scale<<<gridn(ni), 256>>>(mc->x, mc->o, ni, dl->out_scale);
+    }
+
+    rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->x, mc->x, mc->out_norm, ni, eps, AQ0);
+    mtp_matvec_h<<<gridn(t->n_vocab * 32), 256>>>(mc->logits, mc->head, mc->x, ni, t->n_vocab);
+    if (t->softcap > 0.0f)
+        softcap_kernel<<<gridn(t->n_vocab), 256>>>(mc->logits, t->softcap, t->n_vocab);
+    argmax_kernel<<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
+
+    int best = -1;
+    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
+    return best;
+}
+
+extern "C" void mtp_free_device(struct mtp *t) {
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc || t->cuda == (void *)-1) return;
+    for (int L = 0; L < t->n_layer; L++) {
+        struct mtp_ld *d = &mc->l[L];
+        cudaFree(d->attn_norm); cudaFree(d->q_norm); cudaFree(d->post_attn);
+        cudaFree(d->ffn_norm); cudaFree(d->post_ffw);
+        cudaFree(d->q); cudaFree(d->o); cudaFree(d->gate); cudaFree(d->up); cudaFree(d->down);
+    }
+    cudaFree(mc->pre); cudaFree(mc->head); cudaFree(mc->out_norm);
+    cudaFree(mc->cat); cudaFree(mc->x); cudaFree(mc->h); cudaFree(mc->q); cudaFree(mc->xb);
+    cudaFree(mc->o); cudaFree(mc->g1); cudaFree(mc->g2); cudaFree(mc->logits); cudaFree(mc->d_tok);
+    free(mc->l);
+    free(mc);
+    t->cuda = NULL;
 }
 
 #endif // MODEL_CUDA_CUH
