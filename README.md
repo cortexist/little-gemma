@@ -233,23 +233,25 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 10    | 2,520 | 316     | 323   | 3,159 |
-| include   | 5     | 210   | 85      | 58    | 353   |
+| src       | 10    | 2,910 | 415     | 346   | 3,671 |
+| include   | 5     | 213   | 105     | 59    | 377   |
 
-2,730 lines of code in the repository (self-imposed ceiling while exploring: 3,000) —
-but the backends are mutually exclusive, so no single program is anywhere near that.
-Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config, CLI +
-socket server — 1,508 lines) plus exactly one backend:
+3,123 lines of code in the repository — the self-imposed exploring ceiling of
+3,000 was crossed by the long-context roadmap (online softmax, batched prefill,
+the KV ring, f16 KV). The backends are mutually exclusive, so no single program
+is anywhere near that. Each binary is the shared pipeline (GGUF parse, dequant,
+tokenizer, config, CLI + socket server — 1,517 lines) plus exactly one backend:
 
-| binary        | backend on top of the shared 1,508        | code lines |
+| binary        | backend on top of the shared 1,517        | code lines |
 |---------------|-------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                             |      1,755 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,014 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,160 |
+| `run`         | `model-cpu.c`                             |      1,815 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,294 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,498 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that decodes E2B 26% faster than llama.cpp CUDA — multi-turn
-socket serving included — is **2,160 lines of C end to end**, tokenizer and all.
+socket serving, 3.4× batched prefill, and a ring-buffered f16 KV cache included —
+is **2,498 lines of C end to end**, tokenizer and all.
 
 ## Validation
 
