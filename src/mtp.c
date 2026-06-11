@@ -6,8 +6,10 @@
 // — sliding-window blocks read the target's last SWA KV layer, the full block
 // reads the last global KV layer. Its inputs are the target's own embedding
 // of the last chosen token concatenated with the target's last hidden state,
-// squeezed through nextn.pre_projection; nextn.post_projection lifts the
-// result back to target width so steps can chain.
+// squeezed through the next-token pre-projection; the post-projection lifts
+// the result back to target width so steps can chain. (Today's files name
+// these tensors "nextn.*"; the loader also accepts the more literal
+// "next_token.*" for when the converter is renamed.)
 //
 // Drafts are verified by the target (greedy match), so MTP NEVER changes the
 // output — only how many target forwards run per emitted token. That is the
@@ -44,7 +46,7 @@ struct mtp {
     struct gguf_context *ctx;
     int n_layer, n_inner, n_bb, n_vocab, n_head, n_ff;
     float eps, base_full, base_swa, softcap;
-    const struct gguf_tensor *pre, *post, *head;   // nextn.pre/post_projection, token_embd (LM head)
+    const struct gguf_tensor *pre, *post, *head;   // next-token pre/post projections, LM head
     const float *out_norm;
     struct mtp_layer *l;
     // scratch (sized once at open)
@@ -161,8 +163,12 @@ struct mtp *mtp_open(const char *path, const struct model *m) {
     t->base_full= gguf_get_f32(ctx, "gemma4-assistant.rope.freq_base", 1e6f);
     t->base_swa = gguf_get_f32(ctx, "gemma4-assistant.rope.freq_base_swa", 1e4f);
     t->softcap  = gguf_get_f32(ctx, "gemma4-assistant.final_logit_softcapping", 0.0f);
-    t->pre  = gguf_find_tensor(ctx, "nextn.pre_projection.weight");
-    t->post = gguf_find_tensor(ctx, "nextn.post_projection.weight");
+    // the next-token projections — "nextn." in today's files, "next_token."
+    // once the converter says what it means
+    t->pre  = gguf_find_tensor(ctx, "next_token.pre_projection.weight");
+    t->post = gguf_find_tensor(ctx, "next_token.post_projection.weight");
+    if (!t->pre)  t->pre  = gguf_find_tensor(ctx, "nextn.pre_projection.weight");
+    if (!t->post) t->post = gguf_find_tensor(ctx, "nextn.post_projection.weight");
     t->head = gguf_find_tensor(ctx, "token_embd.weight");
     const struct gguf_tensor *on = gguf_find_tensor(ctx, "output_norm.weight");
     t->out_norm = on ? (const float *)on->data : NULL;
