@@ -54,13 +54,20 @@ void model_free(struct model *m);
 // layers keep the full max_seq (seq[L] == max_seq, and the ring index is then
 // the identity). At a long context the cache cost is dominated by the few
 // global KV-owning layers, not the layer count.
+// Global layers store their rows as f16: at a long context the cache cost —
+// capacity and the per-token read — is almost entirely theirs, and halving it
+// is worth one round-to-nearest per stored value (the only step in this
+// project's pipeline that changes the KV numbers; everything else is exact or
+// reassociated). The sliding-window rings stay f32: a few hundred rows save
+// nothing meaningful in f16, so they keep the exact values.
 struct kvcache {
     int     n_layer;
     int     max_seq;   // logical capacity (positions); ring rows may be fewer
     int    *kv_dim;    // per layer: n_head_kv * head_dim(layer)
     int    *seq;       // per layer: rows allocated (ring length); 0 if reusing
-    float **k;         // per layer: [seq * kv_dim], or NULL if the layer reuses KV
-    float **v;
+    int    *f16;       // per layer: 1 if rows are stored as f16 (global layers)
+    void  **k;         // per layer: [seq * kv_dim] f32 or f16, NULL if reusing
+    void  **v;
 };
 
 int  kvcache_init(struct kvcache *kv, const struct model *m, int max_seq);

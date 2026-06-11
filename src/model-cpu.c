@@ -116,6 +116,41 @@ static int kv_src(const struct model *m, int L) {
     return c->n_kv_start - (m->is_local[L] ? 2 : 1);
 }
 
+// ---- f32 <-> f16 (for the f16-stored global-layer KV rows) -----------------
+
+// Round-to-nearest-even, bit-exact with the GPU's cvt.rn.f16.f32 — the CPU and
+// CUDA backends must store the same rounded value or their outputs drift.
+static uint16_t f16_of(float f) {
+    float scale_to_inf, scale_to_zero;                  // 2^112, 2^-110
+    { uint32_t b = 0x77800000u; memcpy(&scale_to_inf,  &b, 4); }
+    { uint32_t b = 0x08800000u; memcpy(&scale_to_zero, &b, 4); }
+    float base = (fabsf(f) * scale_to_inf) * scale_to_zero;
+    uint32_t w; memcpy(&w, &f, 4);
+    uint32_t shl1_w = w + w;
+    uint32_t sign = w & 0x80000000u;
+    uint32_t bias = shl1_w & 0xFF000000u;
+    if (bias < 0x71000000u) bias = 0x71000000u;
+    float fb; { uint32_t b = (bias >> 1) + 0x07800000u; memcpy(&fb, &b, 4); }
+    base = fb + base;
+    uint32_t bits; memcpy(&bits, &base, 4);
+    uint32_t nonsign = ((bits >> 13) & 0x00007C00u) + (bits & 0x00000FFFu);
+    return (uint16_t)((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
+}
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu, bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;
+        else { exp = 127 - 15 + 1; while ((mant & 0x400u) == 0) { mant <<= 1; exp--; } mant &= 0x3FFu; bits = sign | (exp << 23) | (mant << 13); }
+    } else if (exp == 0x1F) bits = sign | 0x7F800000u | (mant << 13);
+    else bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    float f; memcpy(&f, &bits, 4);
+    return f;
+}
+// One element of a cache row, whichever way the layer stores it.
+static float kv_at(const void *row, size_t i, int f16) {
+    return f16 ? f16_to_f32(((const uint16_t *)row)[i]) : ((const float *)row)[i];
+}
+
 // ---- kv cache (host buffers) ----------------------------------------------
 
 int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
@@ -124,9 +159,10 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     kv->max_seq = max_seq;
     kv->kv_dim = calloc((size_t)c->n_layer, sizeof(int));
     kv->seq = calloc((size_t)c->n_layer, sizeof(int));
-    kv->k = calloc((size_t)c->n_layer, sizeof(float *));
-    kv->v = calloc((size_t)c->n_layer, sizeof(float *));
-    if (!kv->kv_dim || !kv->seq || !kv->k || !kv->v) return -1;
+    kv->f16 = calloc((size_t)c->n_layer, sizeof(int));
+    kv->k = calloc((size_t)c->n_layer, sizeof(void *));
+    kv->v = calloc((size_t)c->n_layer, sizeof(void *));
+    if (!kv->kv_dim || !kv->seq || !kv->f16 || !kv->k || !kv->v) return -1;
 
     for (int L = 0; L < c->n_layer; L++) {
         kv->kv_dim[L] = m->n_head_kv[L] * head_dim_at(m, L);
@@ -141,9 +177,10 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
         if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window < max_seq)
             seq = c->sliding_window;
         kv->seq[L] = seq;
+        kv->f16[L] = !m->is_local[L];         // global rows are f16 (see model.h)
         size_t n = (size_t)seq * kv->kv_dim[L];
-        kv->k[L] = calloc(n, sizeof(float));
-        kv->v[L] = calloc(n, sizeof(float));
+        kv->k[L] = calloc(n, kv->f16[L] ? 2 : 4);
+        kv->v[L] = calloc(n, kv->f16[L] ? 2 : 4);
         if (!kv->k[L] || !kv->v[L]) return -1;
     }
     return 0;
@@ -152,8 +189,8 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
 void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
     for (int L = 0; L < kv->n_layer; L++) { free(kv->k[L]); free(kv->v[L]); }
-    free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq);
-    kv->k = kv->v = NULL; kv->kv_dim = kv->seq = NULL;
+    free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq); free(kv->f16);
+    kv->k = kv->v = NULL; kv->kv_dim = kv->seq = kv->f16 = NULL;
 }
 
 // ---- the forward pass -----------------------------------------------------
@@ -257,11 +294,18 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
             for (int hh = 0; hh < n_head_kv; hh++) rmsnorm_plain(vb + hh * hd, vb + hh * hd, hd, eps);
             for (int hh = 0; hh < n_head_kv; hh++) rope_neox(kb + hh * hd, hd, pos, base, ff);
             int row = pos % kv->seq[L];                  // ring write (identity on global layers)
-            memcpy(kv->k[L] + (size_t)row * kv_dim, kb, (size_t)kv_dim * sizeof(float));
-            memcpy(kv->v[L] + (size_t)row * kv_dim, vb, (size_t)kv_dim * sizeof(float));
+            if (kv->f16[L]) {                            // global rows round through f16 once here
+                uint16_t *kr = (uint16_t *)kv->k[L] + (size_t)row * kv_dim;
+                uint16_t *vr = (uint16_t *)kv->v[L] + (size_t)row * kv_dim;
+                for (int i = 0; i < kv_dim; i++) { kr[i] = f16_of(kb[i]); vr[i] = f16_of(vb[i]); }
+            } else {
+                memcpy((float *)kv->k[L] + (size_t)row * kv_dim, kb, (size_t)kv_dim * sizeof(float));
+                memcpy((float *)kv->v[L] + (size_t)row * kv_dim, vb, (size_t)kv_dim * sizeof(float));
+            }
         }
-        const float *Kc = kv->k[src], *Vc = kv->v[src];
+        const void *Kc = kv->k[src], *Vc = kv->v[src];
         const int seq = kv->seq[src];                    // ring length of the owning layer
+        const int kf16 = kv->f16[src];
 
         int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
                   ? pos - c->sliding_window + 1 : 0;
@@ -271,18 +315,18 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
             const float *qh = q + hh * hd;
             int kvh = hh / gqa;
             for (int t = start; t <= pos; t++) {
-                const float *kt = Kc + (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
+                size_t off = (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
                 float s = 0.0f;
-                for (int i = 0; i < hd; i++) s += qh[i] * kt[i];
+                for (int i = 0; i < hd; i++) s += qh[i] * kv_at(Kc, off + i, kf16);
                 att[t] = s; // Gemma4 attention scale is 1.0 (no 1/sqrt(d))
             }
             softmax(att + start, pos - start + 1);
             float *outh = xb + hh * hd;
             for (int i = 0; i < hd; i++) outh[i] = 0.0f;
             for (int t = start; t <= pos; t++) {
-                const float *vt = Vc + (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
+                size_t off = (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
                 float a = att[t];
-                for (int i = 0; i < hd; i++) outh[i] += a * vt[i];
+                for (int i = 0; i < hd; i++) outh[i] += a * kv_at(Vc, off + i, kf16);
             }
         }
 
