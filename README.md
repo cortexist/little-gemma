@@ -86,12 +86,15 @@ Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
 ## Usage
 
 ```
-run -m <model.gguf> [-p "prompt" | -s <socket>]
+run -m <model.gguf> [-mm <mmproj.gguf>] [-p "prompt" | -s <socket>]
 run -c <socket>
 ```
 
 - `-m` only → prints the GGUF dump + config, then exits.
 - `-m` + `-p` → one-shot demo: tokenizes the prompt, generates, reports tok/s.
+  Text only — media arrives over the socket; see "Multimodal" below.
+- `-mm` → also load a multimodal projector, so `-s` sessions accept image and
+  audio frames.
 
 ```
 > run -m model.gguf -p "The capital of France is"
@@ -157,6 +160,53 @@ run -c %TEMP%\lg.sock                              # the conversation, cleaned u
 socket to stdout, no protocol — you see the raw token stream exactly as sent,
 `<turn|>` markers and all. `run -c` is the protocol-aware client: it pumps
 stdin lines as turns and knows where each streamed reply ends.
+
+## Multimodal (the 12B's encoder-free design)
+
+The gemma-4-12B takes images and audio with **no encoder at all** — its mmproj
+file is 11 tensors (167 MB): vision is one linear layer over 48×48-pixel
+patches plus three norms and a learned 2-axis position table; audio is one
+linear layer over raw 16 kHz waveform sliced into 640-sample (40 ms) frames.
+No vision transformer, no conformer, no mel spectrogram. `media.c` implements
+exactly that (the math mirrors llama.cpp's `gemma4uv`/`gemma4ua` graphs), and
+the resulting embedding rows prefill through the same batched-chunk path as
+text — they are just rows the tokenizer didn't make. Media embeddings are
+*not* `√n_embd`-scaled; only real token lookups are.
+
+The runner never reads media **files**. The split mirrors the socket design:
+file formats — JPEG entropy coding, WAV chunk soup, resampling, resize
+filters — belong to an upstream tool, and the model runner handles only what
+its own tensors define. `media_cat` (`tools/media_cat.c`) decodes files into
+the raw shape the model wants (u8 RGB at 48-multiple dimensions, mono 16 kHz
+s16 PCM in whole frames), sends them as typed length-prefixed frames followed
+by the question line, and streams the answer:
+
+```
+run-cuda-i8r -m gemma-4-12B-it-Q4_K_M.gguf -mm mmproj-F16.gguf -s %TEMP%\lg.sock
+media_cat %TEMP%\lg.sock -i photo.jpg "What is in this image?"
+media_cat %TEMP%\lg.sock -a clip.wav  "Transcribe this."
+media_cat %TEMP%\lg.sock -t "Frame at 0:01: " -i f1.jpg -t " Frame at 0:02: " -i f2.jpg \
+          "What changes between the frames?"
+```
+
+A turn over the socket is zero or more typed frames — media spans, and `-t`
+text that lands between them — then the usual newline-terminated text line;
+a text-only client speaks the same protocol it always did. The interleaved
+text is what makes a multi-image turn legible to the model: given two bare
+images it answers "there is only one image", but with timestamp text between
+them it counts both frames and compares them correctly. A video tool emits
+exactly that shape. The server wraps each media span in the model's marker tokens, so
+the model sees what it was trained on:
+`<|turn>user\n<|image>` *(192-ish embedding rows)* `<image|>{text}<turn|>\n<|turn>model\n`.
+The runner validates geometry, not content — junk pixels are junk whether or
+not a valid JPEG wrapped them, and decoding junk is the tool's job anyway.
+At ~2 MB per maximal image, a local socket moves a frame in about a
+millisecond; the prefill it triggers costs hundreds of times more.
+
+The E2B/E4B mmproj files instead carry a 16-block vision transformer and a
+12-block audio conformer — the **legacy path**, which `media_open` rejects;
+it may get implemented if those models stay relevant, or dropped entirely if
+encoder-free designs win (the bet here is on the 12B's design).
 
 ## On SIMD (AVX2) — intentionally not implemented
 
@@ -233,23 +283,27 @@ is for.
 
 | directory | files | code  | comment | blank | total |
 |-----------|-------|-------|---------|-------|-------|
-| src       | 10    | 2,520 | 316     | 323   | 3,159 |
-| include   | 5     | 210   | 85      | 58    | 353   |
+| src       | 11    | 3,201 | 465     | 375   | 4,041 |
+| include   | 6     | 234   | 150     | 69    | 453   |
 
-2,730 lines of code in the repository (self-imposed ceiling while exploring: 3,000) —
-but the backends are mutually exclusive, so no single program is anywhere near that.
-Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config, CLI +
-socket server — 1,508 lines) plus exactly one backend:
+3,435 lines of code in the repository (the original 3,000 exploring ceiling was
+retired when the sandbox phase began; `tools/` and the vendored
+`vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
+backends are mutually exclusive, so no single program is anywhere near that.
+Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
+multimodal embedders, CLI + socket server — 1,786 lines) plus exactly one
+backend:
 
-| binary        | backend on top of the shared 1,508        | code lines |
+| binary        | backend on top of the shared 1,786        | code lines |
 |---------------|-------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                             |      1,755 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,014 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,160 |
+| `run`         | `model-cpu.c`                             |      2,094 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,596 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,800 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that decodes E2B 26% faster than llama.cpp CUDA — multi-turn
-socket serving included — is **2,160 lines of C end to end**, tokenizer and all.
+socket serving, 3.4× batched prefill, a ring-buffered f16 KV cache, and image and
+audio understanding included — is **2,800 lines of C end to end**, tokenizer and all.
 
 ## Validation
 

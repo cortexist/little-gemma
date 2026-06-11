@@ -26,6 +26,7 @@ static size_t available_memory(void) {
 
 #else
 #include <unistd.h>
+#include <fcntl.h>   // posix_fadvise
 
 static int64_t file_size64(FILE *f) {
     if (fseeko(f, 0, SEEK_END) != 0) return -1;
@@ -34,7 +35,22 @@ static int64_t file_size64(FILE *f) {
 static int seek64(FILE *f, int64_t off) {
     return fseeko(f, (off_t)off, SEEK_SET);
 }
+// MemAvailable counts reclaimable page cache; _SC_AVPHYS_PAGES counts only
+// FREE pages, so right after a 7 GB model file is read it reports near zero
+// and the NEXT load — a 175 MB mmproj on a 16 GB Orin — gets refused.
 static size_t available_memory(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[128];
+        unsigned long long kb;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                fclose(f);
+                return (size_t)kb * 1024;
+            }
+        }
+        fclose(f);
+    }
 #if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
     long pages = sysconf(_SC_AVPHYS_PAGES);
     long psize = sysconf(_SC_PAGESIZE);
@@ -317,6 +333,13 @@ struct gguf_context *load_gguf(const char *filepath) {
             fprintf(stderr, "Failed to read tensor data.\n");
             goto fail;
         }
+#ifndef _WIN32
+        // The read just left a second copy of the model in the page cache —
+        // on a unified-memory board that is real pressure (a 7 GB model holds
+        // 14 GB of a 16 GB Orin until the kernel reclaims). We own the only
+        // copy that matters now; tell the kernel to drop the cached one.
+        posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
     }
 
     // Point each tensor into the loaded buffer (offsets are relative to data_offset).

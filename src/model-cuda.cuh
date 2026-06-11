@@ -411,6 +411,20 @@ static unsigned char *d_blob = NULL;
 static void ensure_weights(struct model *m) {
     if (d_blob) return;
     g_ctx = m->ctx;
+    // On an integrated GPU (Jetson) host and device share the same DRAM, so
+    // copying the blob would hold the weights TWICE in the same physical
+    // memory — a 12B that fits fine OOMs at this very malloc. Pin and map the
+    // host blob for the GPU instead: zero extra bytes, and decode streams the
+    // same LPDDR either way. Discrete GPUs keep the copy (reading weights
+    // over PCIe every token would be the opposite of the point).
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    if (prop.integrated &&
+        cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
+        cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
+        return;
+    }
+    cudaGetLastError();                       // clear any failed-register error; fall back
     CUDA_CHECK(cudaMalloc(&d_blob, m->ctx->data_size));
     CUDA_CHECK(cudaMemcpy(d_blob, m->ctx->data, m->ctx->data_size, cudaMemcpyHostToDevice));
 }
@@ -725,37 +739,21 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
     forward_head(m);
 }
 
-// One prefill chunk: the forward for PREFILL_B prompt tokens at positions
-// pos0..pos0+B-1, head skipped. The math is exactly B single-token forwards —
-// every kernel above carries a row dimension that decode launches at 1 — but
-// each weight matrix crosses the memory bus ONCE per chunk instead of once per
-// token, and prefill is bandwidth-bound, so that factor is most of its cost.
-// Per layer, the whole chunk's k/v are written to the cache before its queries
-// run; causality holds because each query reads only up to its own position.
-// Runs un-captured (and without the fork/join forks): a chunk already
-// amortizes launch latency over its B tokens.
-static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0) {
+// One prefill chunk's layer loop: the forward for the PREFILL_B positions
+// whose inputs already sit in dx (and whose PLE rows, if the model has them,
+// sit in d_ipl), at positions *d_pos..*d_pos+B-1, head skipped. The math is
+// exactly B single-token forwards — every kernel above carries a row dimension
+// that decode launches at 1 — but each weight matrix crosses the memory bus
+// ONCE per chunk instead of once per token, and prefill is bandwidth-bound,
+// so that factor is most of its cost. Per layer, the whole chunk's k/v are
+// written to the cache before its queries run; causality holds because each
+// query reads only up to its own position. Runs un-captured (and without the
+// fork/join forks): a chunk already amortizes launch latency over its B tokens.
+static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple) {
     const struct config *c = &m->cfg;
     const int B = PREFILL_B, n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
-    const int has_ple = c->n_embd_per_layer > 0 &&
-                        gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;
     const float *d_rope_freqs = dW(m, "rope_freqs.weight");
-
-    // embedding rows for the whole chunk -> dx, in one upload
-    float *rows = (float *)malloc((size_t)B * n_embd * 4);
-    if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
-    float es = sqrtf((float)n_embd);
-    for (int j = 0; j < B; j++) {
-        float *erow = dequantize_row(wq(m, "token_embd.weight"), tokens[j], n_embd);
-        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
-        free(erow);
-    }
-    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
-    free(rows);
-
-    CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
-    build_per_layer_n(m, tokens);
 
     for (int L = 0; L < c->n_layer; L++) {
         const int local = m->is_local[L];
@@ -827,6 +825,50 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
             rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
         }
     }
+}
+
+static int model_has_ple(struct model *m) {
+    return m->cfg.n_embd_per_layer > 0 &&
+           gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;
+}
+
+// Token form: look up and scale the chunk's embedding rows, build the PLE
+// inputs, then run the layers.
+static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0) {
+    const struct config *c = &m->cfg;
+    const int B = PREFILL_B, n_embd = c->n_embd;
+
+    float *rows = (float *)malloc((size_t)B * n_embd * 4);
+    if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
+    float es = sqrtf((float)n_embd);
+    for (int j = 0; j < B; j++) {
+        float *erow = dequantize_row(wq(m, "token_embd.weight"), tokens[j], n_embd);
+        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
+        free(erow);
+    }
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
+    free(rows);
+
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
+    build_per_layer_n(m, tokens);
+    chunk_layers(m, kv, model_has_ple(m));
+}
+
+// Embedding form (media tokens): the rows enter exactly as given — media
+// embeddings are NOT sqrt(n_embd)-scaled (only real token lookups are). On a
+// PLE model a media position takes the PADDING token's (id 0) per-layer row
+// beside the usual projection of its embedding — the reference does exactly
+// this for embedding batches; the 12B has no PLE at all.
+static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float *rows, int pos0) {
+    const struct config *c = &m->cfg;
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)PREFILL_B * c->n_embd * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
+    int has_ple = model_has_ple(m);
+    if (has_ple) {
+        int pad[PREFILL_B] = { 0 };
+        build_per_layer_n(m, pad);
+    }
+    chunk_layers(m, kv, has_ple);
 }
 
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
@@ -901,6 +943,23 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
     for (; i < n; i++)                                // remainder: the per-token path (no head)
         forward_token(m, kv, tokens[i], pos0 + i, 0);
+}
+
+extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
+    ensure_weights(m);
+    ensure_scratch(m);
+    const int n_embd = m->cfg.n_embd;
+    int i = 0;
+    for (; n - i >= PREFILL_B; i += PREFILL_B)
+        forward_chunk_embd(m, kv, rows + (size_t)i * n_embd, pos0 + i);
+    if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
+    for (; i < n; i++) {                              // remainder: one row through the no-head graph
+        CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)i * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
+        int pos = pos0 + i;
+        CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+        if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row
+        forward_graph(m, kv, 0);
+    }
 }
 
 #endif // MODEL_CUDA_CUH

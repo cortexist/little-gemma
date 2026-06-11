@@ -227,7 +227,13 @@ static float *build_per_layer(struct model *m, int token, const float *inp_scale
     return proj; // [ple, n_layer], slice for layer L at proj + L*ple
 }
 
-void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
+// The decoder body, fed an already-built input row: x_in is the position's
+// n_embd input exactly as the layers should see it (token embeddings arrive
+// pre-scaled by sqrt(n_embd); media embeddings arrive as the projector made
+// them). ple_token selects the per-layer-input row, or -1 for none (media
+// positions on PLE models pass the padding token, 0).
+static void forward_core(struct model *m, struct kvcache *kv, const float *x_in, int ple_token,
+                         int pos, float *logits) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const int n_ff = c->n_ff, ple = c->n_embd_per_layer;
@@ -256,13 +262,10 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
     float *att = malloc((size_t)(pos + 1) * sizeof(float));
     float *pg  = ple > 0 ? malloc((size_t)ple * sizeof(float)) : NULL;
 
-    // embedding lookup (one quantized row), scaled by sqrt(n_embd)
-    float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
-    for (int i = 0; i < n_embd; i++) x[i] = erow[i] * sqrtf((float)n_embd);
-    free(erow);
+    memcpy(x, x_in, (size_t)n_embd * sizeof(float));
 
-    // per-layer inputs (uses the scaled embedding above)
-    float *inp_per_layer = build_per_layer(m, token, x);
+    // per-layer inputs (built from the position's input row)
+    float *inp_per_layer = ple_token >= 0 ? build_per_layer(m, ple_token, x) : NULL;
 
     // rope_freqs (freq_factors, stored f32) used by global/full layers only
     const float *rope_freqs = fptr(m, "rope_freqs.weight");
@@ -374,6 +377,23 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
     free(x); free(h); free(q); free(kb); free(vb); free(xb);
     free(o); free(g1); free(g2); free(att); free(pg);
     free(inp_per_layer);   // rope_freqs and all weights are owned by the cache
+}
+
+void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
+    // embedding lookup (one quantized row), scaled by sqrt(n_embd)
+    const int n_embd = m->cfg.n_embd;
+    float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
+    for (int i = 0; i < n_embd; i++) erow[i] *= sqrtf((float)n_embd);
+    forward_core(m, kv, erow, token, pos, logits);
+    free(erow);
+}
+
+void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
+    // On PLE models a media position takes the PADDING token's (id 0)
+    // per-layer row beside the usual projection of its embedding — the
+    // reference does exactly this for embedding batches.
+    for (int i = 0; i < n; i++)
+        forward_core(m, kv, rows + (size_t)i * m->cfg.n_embd, 0, pos0 + i, NULL);
 }
 
 // Forward + greedy pick. On the CPU this is just a scan over the logits; the
