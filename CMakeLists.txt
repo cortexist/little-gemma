@@ -5,11 +5,13 @@ project(little-gemma C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Warning flags for C only (so they don't reach nvcc).
+# Warning flags for C only (so they don't reach nvcc). The genex must be
+# QUOTED: unquoted, CMake splits it at the ';' and gcc gets a literal
+# "-Wextra>" (found the hard way on the Orin).
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:C>:/W3>)
 else()
-    add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra>)
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra>")
 endif()
 
 # Shared, backend-agnostic sources. model.c = common host setup; media.c = the
@@ -30,6 +32,7 @@ if(OpenMP_C_FOUND)
 endif()
 
 # --- CUDA build (optional) -------------------------------------------------
+set(LG_CUDA_ARCH "86" CACHE STRING "CUDA architecture (A5000 = 86, Orin NX = 87)")
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
@@ -45,7 +48,8 @@ if(CMAKE_CUDA_COMPILER)
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
         endif()
-        set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "86")
+        # dev box A5000 = sm_86; Orin NX: cmake -DLG_CUDA_ARCH=87
+        set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "${LG_CUDA_ARCH}")
         # per-thread default stream: required to stream-capture the forward into a CUDA graph
         # (the legacy default stream is not capturable). model_forward always replays a graph.
         target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
