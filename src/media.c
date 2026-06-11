@@ -422,8 +422,11 @@ static int legacy_audio_open(struct media *md) {
         a->v = atens(md, "a.blk.%d.attn_v.weight", L);
         a->o = atens(md, "a.blk.%d.attn_out.weight", L);
         a->k_rel = atens(md, "a.blk.%d.attn_k_rel.weight", L);
-        a->norm_conv = afptr(md, "a.blk.%d.norm_conv.weight", L);
-        a->conv_norm = afptr(md, "a.blk.%d.conv_norm.weight", L);
+        // the two conv-module norms are CROSS-WIRED in the file: the pre-conv
+        // norm is stored as "conv_norm", the post-depthwise norm as
+        // "norm_conv" (the reference loader swaps them exactly like this)
+        a->norm_conv = afptr(md, "a.blk.%d.conv_norm.weight", L);
+        a->conv_norm = afptr(md, "a.blk.%d.norm_conv.weight", L);
         a->ln2       = afptr(md, "a.blk.%d.ln2.weight", L);
         a->dw        = afptr(md, "a.blk.%d.conv_dw.weight", L);
         a->pw1 = atens(md, "a.blk.%d.conv_pw1.weight", L);
@@ -557,6 +560,9 @@ static float *gemma4a_encode(struct media *md, const float *mel, int T0, int *n_
             rmsnorm_w(D + (size_t)t * ne, a->ffn_post, ne, eps);
             for (int i = 0; i < ne; i++) X[(size_t)t * ne + i] += 0.5f * D[(size_t)t * ne + i];
         }
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE ffn1  %.5f %.5f %.5f %.5f\n", X[0], X[1], X[2], X[3]);
+#endif
 
         // ---- chunked local attention with relative positions ----
         for (int t = 0; t < T; t++) {
@@ -605,17 +611,27 @@ static float *gemma4a_encode(struct media *md, const float *mel, int T0, int *n_
             rmsnorm_w(H + (size_t)t * ne, a->attn_post, ne, eps);
             for (int i = 0; i < ne; i++) X[(size_t)t * ne + i] += H[(size_t)t * ne + i];
         }
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE attnD %.5f %.5f %.5f %.5f (attn out tok0)\n", D[0], D[1], D[2], D[3]);
+        if (L == 0) fprintf(stderr, "PROBE attn  %.5f %.5f %.5f %.5f\n", X[0], X[1], X[2], X[3]);
+#endif
 
         // ---- convolution module ----
         for (int t = 0; t < T; t++) {
             memcpy(H + (size_t)t * ne, X + (size_t)t * ne, (size_t)ne * 4);
             rmsnorm_w(H + (size_t)t * ne, a->norm_conv, ne, eps);
         }
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE cnorm %.5f %.5f %.5f %.5f\n", H[0], H[1], H[2], H[3]);
+#endif
         matmat(G, a->pw1, H, ne, 2 * ne, T);                       // -> GLU halves
         for (int t = 0; t < T; t++)
             for (int i = 0; i < ne; i++)
                 D[(size_t)t * ne + i] = G[(size_t)t * 2 * ne + i] /
                                         (1.0f + expf(-G[(size_t)t * 2 * ne + ne + i]));
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE glu   %.5f %.5f %.5f %.5f\n", D[0], D[1], D[2], D[3]);
+#endif
         for (int t = 0; t < T; t++) {                              // causal depthwise, 5 taps
             float *hr = H + (size_t)t * ne;
             for (int i = 0; i < ne; i++) {
@@ -626,11 +642,17 @@ static float *gemma4a_encode(struct media *md, const float *mel, int T0, int *n_
                 }
                 hr[i] = s;
             }
+#ifdef MEDIA_PROBE
+            if (L == 0 && t == 0) fprintf(stderr, "PROBE dwco  %.5f %.5f %.5f %.5f\n", hr[0], hr[1], hr[2], hr[3]);
+#endif
             rmsnorm_w(hr, a->conv_norm, ne, eps);
             for (int i = 0; i < ne; i++) hr[i] = silu(hr[i]);
         }
         matmat(D, a->pw2, H, ne, ne, T);
         for (size_t i = 0; i < (size_t)T * ne; i++) X[i] += D[i];
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE conv  %.5f %.5f %.5f %.5f\n", X[0], X[1], X[2], X[3]);
+#endif
 
         // ---- FFN 2 (half-step residual) ----
         for (int t = 0; t < T; t++) {
@@ -647,6 +669,9 @@ static float *gemma4a_encode(struct media *md, const float *mel, int T0, int *n_
 
         // ---- layer output norm ----
         for (int t = 0; t < T; t++) rmsnorm_w(X + (size_t)t * ne, a->ln2, ne, eps);
+#ifdef MEDIA_PROBE
+        if (L == 0) fprintf(stderr, "PROBE ln2   %.5f %.5f %.5f %.5f\n", X[0], X[1], X[2], X[3]);
+#endif
     }
 
     // output projection -> plain RMS norm -> the LLM-width projection
