@@ -47,12 +47,19 @@ int  model_init(struct model *m, const struct gguf_context *ctx);
 void model_free(struct model *m);
 
 // Rolling key/value cache. Head size varies per layer (local vs global), and
-// only KV-owning layers allocate storage, so each layer has its own buffer.
+// only KV-owning layers allocate storage: a layer that reuses another's KV
+// holds NULL. Sliding-window (local) layers only ever attend to the last
+// `sliding_window` positions, so their storage is a RING of about that many
+// rows — row for position p is p % seq[L] — instead of max_seq rows. Global
+// layers keep the full max_seq (seq[L] == max_seq, and the ring index is then
+// the identity). At a long context the cache cost is dominated by the few
+// global KV-owning layers, not the layer count.
 struct kvcache {
     int     n_layer;
-    int     max_seq;
+    int     max_seq;   // logical capacity (positions); ring rows may be fewer
     int    *kv_dim;    // per layer: n_head_kv * head_dim(layer)
-    float **k;         // per layer: [max_seq * kv_dim], or NULL if the layer reuses KV
+    int    *seq;       // per layer: rows allocated (ring length); 0 if reusing
+    float **k;         // per layer: [seq * kv_dim], or NULL if the layer reuses KV
     float **v;
 };
 

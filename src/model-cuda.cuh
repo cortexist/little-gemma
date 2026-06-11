@@ -182,14 +182,22 @@ __global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_po
 // the warps' partials merge once at the end. Shared memory is nwarp*hd — independent
 // of how long the context is (the score-array version capped max_seq at ~12k). Scale 1.0.
 // The body is shared with the chunk form via (pos, qoff); the decode entry pins
-// qoff to 0 so the captured graph keeps the original instruction stream.
+// qoff to 0 so the captured graph keeps the original instruction stream. RING is
+// a compile-time flag (one template, two instruction streams): the ring mapping
+// — position start+t lives in cache row (start+t) % seq, T never exceeds seq so
+// the modulo is one conditional subtract per timestep — exists ONLY in the
+// sliding-window instantiation. The global layers, whose per-timestep loop grows
+// with context and notices every added instruction, keep the ring-free body
+// (their rows are positions: a full-length buffer never wraps).
 #define ATTN_HD_MAX 512   // per-lane V accumulator: ATTN_HD_MAX/32 registers
+template <bool RING>
 __device__ static void d_attn(float *xb, const float *q, const float *Kc, const float *Vc,
-                              int hd, int kv_dim, int gqa, int pos, size_t qoff, int window, struct actq aq) {
+                              int hd, int kv_dim, int gqa, int pos, size_t qoff, int window, int seq, struct actq aq) {
     int hh = blockIdx.x, kvh = hh / gqa;
     const float *qh = q + qoff + (size_t)hh * hd;
     int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
     int T = pos - start + 1;
+    int s0 = RING ? start % seq : start;
     extern __shared__ float comb[];                       // [nwarp][hd] partial outputs
     __shared__ float wm[32], ws[32];                      // per-warp running max / sum
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
@@ -201,7 +209,9 @@ __device__ static void d_attn(float *xb, const float *q, const float *Kc, const 
     // one WARP per timestep — the lanes split the K dot, so the row is read with
     // coalesced 128-byte loads; the V row follows while the score is still warm.
     for (int t = warp; t < T; t += nwarp) {
-        const float *kt = Kc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
+        int r = s0 + t;
+        if (RING && r >= seq) r -= seq;                   // ring row of position start+t
+        const float *kt = Kc + (size_t)r * kv_dim + (size_t)kvh * hd;
         float sc = 0.0f;
         for (int i = lane; i < hd; i += 32) sc += qh[i] * kt[i];
         for (int o = 16; o > 0; o >>= 1) sc += __shfl_down_sync(0xffffffffu, sc, o);
@@ -209,7 +219,7 @@ __device__ static void d_attn(float *xb, const float *q, const float *Kc, const 
         float mn = fmaxf(m, sc);
         float corr = expf(m - mn), e = expf(sc - mn);     // first step: m=-inf -> corr=0
         s = s * corr + e;
-        const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
+        const float *vt = Vc + (size_t)r * kv_dim + (size_t)kvh * hd;
         #pragma unroll
         for (int j = 0; j < ATTN_HD_MAX / 32; j++)
             if (j < nv) acc[j] = acc[j] * corr + e * vt[lane + j * 32];
@@ -241,16 +251,26 @@ __device__ static void d_attn(float *xb, const float *q, const float *Kc, const 
 }
 __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
                                    int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
-    d_attn(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, aq);
+    d_attn<false>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, 0, aq);
 }
-// Chunk form: grid (n_head, chunk) — query blockIdx.y sits at *d_pos + blockIdx.y,
-// so a batched chunk is causal by construction: every query reads only cache rows
-// at or before its own position, even though the whole chunk's k/v were written
-// before the launch.
+__global__ static void attn_swa_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
+                                       int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
+    d_attn<true>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, seq, aq);
+}
+// Chunk forms: grid (n_head, chunk) — query blockIdx.y sits at *d_pos + blockIdx.y,
+// so a batched chunk is causal by construction: every query reads only positions
+// at or before its own, even though the whole chunk's k/v were written before the
+// launch (the ring keeps PREFILL_B spare rows so those writes never land on a row
+// an earlier query in the chunk still needs).
 __global__ static void attn_n_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
                                      int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
-    d_attn(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
-           (size_t)blockIdx.y * gridDim.x * hd, window, aq);
+    d_attn<false>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
+                  (size_t)blockIdx.y * gridDim.x * hd, window, 0, aq);
+}
+__global__ static void attn_swa_n_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
+                                         int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
+    d_attn<true>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
+                 (size_t)blockIdx.y * gridDim.x * hd, window, seq, aq);
 }
 
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
@@ -263,6 +283,17 @@ __global__ static void kv_write_kernel(float *dst, const float *src, const int *
 __global__ static void kv_write_n_kernel(float *dst, const float *src, const int *d_pos, int n, int rows) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n * rows) dst[(size_t)(*d_pos + i / n) * n + i % n] = src[i];
+}
+// Ring forms, for sliding-window layers whose cache is seq rows: position p
+// lands on row p % seq. Separate kernels so non-ringed layers keep the
+// modulo-free originals.
+__global__ static void kv_write_ring_kernel(float *dst, const float *src, const int *d_pos, int n, int seq) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[(size_t)(*d_pos % seq) * n + i] = src[i];
+}
+__global__ static void kv_write_ring_n_kernel(float *dst, const float *src, const int *d_pos, int n, int seq, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * rows) dst[(size_t)((*d_pos + i / n) % seq) * n + i % n] = src[i];
 }
 
 __device__ static float d_gelu(float x) {
@@ -444,12 +475,24 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer; kv->max_seq = max_seq;
     kv->kv_dim = (int *)calloc((size_t)c->n_layer, sizeof(int));
+    kv->seq = (int *)calloc((size_t)c->n_layer, sizeof(int));
     kv->k = (float **)calloc((size_t)c->n_layer, sizeof(float *));  // host array of device ptrs
     kv->v = (float **)calloc((size_t)c->n_layer, sizeof(float *));
-    if (!kv->kv_dim || !kv->k || !kv->v) return -1;
+    if (!kv->kv_dim || !kv->seq || !kv->k || !kv->v) return -1;
     for (int L = 0; L < c->n_layer; L++) {
         kv->kv_dim[L] = m->n_head_kv[L] * m->head_dim[L];
-        size_t bytes = (size_t)max_seq * kv->kv_dim[L] * sizeof(float);
+        if (L >= c->n_kv_start) continue;     // reuses kv_src's buffers: k/v stay NULL
+        // A sliding-window layer attends to the last `sliding_window` positions
+        // only, so a ring of about that many rows holds everything its queries
+        // can reach (row for position p is p % seq). PREFILL_B extra rows keep
+        // the batched chunk safe: it writes all B positions BEFORE its queries
+        // run, and with a window-exact ring the write for the chunk's last
+        // token would land on a row its first query still needs.
+        int seq = max_seq;
+        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + PREFILL_B < max_seq)
+            seq = c->sliding_window + PREFILL_B;
+        kv->seq[L] = seq;
+        size_t bytes = (size_t)seq * kv->kv_dim[L] * sizeof(float);
         CUDA_CHECK(cudaMalloc(&kv->k[L], bytes)); CUDA_CHECK(cudaMemset(kv->k[L], 0, bytes));
         CUDA_CHECK(cudaMalloc(&kv->v[L], bytes)); CUDA_CHECK(cudaMemset(kv->v[L], 0, bytes));
     }
@@ -458,8 +501,8 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
 extern "C" void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
     for (int L = 0; L < kv->n_layer; L++) { cudaFree(kv->k[L]); cudaFree(kv->v[L]); }
-    free(kv->k); free(kv->v); free(kv->kv_dim);
-    kv->k = kv->v = NULL; kv->kv_dim = NULL;
+    free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq);
+    kv->k = kv->v = NULL; kv->kv_dim = kv->seq = NULL;
 }
 
 // ====================  forward pass (device-resident)  ======================
@@ -561,14 +604,23 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
             rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);  // plain V norm
             rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2);
-            kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim);    // dst offset from d_pos
-            kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim);
+            if (kv->seq[L] < kv->max_seq) {                // ring (sliding-window layer)
+                kv_write_ring_kernel<<<gridn(kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim, kv->seq[L]);
+                kv_write_ring_kernel<<<gridn(kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim, kv->seq[L]);
+            } else {                                       // full-length: row = position
+                kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim);
+                kv_write_kernel<<<gridn(kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim);
+            }
         }
         const float *Kc = kv->k[src], *Vc = kv->v[src];
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
         // shmem holds each warp's partial output row: (256/32)*hd floats, ctx-independent
-        attn_kernel<<<n_head, 256, (size_t)(256 / 32) * hd * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
+        size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
+        if (kv->seq[src] < kv->max_seq)
+            attn_swa_kernel<<<n_head, 256, shm>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(q_dim));
+        else
+            attn_kernel<<<n_head, 256, shm>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
@@ -672,13 +724,22 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
             rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2, B);
-            kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim, B);
-            kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim, B);
+            if (kv->seq[L] < kv->max_seq) {                // ring (sliding-window layer)
+                kv_write_ring_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim, kv->seq[L], B);
+                kv_write_ring_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim, kv->seq[L], B);
+            } else {                                       // full-length: row = position
+                kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim, B);
+                kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim, B);
+            }
         }
         const float *Kc = kv->k[src], *Vc = kv->v[src];
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
-        attn_n_kernel<<<dim3(n_head, B), 256, (size_t)(256 / 32) * hd * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
+        size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
+        if (kv->seq[src] < kv->max_seq)
+            attn_swa_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(B * q_dim));
+        else
+            attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
 
         matmul_q_n(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);

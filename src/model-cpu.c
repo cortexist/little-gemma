@@ -123,13 +123,25 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     kv->n_layer = c->n_layer;
     kv->max_seq = max_seq;
     kv->kv_dim = calloc((size_t)c->n_layer, sizeof(int));
+    kv->seq = calloc((size_t)c->n_layer, sizeof(int));
     kv->k = calloc((size_t)c->n_layer, sizeof(float *));
     kv->v = calloc((size_t)c->n_layer, sizeof(float *));
-    if (!kv->kv_dim || !kv->k || !kv->v) return -1;
+    if (!kv->kv_dim || !kv->seq || !kv->k || !kv->v) return -1;
 
     for (int L = 0; L < c->n_layer; L++) {
         kv->kv_dim[L] = m->n_head_kv[L] * head_dim_at(m, L);
-        size_t n = (size_t)max_seq * kv->kv_dim[L];
+        if (L >= c->n_kv_start) continue;     // reuses kv_src's buffers: k/v stay NULL
+        // A sliding-window layer attends to the last `sliding_window` positions
+        // only, so a ring of that many rows holds everything its queries can
+        // reach: the write for position p lands on p % seq, over the row for
+        // p - seq, which just slid out of every later query's window. (The CPU
+        // forward is one token at a time, so window rows exactly suffice;
+        // the CUDA cache pads the ring for its prefill chunks.)
+        int seq = max_seq;
+        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window < max_seq)
+            seq = c->sliding_window;
+        kv->seq[L] = seq;
+        size_t n = (size_t)seq * kv->kv_dim[L];
         kv->k[L] = calloc(n, sizeof(float));
         kv->v[L] = calloc(n, sizeof(float));
         if (!kv->k[L] || !kv->v[L]) return -1;
@@ -140,8 +152,8 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
 void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
     for (int L = 0; L < kv->n_layer; L++) { free(kv->k[L]); free(kv->v[L]); }
-    free(kv->k); free(kv->v); free(kv->kv_dim);
-    kv->k = kv->v = NULL; kv->kv_dim = NULL;
+    free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq);
+    kv->k = kv->v = NULL; kv->kv_dim = kv->seq = NULL;
 }
 
 // ---- the forward pass -----------------------------------------------------
@@ -244,10 +256,12 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
             for (int hh = 0; hh < n_head_kv; hh++) rmsnorm(kb + hh * hd, kb + hh * hd, kn, hd, eps);
             for (int hh = 0; hh < n_head_kv; hh++) rmsnorm_plain(vb + hh * hd, vb + hh * hd, hd, eps);
             for (int hh = 0; hh < n_head_kv; hh++) rope_neox(kb + hh * hd, hd, pos, base, ff);
-            memcpy(kv->k[L] + (size_t)pos * kv_dim, kb, (size_t)kv_dim * sizeof(float));
-            memcpy(kv->v[L] + (size_t)pos * kv_dim, vb, (size_t)kv_dim * sizeof(float));
+            int row = pos % kv->seq[L];                  // ring write (identity on global layers)
+            memcpy(kv->k[L] + (size_t)row * kv_dim, kb, (size_t)kv_dim * sizeof(float));
+            memcpy(kv->v[L] + (size_t)row * kv_dim, vb, (size_t)kv_dim * sizeof(float));
         }
         const float *Kc = kv->k[src], *Vc = kv->v[src];
+        const int seq = kv->seq[src];                    // ring length of the owning layer
 
         int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
                   ? pos - c->sliding_window + 1 : 0;
@@ -257,7 +271,7 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
             const float *qh = q + hh * hd;
             int kvh = hh / gqa;
             for (int t = start; t <= pos; t++) {
-                const float *kt = Kc + (size_t)t * kv_dim + (size_t)kvh * hd;
+                const float *kt = Kc + (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
                 float s = 0.0f;
                 for (int i = 0; i < hd; i++) s += qh[i] * kt[i];
                 att[t] = s; // Gemma4 attention scale is 1.0 (no 1/sqrt(d))
@@ -266,7 +280,7 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
             float *outh = xb + hh * hd;
             for (int i = 0; i < hd; i++) outh[i] = 0.0f;
             for (int t = start; t <= pos; t++) {
-                const float *vt = Vc + (size_t)t * kv_dim + (size_t)kvh * hd;
+                const float *vt = Vc + (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
                 float a = att[t];
                 for (int i = 0; i < hd; i++) outh[i] += a * vt[i];
             }
