@@ -24,6 +24,8 @@ add_executable(run ${CORE} src/model-cpu.c)
 target_include_directories(run PRIVATE include)
 if(WIN32)
     target_link_libraries(run PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+elseif(UNIX)
+    target_link_libraries(run PRIVATE m)        # expf/sqrtf/... live in libm
 endif()
 
 find_package(OpenMP)
@@ -47,6 +49,8 @@ if(CMAKE_CUDA_COMPILER)
         target_include_directories(${tgt} PRIVATE include)
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+        elseif(UNIX)
+            target_link_libraries(${tgt} PRIVATE m)
         endif()
         # dev box A5000 = sm_86; Orin NX: cmake -DLG_CUDA_ARCH=87
         set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "${LG_CUDA_ARCH}")
