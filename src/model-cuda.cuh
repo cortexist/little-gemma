@@ -411,6 +411,20 @@ static unsigned char *d_blob = NULL;
 static void ensure_weights(struct model *m) {
     if (d_blob) return;
     g_ctx = m->ctx;
+    // On an integrated GPU (Jetson) host and device share the same DRAM, so
+    // copying the blob would hold the weights TWICE in the same physical
+    // memory — a 12B that fits fine OOMs at this very malloc. Pin and map the
+    // host blob for the GPU instead: zero extra bytes, and decode streams the
+    // same LPDDR either way. Discrete GPUs keep the copy (reading weights
+    // over PCIe every token would be the opposite of the point).
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    if (prop.integrated &&
+        cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
+        cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
+        return;
+    }
+    cudaGetLastError();                       // clear any failed-register error; fall back
     CUDA_CHECK(cudaMalloc(&d_blob, m->ctx->data_size));
     CUDA_CHECK(cudaMemcpy(d_blob, m->ctx->data, m->ctx->data_size, cudaMemcpyHostToDevice));
 }
