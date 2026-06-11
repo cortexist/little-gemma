@@ -53,8 +53,8 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 // The gemma4uv geometry this tool prepares data for. (If a future mmproj
 // changes these, make them flags; the runner derives its own from tensors.)
 #define PATCH    48
-#define MIN_TOK  40
-#define MAX_TOK  280
+#define MIN_TOK  252   // gemma4v (E2B/E4B) trains at 252..280 tokens; the 12B
+#define MAX_TOK  280   // accepts down to 40, so always-high-res suits both
 #define RATE     16000
 #define FRAME    640
 
