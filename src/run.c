@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <winsock2.h>   // must precede windows.h
@@ -63,6 +64,10 @@ static void print_piece(const char *s) {
 // is the unit of work that cannot be interrupted, and never needs to be.
 
 #define SERVE_SEQ 8192   // context budget per conversation
+#define SERVE_GEN 1024   // output cap per turn: greedy decode has no sampler and
+                         // no repeat penalty, so a degenerate loop would otherwise
+                         // spin until the context fills (observed: 8,098 tokens,
+                         // 270 s, of the same sentence about a typo)
 
 static int send_all(sock_t s, const char *buf, int n) {
     while (n > 0) {
@@ -156,8 +161,23 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     strcpy(sa.sun_path, path);
     remove(path);                                       // stale socket from a previous run
     if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 4) != 0) {
-        fprintf(stderr, "bind/listen on %s failed (error %d) - note the socket's directory must exist\n",
-                path, sock_err());
+        // self-diagnosing on purpose: a relative path that LOOKS absolute is
+        // the classic miss (PowerShell does not expand %TEMP% — that literal
+        // directory really got created once), as is a directory created AT
+        // the socket path after reading "the directory must exist"
+        int err = sock_err();
+        char full[576];
+#ifdef _WIN32
+        if (!_fullpath(full, path, sizeof full)) snprintf(full, sizeof full, "%s", path);
+#else
+        snprintf(full, sizeof full, "%s", path);
+#endif
+        struct stat st;
+        fprintf(stderr, "bind/listen failed (error %d) on %s\n  resolved: %s\n  %s\n",
+                err, path, full,
+                stat(full, &st) == 0 && (st.st_mode & S_IFDIR)
+                ? "a DIRECTORY sits at the socket path itself - remove it; only the PARENT must exist"
+                : "the socket's PARENT directory must exist, and the path itself must be free");
         return;
     }
     fprintf(stderr, "listening on %s - one conversation per connection, Ctrl-C to stop\n", path);
@@ -201,6 +221,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     continue;
                 }
                 if (!md) { fprintf(stderr, "media frame but no -mm projector\n"); free(payload); dead = 1; break; }
+                double e0 = now_sec();
                 float *rows = hdr[0] == MEDIA_FRAME_IMAGE && len == 3u * w * h
                             ? media_embed_image(md, (uint8_t *)payload, w, h, &seg[n_seg].n)
                             : hdr[0] == MEDIA_FRAME_AUDIO
@@ -210,7 +231,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 if (!rows) { dead = 1; break; }
                 seg[n_seg].rows = rows;
                 in_media += seg[n_seg].n;
-                fprintf(stderr, "media: %c frame -> %d tokens\n", hdr[0], seg[n_seg].n);
+                fprintf(stderr, "media: %c frame -> %d tokens in %.1fs\n", hdr[0], seg[n_seg].n, now_sec() - e0);
                 n_seg++;
             }
             if (dead || recv_line(c, line, sizeof line, c0) < 0) {
@@ -267,6 +288,11 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             for (;; g++) {                               // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
+                if (g + 1 >= SERVE_GEN) {                // runaway turn: end it ourselves
+                    send_piece(c, " [SERVE_GEN cap]<turn|>");
+                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                    break;
+                }
                 best = model_forward_next(&m, &kv, best, pos++);
             }
             double dt = now_sec() - t1, dp = t1 - t0;
