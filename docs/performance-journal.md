@@ -1,10 +1,11 @@
 # The CUDA performance journal
 
-How little-gemma's decode went from 7.9 to 182.5 tok/s (E2B) — every step gated
-on measured tok/s and on unchanged output, with the failed attempts kept
-alongside the wins, because the negative results are as instructive. The
-architecture this journal optimizes (two backends sharing one forward, the
-matmul as the only seam) is described in the [README](../README.md).
+How little-gemma's decode went from 7.9 to 182.5 tok/s (E2B) — and then how the
+prompt phase, the context cap, and the kv cache caught up — every step gated on
+measured tok/s and on unchanged output, with the failed attempts kept alongside
+the wins, because the negative results are as instructive. The architecture this
+journal optimizes (two backends sharing one forward, the matmul as the only
+seam) is described in the [README](../README.md).
 
 **`model-cuda-f32.cu` — the readable f32 matmul.** Built up in four steps, each diffed
 against the CPU output (byte-identical) before keeping it (E2B tok/s):
@@ -118,8 +119,9 @@ Two things make this work:
    capture-*once*, replay-*many*. So every per-token-varying input — the position (which
    drives the KV-cache write offset, the RoPE angle, and the attention range) — is read
    on-device from a one-int `d_pos` buffer that the host updates before each launch. The
-   nodes themselves never change. (Attention shared memory is fixed at `max_seq` floats,
-   which caps context at ~12k tokens without an online-softmax rewrite.)
+   nodes themselves never change. (Attention shared memory was fixed at `max_seq`
+   floats at this point, which capped context at ~12k tokens; the online-softmax
+   rewrite that removed the cap came later — see "The long-context roadmap" below.)
 2. **Capture needs the per-thread default stream** (`--default-stream=per-thread`; the
    legacy default stream can't be captured), and no `cudaMalloc`/sync mid-capture (two
    tokens run un-captured first so the activation-scratch allocation is already done).
@@ -312,3 +314,97 @@ round-trips, norms, the PLE path — which 2,000 readable lines can do leanly. T
 bigger the model, the more it reduces to one number: sustained DRAM bandwidth
 through the quantized matmul, where llama.cpp's arch-tuned kernels still hold a
 few percent. The crossover for this codebase currently sits right around E4B.
+
+## The long-context roadmap: four more steps
+
+Decode was fast; everything else still assumed short conversations. The attention
+kernel's shared-memory score array capped context at ~12k positions outright, a
+prompt token cost a full weight stream just like a generated one (~2 s of prefill
+per 256-token image on this machine, far worse on an edge device), and the kv
+cache allocated `max_seq` f32 rows for all 35 layers when 20 of them never write
+a row and 13 more can never look back past their 512-position window. Four steps,
+in dependency order — the first three byte-identical, the last one the project's
+single deliberate numerics change. (Perf numbers in this section were measured
+with `nvidia-smi --lock-gpu-clocks`; the idle-parked clock swings short runs by
+±10% otherwise.)
+
+1. **Online-softmax attention.** Each warp now walks its strided slice of
+   timesteps holding a running (max, sum) with per-lane V accumulators in
+   registers, rescaling when the max moves; the warps' partials merge once at
+   the end. Shared memory drops from `max_seq` floats (the ~12k cap) to
+   `nwarp·hd`, independent of context. Verified against a double-precision
+   reference: the old and new kernels both sit ~1e-5 from it at every length to
+   12,288 (old-vs-new ~1e-6 — pure reassociation), and the new kernel holds
+   ~1e-5 at 32,768 and 65,536 where the old one cannot launch at all. **Not
+   bit-identical** — reassociation flips greedy near-ties, and the generated
+   text visibly changed on all three models — so the gate was relaxed for this
+   one step to numeric equivalence plus determinism, with the kernel-level
+   harness as the artifact. Faster too: gen E2B +6.3%, E4B +3.6%, 12B +1.6%.
+   A companion `model_prefill` skips the head — final norm, the n_vocab×n_embd
+   output projection (the model's largest matmul), the argmax sync — for every
+   prompt token but the last; the CUDA side keeps two captured graphs
+   (layers+head for decode, layers-only for prefill).
+
+2. **Batched prefill.** Prompt tokens don't need their outputs read one at a
+   time, so `model_prefill` takes the whole span and the CUDA backends process
+   it in 16-token chunks: a `matmul_q_n` seam dots each weight row against all
+   16 activation columns in one launch, so the weights cross DRAM **once per
+   chunk** instead of once per token (the per-column re-reads hit L1). Each
+   column keeps the one-column kernel's accumulation order, so the chunked path
+   is **byte-identical** to per-token prefill. On a 2,457-token prompt: E2B
+   108 → 371 prompt tok/s (**3.4×**), E4B 76 → 190 (2.5×), 12B 41 → 89 (2.2×);
+   a 256-token image's prefill drops from ~2.4 s to ~0.7 s. Chunk size swept
+   8/16/32 → 327/369/373; 16 takes ~99% of 32's rate at half the registers.
+   **The lesson that shaped the code:** the first draft generalized the decode
+   kernels in place (a `rows` parameter, `pos = *d_pos + blockIdx.y`) and decode
+   lost 5–10% — *with ptxas reporting identical register counts*. The captured
+   graph's latency-bound nodes notice every added instruction. The decode
+   kernels are therefore frozen exactly as they were and the chunk path gets its
+   own `*_n` entry points, with the big bodies shared through a `__device__`
+   function whose row pins to 0 for decode. Decode re-measured equal to within
+   0.1% on all three models.
+
+3. **Reuse-layer NULL + sliding-window ring.** The cache was paying ~5× over
+   minimum. Layers past `n_kv_start` (20 of E2B's 35) only ever read another
+   layer's buffers — they now allocate nothing. Sliding-window layers can never
+   attend past `sliding_window` positions — they now keep a ring (`row = p %
+   seq`) of `sliding_window + PREFILL_B` rows; the `+PREFILL_B` pad is
+   load-bearing, because a prefill chunk writes all 16 positions *before* its
+   queries run, and with a window-exact ring the chunk's last write would land
+   on the row its first query still needs. Global layers keep full length
+   (their `start` is always 0; a full buffer never wraps). Byte-identical,
+   including a CPU run to position ~962 through its window-exact ring. An
+   8,192-position serve cache: E2B 852 → 292 MiB, 12B 5,556 → 1,236 MiB.
+   And the frozen-kernel lesson promptly fired a **third** time: one
+   conditional subtract per timestep in the shared attention loop cost ~8% of
+   long-context decode, so `d_attn` became a `template<bool RING>` — the
+   sliding-window instantiation carries the wrap, the global instantiation
+   keeps its previous instruction stream bit for bit.
+
+4. **f16 KV on the global layers.** The one deliberate numerics change, shipped
+   with a quality check instead of bit-identity. At a long context the cache —
+   capacity and the per-token attention read alike — belongs almost entirely to
+   the few global KV-owning layers, so their rows now store as f16: one
+   round-to-nearest per value at write (the CPU's converter matches the GPU's
+   `cvt.rn` bit for bit), the dot still accumulates f32. The SWA rings stay f32;
+   a few hundred rows save nothing meaningful. The instructive part: scalar
+   `__half` loads measured *−1.8%* — attention on this GPU is issue-bound at
+   these context lengths, and the per-element convert ate the bandwidth saving —
+   but loading `__half2` pairs (one 32-bit load per two elements, the same
+   make-each-load-wider move as i8r) flipped it to gen +1.3% and prefill +3–4%
+   at 4k context, with the win scaling with context and with how
+   bandwidth-starved the device is. Text flips greedy ties vs f32-KV as
+   expected; quality inspected equivalent; deterministic. The same 8K serve
+   cache: E2B 292 → 243 MiB, 12B 1,236 → 1,093 MiB.
+
+Where the cache landed: before the roadmap, E2B at its nominal 131K context
+would have needed ~10.7 GiB of f32 KV; it now needs **~0.5 GiB**, dominated by
+its two global KV-owning layers — and the attention kernel no longer has an
+opinion about how long the context is. One caveat worth carrying forward: every
+verdict in this journal is **device-scoped**. This machine's A5000 (~768 GB/s,
+launch-latency-prone WDDM) is partly latency- and issue-bound, which is exactly
+why batched prefill "only" gained 3.4× and f16 KV needed paired loads to win at
+all; on a bandwidth-starved edge device (an Orin NX has ~100 GB/s shared with
+the CPU) the same compute-for-bandwidth trades convert at much closer to their
+theoretical rates — and the dead ends ruled out above deserve a re-trial there
+before being believed.

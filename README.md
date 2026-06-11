@@ -188,12 +188,14 @@ GPU backends, so each is a thin file that includes the header and defines just
 `matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8r.cu` to see exactly
 where the speed comes from.
 
-Getting the speed was a journey of ~20 steps, each gated on measured tok/s and
-on unchanged output: two profiling-led rewrites that *failed* (and earned their
-write-ups), a CUDA graph against WDDM launch latency, wide weight loads, and a
-long tail of wins that were mostly *outside* the matmul everyone stares at —
-taking E2B from 7.9 to 182.5 tok/s. The full log, dead ends and bisections
-included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
+Getting the speed was a journey of two dozen gated steps: two profiling-led
+rewrites that *failed* (and earned their write-ups), a CUDA graph against WDDM
+launch latency, wide weight loads, a long tail of wins mostly *outside* the
+matmul everyone stares at — E2B from 7.9 to 182.5 tok/s — then a long-context
+roadmap: online-softmax attention (the ~12k context cap gone), batched prefill
+(3.4× prompt speed), and a kv cache at ~5% of its old footprint. The full log,
+dead ends and bisections included, is
+**[docs/performance-journal.md](docs/performance-journal.md)**.
 Where things stand, same machine, same day, both sides re-measured
 (little-gemma = `run-cuda-i8r`, ~166–187 generated tokens; llama.cpp =
 `llama-bench tg32`):
