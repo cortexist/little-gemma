@@ -32,27 +32,7 @@
 #include "gguf.h"
 #include "quant.h"
 #include "model.h"
-
-struct mtp_layer {
-    const float *attn_norm, *q_norm, *post_attn, *ffn_norm, *post_ffw;
-    const float *out_scale;                  // scalar
-    const struct gguf_tensor *q, *o, *gate, *up, *down;
-    int hd;            // q head dim, matches the target KV layer it reads
-    int local;         // 1 = reads the target's SWA KV, 0 = global KV
-    int src;           // target kv layer whose cache this block attends
-};
-
-struct mtp {
-    struct gguf_context *ctx;
-    int n_layer, n_inner, n_bb, n_vocab, n_head, n_ff;
-    float eps, base_full, base_swa, softcap;
-    const struct gguf_tensor *pre, *post, *head;   // next-token pre/post projections, LM head
-    const float *out_norm;
-    struct mtp_layer *l;
-    // scratch (sized once at open)
-    float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *att, *logits;
-    int att_cap;
-};
+#include "mtp-internal.h"
 
 // ---- the same small math model-cpu.c uses -----------------------------------
 
@@ -245,6 +225,7 @@ struct mtp *mtp_open(const char *path, const struct model *m) {
 
 void mtp_free(struct mtp *t) {
     if (!t) return;
+    mtp_free_device(t);
     free_gguf(t->ctx);
     free(t->l);
     free(t->cat); free(t->x); free(t->h); free(t->q); free(t->xb);
@@ -256,12 +237,15 @@ void mtp_free(struct mtp *t) {
 
 // Predict the token AFTER `token`, where `token` is the freshly chosen token
 // that will sit at position `pos` (its own target forward need not have run
-// yet) and h_prev is the target's post-output-norm hidden from the forward
-// that chose it. Returns the draft token id, and (if h_next) the chained
-// backbone hidden. The target cache holds positions < pos only — exactly the
+// yet). h_prev — the target's post-output-norm hidden from the forward that
+// chose it — comes from the backend: model.last_hidden here, a device buffer
+// on CUDA. The target cache holds positions < pos only — exactly the
 // cross-attention this head was trained on.
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
-              int token, int pos, const float *h_prev, float *h_next) {
+              int token, int pos) {
+    if (!model_kv_host)
+        return mtp_draft_device(t, m, kv, token, pos);
+    const float *h_prev = m->last_hidden;
     const struct config *c = &m->cfg;
     const int ni = t->n_inner, nb = t->n_bb;
     const float eps = t->eps;
@@ -339,7 +323,8 @@ int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
     }
 
     rmsnorm(t->x, t->x, t->out_norm, ni, eps);
-    if (h_next) matmul_q(h_next, t->post, t->x, ni, nb);
+    // (chaining via the post-projection comes with deeper spec blocks; at
+    // block 2 there is exactly one draft per round, so it never runs)
     matmul_q(t->logits, t->head, t->x, ni, t->n_vocab);
     if (t->softcap > 0.0f)
         for (int v = 0; v < t->n_vocab; v++) t->logits[v] = t->softcap * tanhf(t->logits[v] / t->softcap);

@@ -20,12 +20,22 @@
 extern "C" {
 #include "model.h"
 #include "quant.h"
+#include "mtp-internal.h"
 }
 
-// kvcache rows live on the device here, so the host-side MTP draft head
-// (src/mtp.c) cannot read them — run.c gates -mtp on this flag. The CUDA
-// MTP port (device-side assistant + batched verify) is the planned follow-up.
+// kvcache rows live on the device here, and so will the draft head: the CUDA
+// MTP port (device-side assistant + batched verify + async overlap) is the
+// in-progress follow-up — until it lands, drafting on this backend declines.
 extern "C" const int model_kv_host = 0;
+
+extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                                int token, int pos) {
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    static int warned = 0;
+    if (!warned) { fprintf(stderr, "mtp: device draft not implemented yet on this backend\n"); warned = 1; }
+    return -1;
+}
+extern "C" void mtp_free_device(struct mtp *t) { (void)t; }
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \

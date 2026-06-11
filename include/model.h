@@ -116,14 +116,15 @@ void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, 
 struct mtp;
 struct mtp *mtp_open(const char *path, const struct model *m);
 void        mtp_free(struct mtp *t);
-// Draft the successor of `token` (the freshly chosen token for position `pos`,
-// whose own forward need not have run); h_prev = target hidden that chose it.
-// Optionally writes the chained backbone hidden to h_next [n_embd].
+// Draft the successor of `token` — the freshly chosen token for position
+// `pos`, whose own forward need not have run. The backend supplies the other
+// half of the head's input itself: the hidden state of the forward that chose
+// `token` (CPU: model.last_hidden; CUDA: kept on the device).
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
-              int token, int pos, const float *h_prev, float *h_next);
+              int token, int pos);
 
-// 1 if this backend's kvcache rows live in host memory (CPU backend); the
-// CUDA backends keep them on the device and cannot feed mtp_draft (yet).
+// 1 if this backend's kvcache rows live in host memory (the CPU backend);
+// the CUDA backends keep them — and the draft head — on the device.
 extern const int model_kv_host;
 
 #endif // MODEL_H

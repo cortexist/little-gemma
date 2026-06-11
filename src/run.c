@@ -375,16 +375,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
         model_free(&m); tokenizer_free(tk); return;
     }
 
-    struct mtp *t = NULL;
-    float *h_prev = NULL;
-    if (mtp_path) {
-        if (!model_kv_host)
-            fprintf(stderr, "mtp: this backend keeps its KV cache on the device; "
-                            "the draft head is CPU-only for now — ignoring -mtp\n");
-        else if ((t = mtp_open(mtp_path, &m)) != NULL)
-            h_prev = malloc((size_t)m.cfg.n_embd * sizeof(float));
-        if (t && !h_prev) { mtp_free(t); t = NULL; }
-    }
+    struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
     int pos = 0;
     // Stop at end-of-turn. gemma4's turn end is <turn|>; the gguf eos_token_id is
     // <turn|> on E2B but <eos> on 12B, so stop on either.
@@ -410,7 +401,6 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     // greedy generation
     double tg = now_sec();
     int g = 0, n_draft = 0, n_accept = 0;
-    if (t) memcpy(h_prev, m.last_hidden, (size_t)m.cfg.n_embd * sizeof(float));
     for (; g < N_GEN; g++) {
         if (best == eot || best == eos) break;               // end of turn
         if (best == ch_open)  in_thought = 1;                // channel name starts
@@ -421,10 +411,9 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
         }
         // draft the successor of `best` before its forward runs (the cache
         // holds positions < pos, exactly what the head cross-attends)
-        int draft = t ? mtp_draft(t, &m, &kv, best, pos, h_prev, NULL) : -1;
+        int draft = t ? mtp_draft(t, &m, &kv, best, pos) : -1;
         best = model_forward_next(&m, &kv, best, pos++);
         if (t) {
-            memcpy(h_prev, m.last_hidden, (size_t)m.cfg.n_embd * sizeof(float));
             n_draft++;
             if (best == draft) n_accept++;
         }
@@ -440,7 +429,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
         fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%)\n",
                 n_accept, n_draft, 100.0 * n_accept / n_draft);
 
-    if (t) { mtp_free(t); free(h_prev); }
+    mtp_free(t);
     kvcache_free(&kv);
     model_free(&m);
     tokenizer_free(tk);

@@ -15,6 +15,15 @@
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
 const int model_kv_host = 1;     // this backend's kvcache rows are host memory
 
+// The host draft path in mtp.c does all the work on this backend.
+#include "mtp-internal.h"
+int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                      int token, int pos) {
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    return -1;
+}
+void mtp_free_device(struct mtp *t) { (void)t; }
+
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
