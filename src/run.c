@@ -201,6 +201,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     continue;
                 }
                 if (!md) { fprintf(stderr, "media frame but no -mm projector\n"); free(payload); dead = 1; break; }
+                double e0 = now_sec();
                 float *rows = hdr[0] == MEDIA_FRAME_IMAGE && len == 3u * w * h
                             ? media_embed_image(md, (uint8_t *)payload, w, h, &seg[n_seg].n)
                             : hdr[0] == MEDIA_FRAME_AUDIO
@@ -210,7 +211,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 if (!rows) { dead = 1; break; }
                 seg[n_seg].rows = rows;
                 in_media += seg[n_seg].n;
-                fprintf(stderr, "media: %c frame -> %d tokens\n", hdr[0], seg[n_seg].n);
+                fprintf(stderr, "media: %c frame -> %d tokens in %.1fs\n", hdr[0], seg[n_seg].n, now_sec() - e0);
                 n_seg++;
             }
             if (dead || recv_line(c, line, sizeof line, c0) < 0) {

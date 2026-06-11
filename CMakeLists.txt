@@ -10,8 +10,23 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # "-Wextra>" (found the hard way on the Orin).
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:C>:/W3>)
+    # MSVC targets bare SSE2 unless told otherwise; AVX2 lets it vectorize the
+    # multi-accumulator dot products in media.c (GCC at -O3 needs no nudge —
+    # NEON is baseline on aarch64, so the Orin already gets this).
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
 else()
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra>")
+endif()
+
+# media.c carries the host vision transformer (~1 TFLOP per image); fast-math
+# lets the compiler turn its dot products into real SIMD reductions, which
+# /fp:precise (and GCC's default) forbid because that reorders the sums. The
+# sums carry no exactness contract — the oracle comparison tolerance is 1e-4.
+# Scoped to this one file: the LLM side keeps strict fp.
+if(MSVC)
+    set_source_files_properties(src/media.c PROPERTIES COMPILE_OPTIONS "/fp:fast")
+else()
+    set_source_files_properties(src/media.c PROPERTIES COMPILE_OPTIONS "-ffast-math")
 endif()
 
 # Shared, backend-agnostic sources. model.c = common host setup; media.c = the
@@ -28,6 +43,9 @@ elseif(UNIX)
     target_link_libraries(run PRIVATE m)        # expf/sqrtf/... live in libm
 endif()
 
+# OpenMP carries media.c's host vision transformer (~1 TFLOP per image for
+# gemma4v) on EVERY backend — the CUDA targets compile media.c as C too, and
+# without this they run it single-threaded (minutes per image, found the hard way).
 find_package(OpenMP)
 if(OpenMP_C_FOUND)
     target_link_libraries(run PRIVATE OpenMP::OpenMP_C)
@@ -51,6 +69,9 @@ if(CMAKE_CUDA_COMPILER)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
         elseif(UNIX)
             target_link_libraries(${tgt} PRIVATE m)
+        endif()
+        if(OpenMP_C_FOUND)
+            target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_C)
         endif()
         # dev box A5000 = sm_86; Orin NX: cmake -DLG_CUDA_ARCH=87
         set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "${LG_CUDA_ARCH}")

@@ -83,6 +83,16 @@ static void rmsnorm_w(float *x, const float *w, int n, float eps) {
 
 static float gelu_quick(float x) { return x / (1.0f + expf(-1.702f * x)); }
 
+// Dot product, written naively ON PURPOSE: this file is compiled with
+// fast-math (see CMakeLists), which licenses the compiler to reassociate the
+// sum into a SIMD reduction. A hand-unrolled multi-accumulator version was
+// tried and was WORSE — it defeats MSVC's vectorizer pattern match.
+static float dotf(const float *a, const float *b, int n) {
+    float s = 0.0f;
+    for (int j = 0; j < n; j++) s += a[j] * b[j];
+    return s;
+}
+
 // out[m] = W . x, unpacking each (f16/f32) weight row on the fly — the same
 // shape as the CPU backend's matmul_q, OpenMP across the independent rows.
 static void matvec(float *out, const struct gguf_tensor *t, const float *x, int k, int m) {
@@ -96,33 +106,36 @@ static void matvec(float *out, const struct gguf_tensor *t, const float *x, int 
         #pragma omp for schedule(static)
         for (i = 0; i < m; i++) {
             dequantize_into(t->type, base + (size_t)i * row_bytes, buf, k);
-            float s = 0.0f;
-            for (int j = 0; j < k; j++) s += buf[j] * x[j];
-            out[i] = s;
+            out[i] = dotf(buf, x, k);
         }
         free(buf);
     }
 }
 
-// out[t][r] = W . x_t for all T rows at once — each (f16) weight row is
-// unpacked ONCE and dotted against every position while it is hot (the same
-// move as the GPU's batched prefill). X is [T][k] contiguous, out is [T][m].
+// out[t][r] = W . x_t for all T rows at once — weight rows are unpacked ONCE,
+// a block at a time, and every position is dotted against the block while it
+// is cache-hot. X is [T][k] contiguous, out is [T][m]. The block matters:
+// one-row-at-a-time re-streams all of X from memory per weight row (~90 GB of
+// traffic per gemma4v layer at 266 tokens), and the encoder goes memory-bound
+// — blocking by 64 cuts that traffic 64-fold.
+#define MM_RB 64
 static void matmat(float *out, const struct gguf_tensor *t, const float *X, int k, int m, int T) {
     const int blck = ggml_blck_size(t->type);
     const size_t row_bytes = (size_t)(k / blck) * ggml_type_size(t->type);
     const unsigned char *base = t->data;
     #pragma omp parallel
     {
-        float *buf = malloc((size_t)k * sizeof(float));
-        int r;
+        float *buf = malloc((size_t)MM_RB * k * sizeof(float));
+        int rb;
         #pragma omp for schedule(static)
-        for (r = 0; r < m; r++) {
-            dequantize_into(t->type, base + (size_t)r * row_bytes, buf, k);
+        for (rb = 0; rb < (m + MM_RB - 1) / MM_RB; rb++) {
+            int r0 = rb * MM_RB, rn = m - r0 < MM_RB ? m - r0 : MM_RB;
+            for (int r = 0; r < rn; r++)
+                dequantize_into(t->type, base + (size_t)(r0 + r) * row_bytes, buf + (size_t)r * k, k);
             for (int tt = 0; tt < T; tt++) {
                 const float *x = X + (size_t)tt * k;
-                float s = 0.0f;
-                for (int j = 0; j < k; j++) s += buf[j] * x[j];
-                out[(size_t)tt * m + r] = s;
+                float *o = out + (size_t)tt * m + r0;
+                for (int r = 0; r < rn; r++) o[r] = dotf(buf + (size_t)r * k, x, k);
             }
         }
         free(buf);
@@ -375,18 +388,24 @@ static float *v_embed_image(struct media *md, const uint8_t *rgb, int w, int h, 
     float *U = malloc((size_t)np * 4 * ne * sizeof(float));
     if (!H || !Q || !K || !V || !D || !G || !U) goto fail;
 
+    // every per-position loop below is OpenMP'd (index declared outside the
+    // for: MSVC's C-mode OpenMP insists) — at 16 layers even the elementwise
+    // passes add up, the gelu alone is a hundred million expf calls
+    int p;
     for (int L = 0; L < md->v_layer; L++) {
         const struct vlayer *v = &md->vl[L];
 
         // ---- attention ----
-        for (int p = 0; p < np; p++) {
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++) {
             memcpy(H + (size_t)p * ne, X + (size_t)p * ne, (size_t)ne * 4);
             rmsnorm_w(H + (size_t)p * ne, v->ln1, ne, eps);
         }
         matmat(Q, v->q, H, ne, ne, np);
         matmat(K, v->k, H, ne, ne, np);
         matmat(V, v->v, H, ne, ne, np);
-        for (int p = 0; p < np; p++)
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++)
             for (int hh = 0; hh < nh; hh++) {
                 rmsnorm_w(Q + (size_t)p * ne + hh * dh, v->qn, dh, eps);
                 rmsnorm_w(K + (size_t)p * ne + hh * dh, v->kn, dh, eps);
@@ -394,49 +413,80 @@ static float *v_embed_image(struct media *md, const uint8_t *rgb, int w, int h, 
             }
         rope2d(Q, np, ne, nh, n_cols, 100.0f);
         rope2d(K, np, ne, nh, n_cols, 100.0f);
+        // full attention, scale 1.0, in query blocks: one query at a time
+        // would re-stream all of K and V per query (14 MB x 2394 queries, per
+        // layer) — per BLOCK, each key/value row is loaded once and used 64x
+        #pragma omp parallel
         {
-            int p;
-            #pragma omp parallel for schedule(static)
-            for (p = 0; p < np; p++) {                      // full attention, scale 1.0
-                float *att = malloc((size_t)np * sizeof(float));
-                for (int hh = 0; hh < nh; hh++) {
-                    const float *qh = Q + (size_t)p * ne + hh * dh;
-                    float mx = -1e30f;
-                    for (int kk = 0; kk < np; kk++) {
-                        const float *kh = K + (size_t)kk * ne + hh * dh;
-                        float s = 0.0f;
-                        for (int i = 0; i < dh; i++) s += qh[i] * kh[i];
-                        att[kk] = s;
-                        if (s > mx) mx = s;
+            enum { QB = 64 };
+            // local copies: OpenMP outlines this block into its own function
+            // and rewrites captured variables as loads through a shared-frame
+            // pointer — MSVC's vectorizer then refuses every loop bounded by
+            // them ("upper bound is not loop-invariant", C5002 reason 501)
+            const int NP = np, NH = nh, DH = dh, NE = ne;
+            const float *Kl = K, *Vl = V, *Ql = Q;
+            float *Dl = D;
+            float *att = malloc((size_t)QB * NP * sizeof(float));
+            int qb;
+            #pragma omp for schedule(static)
+            for (qb = 0; qb < (NP + QB - 1) / QB; qb++) {
+                int q0 = qb * QB, qn = NP - q0 < QB ? NP - q0 : QB;
+                for (int hh = 0; hh < NH; hh++) {
+                    for (int kk = 0; kk < NP; kk++) {
+                        const float *kh = Kl + (size_t)kk * NE + hh * DH;
+                        for (int q = 0; q < qn; q++)
+                            att[(size_t)q * NP + kk] = dotf(Ql + (size_t)(q0 + q) * NE + hh * DH, kh, DH);
                     }
-                    float sum = 0.0f;
-                    for (int kk = 0; kk < np; kk++) { att[kk] = expf(att[kk] - mx); sum += att[kk]; }
-                    float *outr = D + (size_t)p * ne + hh * dh;
-                    for (int i = 0; i < dh; i++) {
-                        float o = 0.0f;
-                        for (int kk = 0; kk < np; kk++) o += att[kk] * V[(size_t)kk * ne + hh * dh + i];
-                        outr[i] = o / sum;
+                    for (int q = 0; q < qn; q++) {          // softmax per query row
+                        float *a = att + (size_t)q * NP;
+                        float mx = -1e30f;
+                        for (int kk = 0; kk < NP; kk++) if (a[kk] > mx) mx = a[kk];
+                        // map and reduce in separate loops: fused, the expf
+                        // call blocks vectorizing the sum and vice versa
+                        for (int kk = 0; kk < NP; kk++) a[kk] = expf(a[kk] - mx);
+                        float sum = 0.0f;
+                        for (int kk = 0; kk < NP; kk++) sum += a[kk];
+                        float inv = 1.0f / sum;
+                        for (int kk = 0; kk < NP; kk++) a[kk] *= inv;
+                        float *outr = Dl + (size_t)(q0 + q) * NE + hh * DH;
+                        for (int i = 0; i < DH; i++) outr[i] = 0.0f;
+                    }
+                    for (int kk = 0; kk < NP; kk++) {       // weighted V, values outer
+                        const float *vh = Vl + (size_t)kk * NE + hh * DH;
+                        for (int q = 0; q < qn; q++) {
+                            float *outr = Dl + (size_t)(q0 + q) * NE + hh * DH;
+                            float wgt = att[(size_t)q * NP + kk];
+                            for (int i = 0; i < DH; i++) outr[i] += wgt * vh[i];
+                        }
                     }
                 }
-                free(att);
             }
+            free(att);
         }
         matmat(H, v->o, D, ne, ne, np);
-        for (int p = 0; p < np; p++) {
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++) {
             rmsnorm_w(H + (size_t)p * ne, v->attn_post, ne, eps);
             for (int i = 0; i < ne; i++) X[(size_t)p * ne + i] += H[(size_t)p * ne + i];
         }
 
         // ---- gated FFN: gelu_quick(gate) * up -> down ----
-        for (int p = 0; p < np; p++) {
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++) {
             memcpy(H + (size_t)p * ne, X + (size_t)p * ne, (size_t)ne * 4);
             rmsnorm_w(H + (size_t)p * ne, v->ln2, ne, eps);
         }
         matmat(G, v->gate, H, ne, 4 * ne, np);
         matmat(U, v->up, H, ne, 4 * ne, np);
-        for (size_t i = 0; i < (size_t)np * 4 * ne; i++) G[i] = gelu_quick(G[i]) * U[i];
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++) {
+            float *g = G + (size_t)p * 4 * ne;
+            const float *u = U + (size_t)p * 4 * ne;
+            for (int i = 0; i < 4 * ne; i++) g[i] = gelu_quick(g[i]) * u[i];
+        }
         matmat(D, v->down, G, 4 * ne, ne, np);
-        for (int p = 0; p < np; p++) {
+        #pragma omp parallel for schedule(static)
+        for (p = 0; p < np; p++) {
             rmsnorm_w(D + (size_t)p * ne, v->ffn_post, ne, eps);
             for (int i = 0; i < ne; i++) X[(size_t)p * ne + i] += D[(size_t)p * ne + i];
         }
