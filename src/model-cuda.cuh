@@ -479,6 +479,9 @@ static int kv_src_dev(const struct model *m, int L) {
 
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
+static float *g_hidden;                 // post-output-norm hidden of the last
+                                        // head-bearing forward (the MTP draft
+                                        // head's h_prev; 15 KB, copied per token)
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
 static int *d_pos;                      // device-resident token position (for static graph)
 static int *d_best;                     // device-side argmax result
@@ -520,6 +523,7 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&dxb, B * q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, B * maxkv * 4));
     CUDA_CHECK(cudaMalloc(&dvb, B * maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, B * nff * 4));
     CUDA_CHECK(cudaMalloc(&dg2, B * nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
+    CUDA_CHECK(cudaMalloc(&g_hidden, (size_t)ne * 4));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
@@ -744,6 +748,9 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
 static void forward_head(struct model *m) {
     const struct config *c = &m->cfg;
     rmsnorm_kernel<<<1, NORM_THREADS(c->n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), c->n_embd, c->rms_eps, actq_for(c->n_embd));
+    // keep the post-norm hidden for the MTP draft head (a static graph node;
+    // 15 KB D2D, measured no decode cost — see the journal)
+    CUDA_CHECK(cudaMemcpyAsync(g_hidden, dx, (size_t)c->n_embd * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, c->n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
