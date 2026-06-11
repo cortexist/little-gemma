@@ -32,6 +32,15 @@ static int sock_err(void) { return errno; }
 
 #define N_GEN 256  // max tokens to generate (stops early on EOS)
 
+// Wall-clock seconds. clock() is WALL time on Windows but CPU time on POSIX —
+// with the GPU doing the work the CPU mostly idle-waits, so the Orin reported
+// a glorious 3,400 tok/s before this was caught.
+static double now_sec(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
 // Print a token's text with the ▁ marker (U+2581 = e2 96 81) rendered as a space.
 static void print_piece(const char *s) {
     if (!s) return;
@@ -216,7 +225,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 fprintf(stderr, "context full\n");
                 break;
             }
-            clock_t t0 = clock();
+            double t0 = now_sec();
             // The turn is assembled as alternating text and embedding spans:
             // text accumulates (turn opener, 'T' frames, media markers) and is
             // encoded+prefilled in one go right before each media span, whose
@@ -259,7 +268,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
                 best = model_forward_next(&m, &kv, best, pos++);
             }
-            double dt = (double)(clock() - t0) / CLOCKS_PER_SEC;
+            double dt = now_sec() - t0;
             fprintf(stderr, "turn: %d in, %d out, %.2fs (%.2f tok/s)\n",
                     total, g + 1, dt, (total + g + 1) / (dt > 0 ? dt : 1e-9));
             if (fail || pos + 1 >= SERVE_SEQ) break;     // client gone or context full
@@ -347,14 +356,14 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     fflush(stdout);
 
     // prefill: the last prompt token's forward also picks the first generated token
-    clock_t tp = clock();
+    double tp = now_sec();
     model_prefill(&m, &kv, promptv, n_prompt - 1, 0);
     pos = n_prompt - 1;
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
-    double t_prompt = (double)(clock() - tp) / CLOCKS_PER_SEC;
+    double t_prompt = now_sec() - tp;
 
     // greedy generation
-    clock_t tg = clock();
+    double tg = now_sec();
     int g = 0;
     for (; g < N_GEN; g++) {
         if (best == eot || best == eos) break;               // end of turn
@@ -366,7 +375,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
         }
         best = model_forward_next(&m, &kv, best, pos++);
     }
-    double t_gen = (double)(clock() - tg) / CLOCKS_PER_SEC;
+    double t_gen = now_sec() - tg;
 
     printf("\n\n");
     fprintf(stderr, "prompt: %d tokens in %.2fs (%.2f tok/s)\n",
