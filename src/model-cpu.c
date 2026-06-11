@@ -301,12 +301,16 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
         if (os) { for (int i = 0; i < n_embd; i++) x[i] *= os[0]; }
     }
 
-    // final norm + tied output projection (logits = token_embd . x), then softcap
-    rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
-    matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
-    if (c->logit_softcap > 0.0f) {
-        float sc = c->logit_softcap;
-        for (int v = 0; v < c->n_vocab; v++) logits[v] = sc * tanhf(logits[v] / sc);
+    // final norm + tied output projection (logits = token_embd . x), then softcap.
+    // Skipped entirely for prefill (logits == NULL): a prompt token only needs
+    // its kv writes, and the head is the largest matmul in the model.
+    if (logits) {
+        rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
+        matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
+        if (c->logit_softcap > 0.0f) {
+            float sc = c->logit_softcap;
+            for (int v = 0; v < c->n_vocab; v++) logits[v] = sc * tanhf(logits[v] / sc);
+        }
     }
 
     free(x); free(h); free(q); free(kb); free(vb); free(xb);
@@ -326,4 +330,8 @@ int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) 
     int best = 0;
     for (int v = 1; v < m->cfg.n_vocab; v++) if (lbuf[v] > lbuf[best]) best = v;
     return best;
+}
+
+void model_prefill(struct model *m, struct kvcache *kv, int token, int pos) {
+    model_forward(m, kv, token, pos, NULL);   // fills the kv cache, skips the head
 }

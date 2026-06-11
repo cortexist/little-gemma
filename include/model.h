@@ -70,4 +70,10 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
 // 4 bytes cross the bus per token instead of the whole vocabulary's logits.
 int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos);
 
+// The forward for a prompt token whose output nobody reads: fills the kv cache
+// and skips the head — the final norm, the n_vocab×n_embd output projection
+// (~10% of a token's weight traffic), and the argmax/sync. Use it for every
+// prompt token but the last, whose logits pick the first generated token.
+void model_prefill(struct model *m, struct kvcache *kv, int token, int pos);
+
 #endif // MODEL_H

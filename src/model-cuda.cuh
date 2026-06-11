@@ -148,7 +148,11 @@ __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos,
 // Attention for the current query position: one block per query head. pos is device-
 // resident and start is derived in-kernel (so the launch params never change across
 // tokens -> the forward captures into a static CUDA graph). window=0 means full causal.
-// Shared memory holds the (pos-start+1) scores; the launch sizes it for max_seq. Scale 1.0.
+// Online softmax: each warp walks its strided slice of timesteps holding a running
+// (max, sum) and a per-lane V accumulator in registers, rescaling when the max moves;
+// the warps' partials merge once at the end. Shared memory is nwarp*hd — independent
+// of how long the context is (the score-array version capped max_seq at ~12k). Scale 1.0.
+#define ATTN_HD_MAX 512   // per-lane V accumulator: ATTN_HD_MAX/32 registers
 __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
                                    int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
     int hh = blockIdx.x, kvh = hh / gqa;
@@ -156,42 +160,48 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
     int pos = *d_pos;
     int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
     int T = pos - start + 1;
-    extern __shared__ float att[];
-    __shared__ float red[256];
+    extern __shared__ float comb[];                       // [nwarp][hd] partial outputs
+    __shared__ float wm[32], ws[32];                      // per-warp running max / sum
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
-    // scores: one WARP per timestep — the lanes split the dot, so the K row is
-    // read with coalesced 128-byte loads (one thread per timestep made each warp
-    // touch 32 different rows: ~1 useful float per memory sector).
+    int nv = hd / 32;                                     // V floats per lane
+    float acc[ATTN_HD_MAX / 32];
+    #pragma unroll
+    for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
+    float m = -INFINITY, s = 0.0f;
+    // one WARP per timestep — the lanes split the K dot, so the row is read with
+    // coalesced 128-byte loads; the V row follows while the score is still warm.
     for (int t = warp; t < T; t += nwarp) {
         const float *kt = Kc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
-        float s = 0.0f;
-        for (int i = lane; i < hd; i += 32) s += qh[i] * kt[i];
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) att[t] = s;
+        float sc = 0.0f;
+        for (int i = lane; i < hd; i += 32) sc += qh[i] * kt[i];
+        for (int o = 16; o > 0; o >>= 1) sc += __shfl_down_sync(0xffffffffu, sc, o);
+        sc = __shfl_sync(0xffffffffu, sc, 0);
+        float mn = fmaxf(m, sc);
+        float corr = expf(m - mn), e = expf(sc - mn);     // first step: m=-inf -> corr=0
+        s = s * corr + e;
+        const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd;
+        #pragma unroll
+        for (int j = 0; j < ATTN_HD_MAX / 32; j++)
+            if (j < nv) acc[j] = acc[j] * corr + e * vt[lane + j * 32];
+        m = mn;
     }
+    if (lane == 0) { wm[warp] = m; ws[warp] = s; }
+    #pragma unroll
+    for (int j = 0; j < ATTN_HD_MAX / 32; j++)
+        if (j < nv) comb[warp * hd + lane + j * 32] = acc[j];
     __syncthreads();
-    // softmax over att[0..T): block-parallel max, then exp+sum, then scale
-    // (was a serial thread-0 loop — 3*T dependent ops once T grows).
-    float mx = -INFINITY;
-    for (int t = threadIdx.x; t < T; t += blockDim.x) mx = fmaxf(mx, att[t]);
-    red[threadIdx.x] = mx;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
-    mx = red[0];
-    __syncthreads();
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < T; t += blockDim.x) { float e = expf(att[t] - mx); att[t] = e; sum += e; }
-    red[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
-    float inv = 1.0f / red[0];
-    for (int t = threadIdx.x; t < T; t += blockDim.x) att[t] *= inv;
-    __syncthreads();
+    // merge the warps: T>=1 keeps warp 0 active, so the global max is finite; an
+    // idle warp (T < nwarp) carries m=-inf, s=0 and weighs in as exactly zero.
+    float gm = -INFINITY;
+    for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
+    float gs = 0.0f;
+    for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
+    float inv = 1.0f / gs;
     float *outh = xb + (size_t)hh * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-        float acc = 0.0f;
-        for (int t = 0; t < T; t++) { const float *vt = Vc + (size_t)(start + t) * kv_dim + (size_t)kvh * hd; acc += att[t] * vt[i]; }
-        outh[i] = acc;
+        float o = 0.0f;
+        for (int w = 0; w < nwarp; w++) o += comb[w * hd + i] * expf(wm[w] - gm);
+        outh[i] = o * inv;
     }
     if (aq.xq) {
         __syncthreads();
@@ -415,7 +425,7 @@ static int build_per_layer(struct model *m, int token) {
 // d_ipl the PLE inputs; every op runs on the (per-thread) default stream with no host
 // work or sync, so it is stream-capturable. KV-cache writes use async copies for the
 // same reason (a synchronous cudaMemcpy is illegal mid-capture).
-static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
+static void forward_layers(struct model *m, struct kvcache *kv) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
@@ -458,7 +468,8 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         const float *Kc = kv->k[src], *Vc = kv->v[src];
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
-        attn_kernel<<<n_head, 256, (size_t)kv->max_seq * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
+        // shmem holds each warp's partial output row: (256/32)*hd floats, ctx-independent
+        attn_kernel<<<n_head, 256, (size_t)(256 / 32) * hd * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
 
         matmul_q(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_add_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
@@ -486,10 +497,22 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
         }
     }
 
-    rmsnorm_kernel<<<1, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, eps, actq_for(n_embd));
-    matmul_q(dlogits, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
+}
+
+// Final norm + tied output projection. Split from the layers so prefill can
+// replay a graph without it: a prompt token's logits are never read, and the
+// n_vocab×n_embd head is the single largest matmul in the model.
+static void forward_head(struct model *m) {
+    const struct config *c = &m->cfg;
+    rmsnorm_kernel<<<1, NORM_THREADS(c->n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), c->n_embd, c->rms_eps, actq_for(c->n_embd));
+    matmul_q(dlogits, wq(m, "token_embd.weight"), dx, c->n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
+}
+
+static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
+    forward_layers(m, kv);
+    forward_head(m);
 }
 
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
@@ -501,22 +524,26 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
 // all tokens. The first two tokens run un-captured so ensure_act's one-time cudaMalloc
 // (illegal mid-capture) is already done before capture. (Requires the per-thread default
 // stream — see CMakeLists — since the legacy default stream cannot be captured.)
-static cudaGraphExec_t g_graph_exec = NULL;
+static cudaGraphExec_t g_graph_exec[2] = { NULL, NULL };   // [1]=layers+head (decode), [0]=layers only (prefill)
 static int g_graph_warmups = 0;
-static void forward_graph(struct model *m, struct kvcache *kv) {
+static void forward_graph(struct model *m, struct kvcache *kv, int head) {
     if (g_graph_warmups < 2) { g_graph_warmups++; forward_layers_and_head(m, kv); return; }
-    if (!g_graph_exec) {
-        cudaGraph_t graph;
-        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-        forward_layers_and_head(m, kv);
-        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-        CUDA_CHECK(cudaGraphInstantiate(&g_graph_exec, graph, 0));
-        CUDA_CHECK(cudaGraphDestroy(graph));
+    // Both variants are captured the first time either is needed, so the cost
+    // of recording ~1000 nodes lands in the prompt phase, not the gen timer.
+    if (!g_graph_exec[0]) {
+        for (int h = 0; h < 2; h++) {
+            cudaGraph_t graph;
+            CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            if (h) forward_layers_and_head(m, kv); else forward_layers(m, kv);
+            CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&g_graph_exec[h], graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
     }
-    CUDA_CHECK(cudaGraphLaunch(g_graph_exec, cudaStreamPerThread));
+    CUDA_CHECK(cudaGraphLaunch(g_graph_exec[!!head], cudaStreamPerThread));
 }
 
-static void forward_token(struct model *m, struct kvcache *kv, int token, int pos) {
+static void forward_token(struct model *m, struct kvcache *kv, int token, int pos, int head) {
     ensure_weights(m);
     ensure_scratch(m);
     const struct config *c = &m->cfg;
@@ -531,20 +558,24 @@ static void forward_token(struct model *m, struct kvcache *kv, int token, int po
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));  // graph reads pos from here
     build_per_layer(m, token);
-    forward_graph(m, kv);               // capture once, then replay the forward each token
+    forward_graph(m, kv, head);         // capture once (per variant), then replay each token
 }
 
 extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, int pos, float *logits) {
-    forward_token(m, kv, token, pos);
+    forward_token(m, kv, token, pos, 1);
     CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
 }
 
 extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) {
-    forward_token(m, kv, token, pos);
+    forward_token(m, kv, token, pos, 1);
     argmax_kernel<<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
     int best;
     CUDA_CHECK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
     return best;
+}
+
+extern "C" void model_prefill(struct model *m, struct kvcache *kv, int token, int pos) {
+    forward_token(m, kv, token, pos, 0);   // no head, no argmax, no sync round-trip
 }
 
 #endif // MODEL_CUDA_CUH
