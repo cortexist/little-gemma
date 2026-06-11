@@ -12,9 +12,10 @@ else()
     add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra>)
 endif()
 
-# Shared, backend-agnostic sources. model.c = common host setup; the compute
+# Shared, backend-agnostic sources. model.c = common host setup; media.c = the
+# multimodal embedders (host f32 compute, all backends share it); the compute
 # backend is model-cpu.c (CPU) or model-cuda-{f32,i8}.cu (CUDA), selected per target.
-set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c)
+set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c src/media.c)
 
 # --- CPU build -------------------------------------------------------------
 add_executable(run ${CORE} src/model-cpu.c)
@@ -63,6 +64,17 @@ if(WIN32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(socket_cat PRIVATE Threads::Threads)
+endif()
+
+# media_cat: decodes image/audio FILES into the raw frames the server's media
+# protocol carries (the model runner itself never reads media files). The only
+# place third-party code (vendor/stb_image.h) is compiled.
+add_executable(media_cat tools/media_cat.c)
+target_include_directories(media_cat PRIVATE include vendor)
+if(WIN32)
+    target_link_libraries(media_cat PRIVATE ws2_32)
+elseif(UNIX)
+    target_link_libraries(media_cat PRIVATE m)
 endif()
 
 # --- tensor/graph self-test ------------------------------------------------
