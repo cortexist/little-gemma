@@ -169,6 +169,10 @@ int model_init(struct model *m, const struct gguf_context *ctx) {
         m->head_dim[L]  = (int)(q->dims[1] / (uint64_t)m->cfg.n_head);
         m->n_head_kv[L] = (int)(k->dims[1] / (uint64_t)m->head_dim[L]);
     }
+
+    // scratch for the MTP draft head's h_prev (filled by the backend's forward)
+    m->last_hidden = calloc((size_t)m->cfg.n_embd, sizeof(float));
+    if (!m->last_hidden) return -1;
     return 0;
 }
 
@@ -178,6 +182,8 @@ void model_free(struct model *m) {
     free(m->ffn_len);
     free(m->head_dim);
     free(m->n_head_kv);
+    free(m->last_hidden);
+    m->last_hidden = NULL;
     m->is_local = NULL;
     m->ffn_len = NULL;
     m->head_dim = NULL;

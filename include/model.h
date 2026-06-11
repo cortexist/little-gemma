@@ -41,6 +41,10 @@ struct model {
     int                       *ffn_len;    // per layer: feed-forward width (elastic FFN)
     int                       *head_dim;   // per layer: size of one attention head
     int                       *n_head_kv;  // per layer: number of key/value heads
+    float                     *last_hidden; // post-output-norm hidden of the most
+                                            // recent logits-producing forward — what
+                                            // the MTP draft head feeds on (n_embd;
+                                            // the CPU backend fills it each forward)
 };
 
 int  model_init(struct model *m, const struct gguf_context *ctx);
@@ -102,5 +106,24 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
 // token's (id 0) per-layer row beside the usual projection of its embedding,
 // matching the reference; the 12B has no PLE at all.
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0);
+
+// ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
+// A tiny transformer that predicts the token AFTER next by cross-attending
+// straight into the target's KV cache (it has no K/V projections of its own).
+// Greedy verify means drafts NEVER change the output — only how many target
+// forwards run per emitted token. Host implementation: needs the cache rows
+// in host memory (model_kv_host == 1; the CPU backend).
+struct mtp;
+struct mtp *mtp_open(const char *path, const struct model *m);
+void        mtp_free(struct mtp *t);
+// Draft the successor of `token` (the freshly chosen token for position `pos`,
+// whose own forward need not have run); h_prev = target hidden that chose it.
+// Optionally writes the chained backbone hidden to h_next [n_embd].
+int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
+              int token, int pos, const float *h_prev, float *h_next);
+
+// 1 if this backend's kvcache rows live in host memory (CPU backend); the
+// CUDA backends keep them on the device and cannot feed mtp_draft (yet).
+extern const int model_kv_host;
 
 #endif // MODEL_H

@@ -13,6 +13,8 @@
 // ---- math kernels (plain f32; the part CUDA will replace) -----------------
 
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
+const int model_kv_host = 1;     // this backend's kvcache rows are host memory
+
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -367,6 +369,8 @@ static void forward_core(struct model *m, struct kvcache *kv, const float *x_in,
     // its kv writes, and the head is the largest matmul in the model.
     if (logits) {
         rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
+        if (m->last_hidden)                       // h_prev for the MTP draft head
+            memcpy(m->last_hidden, x, (size_t)n_embd * sizeof(float));
         matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
         if (c->logit_softcap > 0.0f) {
             float sc = c->logit_softcap;

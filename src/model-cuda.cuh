@@ -22,6 +22,11 @@ extern "C" {
 #include "quant.h"
 }
 
+// kvcache rows live on the device here, so the host-side MTP draft head
+// (src/mtp.c) cannot read them — run.c gates -mtp on this flag. The CUDA
+// MTP port (device-side assistant + batched verify) is the planned follow-up.
+extern "C" const int model_kv_host = 0;
+
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
     exit(1); } } while (0)

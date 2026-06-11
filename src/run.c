@@ -347,7 +347,13 @@ static void client(const char *path) {
 }
 
 // Tokenize the prompt under the Gemma chat template, generate greedily, report tok/s.
-static void generate(const struct gguf_context *ctx, const char *prompt) {
+// `mtp_path` (optional) loads a gemma4-assistant draft head and runs it as an
+// ORACLE: one draft per generated token, scored against what the target then
+// actually picks. Greedy verify means drafts can never change the output; the
+// acceptance rate printed at the end is the correctness gate for the draft
+// head (a right implementation accepts well over half, a wrong one near none).
+// The throughput win comes later, when the CUDA port batches the verify.
+static void generate(const struct gguf_context *ctx, const char *prompt, const char *mtp_path) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
 
@@ -367,6 +373,17 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     struct kvcache kv;
     if (kvcache_init(&kv, &m, n_prompt + N_GEN + 1) != 0) {
         model_free(&m); tokenizer_free(tk); return;
+    }
+
+    struct mtp *t = NULL;
+    float *h_prev = NULL;
+    if (mtp_path) {
+        if (!model_kv_host)
+            fprintf(stderr, "mtp: this backend keeps its KV cache on the device; "
+                            "the draft head is CPU-only for now — ignoring -mtp\n");
+        else if ((t = mtp_open(mtp_path, &m)) != NULL)
+            h_prev = malloc((size_t)m.cfg.n_embd * sizeof(float));
+        if (t && !h_prev) { mtp_free(t); t = NULL; }
     }
     int pos = 0;
     // Stop at end-of-turn. gemma4's turn end is <turn|>; the gguf eos_token_id is
@@ -392,7 +409,8 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
 
     // greedy generation
     double tg = now_sec();
-    int g = 0;
+    int g = 0, n_draft = 0, n_accept = 0;
+    if (t) memcpy(h_prev, m.last_hidden, (size_t)m.cfg.n_embd * sizeof(float));
     for (; g < N_GEN; g++) {
         if (best == eot || best == eos) break;               // end of turn
         if (best == ch_open)  in_thought = 1;                // channel name starts
@@ -401,7 +419,15 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
             print_piece(tokenizer_token_text(tk, best));
             fflush(stdout);
         }
+        // draft the successor of `best` before its forward runs (the cache
+        // holds positions < pos, exactly what the head cross-attends)
+        int draft = t ? mtp_draft(t, &m, &kv, best, pos, h_prev, NULL) : -1;
         best = model_forward_next(&m, &kv, best, pos++);
+        if (t) {
+            memcpy(h_prev, m.last_hidden, (size_t)m.cfg.n_embd * sizeof(float));
+            n_draft++;
+            if (best == draft) n_accept++;
+        }
     }
     double t_gen = now_sec() - tg;
 
@@ -410,24 +436,29 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
             n_prompt, t_prompt, n_prompt / (t_prompt > 0 ? t_prompt : 1e-9));
     fprintf(stderr, "gen:    %d tokens in %.2fs (%.2f tok/s)\n",
             g, t_gen, g / (t_gen > 0 ? t_gen : 1e-9));
+    if (t && n_draft)
+        fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%)\n",
+                n_accept, n_draft, 100.0 * n_accept / n_draft);
 
+    if (t) { mtp_free(t); free(h_prev); }
     kvcache_free(&kv);
     model_free(&m);
     tokenizer_free(tk);
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL;
+    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
         else if (!strcmp(argv[i], "-s") && i + 1 < argc)  spath  = argv[++i];
         else if (!strcmp(argv[i], "-c") && i + 1 < argc)  cpath  = argv[++i];
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
+        else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
     }
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
-        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-p \"prompt\" | -s <socket>]\n"
+        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-p \"prompt\" | -s <socket>]\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
@@ -441,7 +472,7 @@ int main(int argc, char **argv) {
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
     if (spath)       serve(ctx, spath, mmproj);
-    else if (prompt) { printf("\n"); generate(ctx, prompt); }
+    else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);
     return 0;
