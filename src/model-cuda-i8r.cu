@@ -320,3 +320,77 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_i8r_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
+
+// The chunk form: one warp per output row, all PREFILL_B activation columns at
+// once — out[j*m + i] = W[i,:] . x_j. This is where batched prefill's win
+// lives: a weight sub-block is fetched and dotted against every column while
+// it is hot, so the row crosses DRAM once per CHUNK instead of once per token
+// (the per-column re-reads hit L1). Activations sit at column stride k (int8)
+// and k/32 (scales), exactly as the producers' epilogues laid them out. Each
+// column's accumulation order matches the one-column kernel, so the result is
+// bit-identical to PREFILL_B separate matmul_q calls.
+__global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
+                                           const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= m) return;
+    const unsigned char *row = wbase + (size_t)warp * (k / blck) * ts;
+    int nb = k / blck, gpb = blck / 32;
+    float s[PREFILL_B];
+    #pragma unroll
+    for (int j = 0; j < PREFILL_B; j++) s[j] = 0.0f;
+
+    int nsub = 0;
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
+    else if (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K) nsub = 16;
+    else if (type == GGML_TYPE_Q8_0) nsub = 1;
+
+    if (nsub) {
+        int total = nb * nsub;
+        for (int si = lane; si < total; si += 32) {
+            int b = si / nsub, sj = si % nsub;
+            const unsigned char *blk = row + (size_t)b * ts;
+            for (int j = 0; j < PREFILL_B; j++) {
+                const int8_t *xqb = xq + (size_t)j * k + (size_t)b * blck;
+                const float2 *xdsb = xds + (size_t)j * (k / 32) + (size_t)b * gpb;
+                switch (type) {
+                    case GGML_TYPE_Q4_K: s[j] += sub_q4_K((const block_q4_K *)blk, sj, xqb, xdsb); break;
+                    case GGML_TYPE_Q5_K: s[j] += sub_q5_K((const block_q5_K *)blk, sj, xqb, xdsb); break;
+                    case GGML_TYPE_Q3_K: s[j] += sub_q3_Kr((const block_q3_Kr *)blk, sj, xqb, xdsb); break;
+                    case GGML_TYPE_Q6_K: s[j] += sub_q6_Kr((const block_q6_Kr *)blk, sj, xqb, xdsb); break;
+                    case GGML_TYPE_Q8_0: s[j] += sub_q8_0((const block_q8_0 *)blk, xqb, xdsb); break;
+                }
+            }
+        }
+    } else if (type == GGML_TYPE_F32) {
+        const float *wr = (const float *)row;
+        for (int i = lane; i < k; i += 32) {
+            float w = wr[i];
+            for (int j = 0; j < PREFILL_B; j++) s[j] += w * x[(size_t)j * k + i];
+        }
+    } else {                                             // bf16 / f16: one uint32 = 2 elements
+        const uint16_t *wr = (const uint16_t *)row;
+        for (int i = 2 * lane; i < k; i += 64) {
+            uint32_t two = ld32(wr + i);
+            float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
+            float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
+            for (int j = 0; j < PREFILL_B; j++)
+                s[j] += w0 * x[(size_t)j * k + i] + w1 * x[(size_t)j * k + i + 1];
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < PREFILL_B; j++) {
+        float v = s[j];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        if (lane == 0) out[(size_t)j * m + warp] = v;
+    }
+}
+
+static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
+    int blck = ggml_blck_size(t->type), ts;
+    const unsigned char *w = rweight(t, &ts);
+    int rows_per_block = 256 / 32;
+    int blocks = (m + rows_per_block - 1) / rows_per_block;
+    matmul_i8r_n_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+}

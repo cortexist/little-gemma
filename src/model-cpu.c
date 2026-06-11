@@ -332,6 +332,9 @@ int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) 
     return best;
 }
 
-void model_prefill(struct model *m, struct kvcache *kv, int token, int pos) {
-    model_forward(m, kv, token, pos, NULL);   // fills the kv cache, skips the head
+void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
+    // No chunking on the CPU — each forward already streams the weights through
+    // the cache hierarchy once per token and there is no launch overhead to
+    // amortize; the span form simply skips the head for every token.
+    for (int i = 0; i < n; i++) model_forward(m, kv, tokens[i], pos0 + i, NULL);
 }

@@ -70,10 +70,14 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
 // 4 bytes cross the bus per token instead of the whole vocabulary's logits.
 int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos);
 
-// The forward for a prompt token whose output nobody reads: fills the kv cache
-// and skips the head — the final norm, the n_vocab×n_embd output projection
-// (~10% of a token's weight traffic), and the argmax/sync. Use it for every
-// prompt token but the last, whose logits pick the first generated token.
-void model_prefill(struct model *m, struct kvcache *kv, int token, int pos);
+// The forward for prompt tokens whose outputs nobody reads: fills the kv cache
+// for tokens[0..n) at positions pos0..pos0+n-1 and skips the head — the final
+// norm, the n_vocab×n_embd output projection (~10% of a token's weight
+// traffic), and the argmax/sync. Use it for every prompt token but the last,
+// whose logits pick the first generated token. The CUDA backends process the
+// span in fixed-size chunks so each weight matrix is read from memory once per
+// chunk instead of once per token — prefill is bandwidth-bound, so that factor
+// is most of its cost.
+void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0);
 
 #endif // MODEL_H

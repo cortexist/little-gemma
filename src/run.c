@@ -153,7 +153,8 @@ static void serve(const struct gguf_context *ctx, const char *path) {
             int skip = pos == 0 ? 0 : 1;                 // tokenizer_encode always prepends BOS
             if (n <= skip || pos + (n - skip) + 1 >= SERVE_SEQ) { fprintf(stderr, "context full\n"); break; }
             clock_t t0 = clock();
-            for (int i = skip; i + 1 < n; i++) model_prefill(&m, &kv, promptv[i], pos++);
+            model_prefill(&m, &kv, promptv + skip, n - 1 - skip, pos);
+            pos += n - 1 - skip;
             int best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             int g = 0, fail = 0;
             for (;; g++) {                               // stream raw token text, turn end included
@@ -250,7 +251,8 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
 
     // prefill: the last prompt token's forward also picks the first generated token
     clock_t tp = clock();
-    for (int i = 0; i + 1 < n_prompt; i++) model_prefill(&m, &kv, promptv[i], pos++);
+    model_prefill(&m, &kv, promptv, n_prompt - 1, 0);
+    pos = n_prompt - 1;
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = (double)(clock() - tp) / CLOCKS_PER_SEC;
 

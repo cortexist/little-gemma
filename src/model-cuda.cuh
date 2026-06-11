@@ -111,11 +111,15 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
 // maybe scale" — three round-trips through global memory as separate kernels.
 // Fused: one block normalizes x (length n), accumulates into acc, applies the
 // optional per-layer output scale os, and (epilogue) quantizes the result.
-__global__ static void rmsnorm_add_kernel(float *acc, const float *x, const float *w, int n, float eps,
-                                          const float *os, struct actq aq) {
+// The body is shared with the chunk form below via `row`; this decode entry
+// pins row to 0 so the captured graph keeps the original instruction stream.
+__device__ static void d_rmsnorm_add(float *acc, const float *x, const float *w, int n, float eps,
+                                     const float *os, struct actq aq, int row) {
+    const float *xr = x + (size_t)row * n;
+    float *accr = acc + (size_t)row * n;
     __shared__ float sh[1024];
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     sh[threadIdx.x] = ss;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
@@ -123,13 +127,22 @@ __global__ static void rmsnorm_add_kernel(float *acc, const float *x, const floa
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         // __fadd_rn keeps the separately-rounded mul-then-add of the unfused
         // kernels (an FMA here would change the last bit, and the greedy path).
-        float v = __fadd_rn(acc[i], x[i] * scale * w[i]);
-        acc[i] = os ? v * os[0] : v;
+        float v = __fadd_rn(accr[i], xr[i] * scale * w[i]);
+        accr[i] = os ? v * os[0] : v;
     }
     if (aq.xq) {
         __syncthreads();
-        for (int g = threadIdx.x; g < n / 32; g += blockDim.x) d_quant_group(acc + g * 32, g, aq);
+        for (int g = threadIdx.x; g < n / 32; g += blockDim.x)
+            d_quant_group(accr + g * 32, row * (n / 32) + g, aq);
     }
+}
+__global__ static void rmsnorm_add_kernel(float *acc, const float *x, const float *w, int n, float eps,
+                                          const float *os, struct actq aq) {
+    d_rmsnorm_add(acc, x, w, n, eps, os, aq, 0);
+}
+__global__ static void rmsnorm_add_n_kernel(float *acc, const float *x, const float *w, int n, float eps,
+                                            const float *os, struct actq aq) {
+    d_rmsnorm_add(acc, x, w, n, eps, os, aq, blockIdx.x);
 }
 
 // GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
@@ -144,20 +157,37 @@ __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos,
     float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
     vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
 }
+// The chunk form: row r holds the chunk's r-th token, at position *d_pos + r.
+// A separate kernel (not a `rows` parameter) so the decode graph keeps the
+// division-free original — its tiny latency-bound nodes notice every cycle.
+__global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff,
+                                     int total, int rows) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total * rows) return;
+    int row = idx / total, rem = idx % total;
+    int pos = *d_pos + row;
+    int head = rem / half, i = rem % half;
+    float *vh = v + (size_t)row * (total / half) * hd + (size_t)head * hd;
+    float freq = powf(base, -2.0f * (float)i / (float)hd);
+    float ang = (float)pos * freq / (ff ? ff[i] : 1.0f);
+    float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
+    vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
+}
 
-// Attention for the current query position: one block per query head. pos is device-
+// Attention for one query position: one block per query head. pos is device-
 // resident and start is derived in-kernel (so the launch params never change across
 // tokens -> the forward captures into a static CUDA graph). window=0 means full causal.
 // Online softmax: each warp walks its strided slice of timesteps holding a running
 // (max, sum) and a per-lane V accumulator in registers, rescaling when the max moves;
 // the warps' partials merge once at the end. Shared memory is nwarp*hd — independent
 // of how long the context is (the score-array version capped max_seq at ~12k). Scale 1.0.
+// The body is shared with the chunk form via (pos, qoff); the decode entry pins
+// qoff to 0 so the captured graph keeps the original instruction stream.
 #define ATTN_HD_MAX 512   // per-lane V accumulator: ATTN_HD_MAX/32 registers
-__global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
-                                   int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
+__device__ static void d_attn(float *xb, const float *q, const float *Kc, const float *Vc,
+                              int hd, int kv_dim, int gqa, int pos, size_t qoff, int window, struct actq aq) {
     int hh = blockIdx.x, kvh = hh / gqa;
-    const float *qh = q + (size_t)hh * hd;
-    int pos = *d_pos;
+    const float *qh = q + qoff + (size_t)hh * hd;
     int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
     int T = pos - start + 1;
     extern __shared__ float comb[];                       // [nwarp][hd] partial outputs
@@ -197,7 +227,7 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
     float gs = 0.0f;
     for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
     float inv = 1.0f / gs;
-    float *outh = xb + (size_t)hh * hd;
+    float *outh = xb + qoff + (size_t)hh * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float o = 0.0f;
         for (int w = 0; w < nwarp; w++) o += comb[w * hd + i] * expf(wm[w] - gm);
@@ -206,8 +236,21 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
     if (aq.xq) {
         __syncthreads();
         for (int g = threadIdx.x; g < hd / 32; g += blockDim.x)
-            d_quant_group(outh + g * 32, (hh * hd) / 32 + g, aq);
+            d_quant_group(outh + g * 32, (int)(qoff / 32) + (hh * hd) / 32 + g, aq);
     }
+}
+__global__ static void attn_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
+                                   int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
+    d_attn(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, aq);
+}
+// Chunk form: grid (n_head, chunk) — query blockIdx.y sits at *d_pos + blockIdx.y,
+// so a batched chunk is causal by construction: every query reads only cache rows
+// at or before its own position, even though the whole chunk's k/v were written
+// before the launch.
+__global__ static void attn_n_kernel(float *xb, const float *q, const float *Kc, const float *Vc,
+                                     int hd, int kv_dim, int gqa, const int *d_pos, int window, struct actq aq) {
+    d_attn(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
+           (size_t)blockIdx.y * gridDim.x * hd, window, aq);
 }
 
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
@@ -215,6 +258,11 @@ __global__ static void attn_kernel(float *xb, const float *q, const float *Kc, c
 __global__ static void kv_write_kernel(float *dst, const float *src, const int *d_pos, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[(size_t)(*d_pos) * n + i] = src[i];
+}
+// The chunk form: `rows` consecutive cache rows starting at *d_pos.
+__global__ static void kv_write_n_kernel(float *dst, const float *src, const int *d_pos, int n, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * rows) dst[(size_t)(*d_pos + i / n) * n + i % n] = src[i];
 }
 
 __device__ static float d_gelu(float x) {
@@ -240,6 +288,14 @@ __global__ static void geglu_kernel(float *g, const float *u, int n, struct actq
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) g[i] = d_gelu(g[i]) * u[i];
     d_quant_block(g, n, aq);
+}
+// The chunk form: g is [rows][n] contiguous; u's rows may sit ustride apart
+// (the PLE inputs are one [n_layer*ple] record per token, so a layer's slice
+// strides by the record).
+__global__ static void geglu_n_kernel(float *g, const float *u, int n, int rows, int ustride, struct actq aq) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * rows) g[i] = d_gelu(g[i]) * u[(size_t)(i / n) * ustride + i % n];
+    d_quant_block(g, n * rows, aq);
 }
 __global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
@@ -301,6 +357,14 @@ static int kv_src_dev(const struct model *m, int L) {
     return c->n_kv_start - (m->is_local[L] ? 2 : 1);
 }
 
+// Batched prefill processes the prompt in chunks of this many tokens: each
+// weight matrix then crosses the memory bus once per CHUNK instead of once per
+// token. The activation buffers below are allocated PREFILL_B rows wide; decode
+// and the chunk remainder simply use row 0. Swept 8/16/32 on a 2.4k-token
+// prompt (E2B): 327/369/373 tok/s — 16 takes ~99% of 32's rate at half the
+// matmul kernel's per-lane accumulators and half the scratch.
+#define PREFILL_B 16
+
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
@@ -337,20 +401,21 @@ static void ensure_scratch(struct model *m) {
         int kvd = m->n_head_kv[L] * m->head_dim[L];
         if (kvd > maxkv) maxkv = kvd;
     }
+    size_t B = PREFILL_B;   // every activation buffer holds a whole prefill chunk
     int q_max = c->n_head * maxhd, ne = c->n_embd, nff = c->n_ff, ple = c->n_embd_per_layer;
-    CUDA_CHECK(cudaMalloc(&dx,  (size_t)ne   * 4)); CUDA_CHECK(cudaMalloc(&dh,  (size_t)ne   * 4));
-    CUDA_CHECK(cudaMalloc(&dout,(size_t)ne   * 4)); CUDA_CHECK(cudaMalloc(&dq,  (size_t)q_max * 4));
-    CUDA_CHECK(cudaMalloc(&dxb, (size_t)q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, (size_t)maxkv * 4));
-    CUDA_CHECK(cudaMalloc(&dvb, (size_t)maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, (size_t)nff * 4));
-    CUDA_CHECK(cudaMalloc(&dg2, (size_t)nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
+    CUDA_CHECK(cudaMalloc(&dx,  B * ne   * 4)); CUDA_CHECK(cudaMalloc(&dh,  B * ne   * 4));
+    CUDA_CHECK(cudaMalloc(&dout,B * ne   * 4)); CUDA_CHECK(cudaMalloc(&dq,  B * q_max * 4));
+    CUDA_CHECK(cudaMalloc(&dxb, B * q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, B * maxkv * 4));
+    CUDA_CHECK(cudaMalloc(&dvb, B * maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, B * nff * 4));
+    CUDA_CHECK(cudaMalloc(&dg2, B * nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
         size_t total = (size_t)ple * c->n_layer;
-        CUDA_CHECK(cudaMalloc(&dpg,   (size_t)ple * 4));
-        CUDA_CHECK(cudaMalloc(&d_ipl, total * 4));
-        CUDA_CHECK(cudaMalloc(&d_tok, total * 4));
-        CUDA_CHECK(cudaMalloc(&d_proj,total * 4));
+        CUDA_CHECK(cudaMalloc(&dpg,   B * ple * 4));
+        CUDA_CHECK(cudaMalloc(&d_ipl, B * total * 4));
+        CUDA_CHECK(cudaMalloc(&d_tok, B * total * 4));
+        CUDA_CHECK(cudaMalloc(&d_proj,B * total * 4));
     }
     CUDA_CHECK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
@@ -358,15 +423,18 @@ static void ensure_scratch(struct model *m) {
     scratch_ok = 1;
 }
 
-// The backend seam — the including .cu defines these three.
+// The backend seam — the including .cu defines these four.
 // matmul_q: d_out[m] = W . d_x with W the quantized tensor t (all device ptrs).
 //   The int8 backend reads d_x's quantization from its buffers, already filled
 //   by a producer kernel's epilogue (actq_for) or by act_quantize.
+// matmul_q_n: the PREFILL_B-column form — d_out[j*m..] = W . d_x[j*k..] for the
+//   whole chunk in one launch, so W streams from memory once per chunk.
 // actq_for(k): the backend's epilogue buffers for a k-length activation that is
 //   about to feed matmul_q (the f32 backend returns AQ0 — no quantization).
 // act_quantize: quantize d_x explicitly — for the one activation no kernel
 //   produces (the host-uploaded embedding); no-op for f32.
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static struct actq actq_for(int k);
 static void act_quantize(const float *d_x, int k);
 
@@ -417,6 +485,37 @@ static int build_per_layer(struct model *m, int token) {
     scale_const_kernel<<<gridn((int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), (int)total);
     rmsnorm_kernel<<<c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps, AQ0);
     combine_kernel<<<gridn((int)total), 256>>>(d_ipl, d_proj, d_tok, 1.0f / sqrtf(2.0f), (int)total);
+    return 1;
+}
+
+// The chunk form: PLE inputs for PREFILL_B tokens — one [n_layer*ple] record
+// per token, laid out back to back in d_ipl. Same math per token; the bf16
+// projection (the big matmul here) reads its weights once for the whole chunk.
+static int build_per_layer_n(struct model *m, const int *tokens) {
+    const struct config *c = &m->cfg;
+    const int ple = c->n_embd_per_layer, B = PREFILL_B;
+    if (ple <= 0) return 0;
+    const struct gguf_tensor *pte = gguf_find_tensor(m->ctx, "per_layer_token_embd.weight");
+    if (!pte) return 0;
+    const int64_t total = (int64_t)ple * c->n_layer;
+
+    float *host = (float *)malloc((size_t)B * total * 4);
+    if (!host) return 0;
+    float te_scale = sqrtf((float)ple);
+    for (int j = 0; j < B; j++) {
+        float *tok = dequantize_row(pte, tokens[j], total);
+        if (!tok) { free(host); return 0; }
+        for (int64_t i = 0; i < total; i++) host[(size_t)j * total + i] = tok[i] * te_scale;
+        free(tok);
+    }
+    CUDA_CHECK(cudaMemcpy(d_tok, host, (size_t)B * total * 4, cudaMemcpyHostToDevice));
+    free(host);
+
+    act_quantize(dx, B * c->n_embd);                  // dx came from the host, no producer kernel
+    matmul_q_n(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
+    scale_const_kernel<<<gridn(B * (int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), B * (int)total);
+    rmsnorm_kernel<<<B * c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps, AQ0);
+    combine_kernel<<<gridn(B * (int)total), 256>>>(d_ipl, d_proj, d_tok, 1.0f / sqrtf(2.0f), B * (int)total);
     return 1;
 }
 
@@ -515,6 +614,96 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
     forward_head(m);
 }
 
+// One prefill chunk: the forward for PREFILL_B prompt tokens at positions
+// pos0..pos0+B-1, head skipped. The math is exactly B single-token forwards —
+// every kernel above carries a row dimension that decode launches at 1 — but
+// each weight matrix crosses the memory bus ONCE per chunk instead of once per
+// token, and prefill is bandwidth-bound, so that factor is most of its cost.
+// Per layer, the whole chunk's k/v are written to the cache before its queries
+// run; causality holds because each query reads only up to its own position.
+// Runs un-captured (and without the fork/join forks): a chunk already
+// amortizes launch latency over its B tokens.
+static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0) {
+    const struct config *c = &m->cfg;
+    const int B = PREFILL_B, n_embd = c->n_embd, n_head = c->n_head;
+    const float eps = c->rms_eps;
+    const int has_ple = c->n_embd_per_layer > 0 &&
+                        gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;
+    const float *d_rope_freqs = dW(m, "rope_freqs.weight");
+
+    // embedding rows for the whole chunk -> dx, in one upload
+    float *rows = (float *)malloc((size_t)B * n_embd * 4);
+    if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
+    float es = sqrtf((float)n_embd);
+    for (int j = 0; j < B; j++) {
+        float *erow = dequantize_row(wq(m, "token_embd.weight"), tokens[j], n_embd);
+        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
+        free(erow);
+    }
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
+    free(rows);
+
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
+    build_per_layer_n(m, tokens);
+
+    for (int L = 0; L < c->n_layer; L++) {
+        const int local = m->is_local[L];
+        const int hd = m->head_dim[L], n_head_kv = m->n_head_kv[L];
+        const int q_dim = n_head * hd, kv_dim = n_head_kv * hd;
+        const float base = local ? c->rope_freq_base_swa : c->rope_freq_base;
+        const float *ff = local ? NULL : d_rope_freqs;
+        const float *os = dW_layer(m, L, "layer_output_scale.weight");
+
+        // ---- attention ----
+        rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
+
+        int src = kv_src_dev(m, L);
+        const int has_kv = L < c->n_kv_start;
+        if (has_kv) {
+            matmul_q_n(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
+            const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
+            if (wv) matmul_q_n(dvb, wv, dh, n_embd, kv_dim);
+            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        }
+        matmul_q_n(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
+        rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
+        if (has_kv) {
+            rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
+            rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
+            rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2, B);
+            kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->k[L], dkb, d_pos, kv_dim, B);
+            kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>(kv->v[L], dvb, d_pos, kv_dim, B);
+        }
+        const float *Kc = kv->k[src], *Vc = kv->v[src];
+        int gqa = n_head / n_head_kv;
+        int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
+        attn_n_kernel<<<dim3(n_head, B), 256, (size_t)(256 / 32) * hd * sizeof(float)>>>(dxb, dq, Kc, Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
+
+        matmul_q_n(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
+        rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
+
+        // ---- feed-forward (GeGLU) ----
+        const int nff = m->ffn_len[L];
+        rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
+        matmul_q_n(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
+        matmul_q_n(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
+        matmul_q_n(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
+        rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
+                                       has_ple ? NULL : os, has_ple ? actq_for(B * n_embd) : AQ0);
+
+        // ---- per-layer input (PLE) ----
+        if (has_ple) {
+            const int ple = c->n_embd_per_layer;
+            matmul_q_n(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
+            geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
+            matmul_q_n(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
+            rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
+        }
+    }
+}
+
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
 // ~1000 per-token kernel launches collapse into one graph launch, erasing the WDDM
 // launch latency that leaves the GPU idle ~30% of each token. The graph is fully STATIC
@@ -574,8 +763,19 @@ extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token
     return best;
 }
 
-extern "C" void model_prefill(struct model *m, struct kvcache *kv, int token, int pos) {
-    forward_token(m, kv, token, pos, 0);   // no head, no argmax, no sync round-trip
+extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
+    ensure_weights(m);
+    ensure_scratch(m);
+    int i = 0;
+    for (; n - i >= PREFILL_B; i += PREFILL_B)        // full chunks: weights read once per chunk
+        forward_chunk(m, kv, tokens + i, pos0 + i);
+    // The warmup tokens exist so ensure_act's one-time cudaMallocs precede graph
+    // capture; one chunk does all of them (its activations are B× decode's), so
+    // skip straight to capture — otherwise a chunk-aligned prompt would push the
+    // two un-captured tokens and the capture itself into the generation timer.
+    if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
+    for (; i < n; i++)                                // remainder: the per-token path (no head)
+        forward_token(m, kv, tokens[i], pos0 + i, 0);
 }
 
 #endif // MODEL_CUDA_CUH
