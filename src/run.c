@@ -64,6 +64,10 @@ static void print_piece(const char *s) {
 // is the unit of work that cannot be interrupted, and never needs to be.
 
 #define SERVE_SEQ 8192   // context budget per conversation
+#define SERVE_GEN 1024   // output cap per turn: greedy decode has no sampler and
+                         // no repeat penalty, so a degenerate loop would otherwise
+                         // spin until the context fills (observed: 8,098 tokens,
+                         // 270 s, of the same sentence about a typo)
 
 static int send_all(sock_t s, const char *buf, int n) {
     while (n > 0) {
@@ -284,6 +288,11 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             for (;; g++) {                               // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
+                if (g + 1 >= SERVE_GEN) {                // runaway turn: end it ourselves
+                    send_piece(c, " [SERVE_GEN cap]<turn|>");
+                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                    break;
+                }
                 best = model_forward_next(&m, &kv, best, pos++);
             }
             double dt = now_sec() - t1, dp = t1 - t0;
