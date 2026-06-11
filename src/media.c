@@ -258,13 +258,19 @@ static float *uv_embed_image(struct media *md, const uint8_t *rgb, int w, int h,
         return NULL;
     }
 
+    // batched on purpose: the two linears carry ~80 MB of f16 weights, and a
+    // patch-at-a-time matvec re-unpacks and re-streams all of it per patch
+    // (266 x 80 MB for a typical image) — matmat unpacks each row once
     float *out = malloc((size_t)n * ne * sizeof(float));
-    float *vec = malloc((size_t)pin * sizeof(float));
-    float *e   = malloc((size_t)ne * sizeof(float));
-    if (!out || !vec || !e) { free(out); free(vec); free(e); return NULL; }
+    float *E   = malloc((size_t)n * ne * sizeof(float));
+    float *F   = malloc((size_t)n * pin * sizeof(float));
+    if (!out || !E || !F) { free(out); free(E); free(F); return NULL; }
 
-    for (int p = 0; p < n; p++) {
+    int p;
+    #pragma omp parallel for schedule(static)
+    for (p = 0; p < n; p++) {
         int col = p % n_cols, row = p / n_cols;
+        float *vec = F + (size_t)p * pin;
         // flatten the patch the way im2col over a planar [W,H,3] image does:
         // channel-major, row-major pixels within the channel, in [0,1]
         for (int c = 0; c < 3; c++)
@@ -272,19 +278,23 @@ static float *uv_embed_image(struct media *md, const uint8_t *rgb, int w, int h,
                 for (int kx = 0; kx < P; kx++)
                     vec[(c * P + ky) * P + kx] =
                         (float)rgb[3 * ((size_t)(row * P + ky) * w + (col * P + kx)) + c] / 255.0f;
-
         layernorm(vec, md->vn1w, md->vn1b, pin, 1e-5f);
-        matvec(e, md->v_patch_w, vec, pin, ne);
-        for (int i = 0; i < ne; i++) e[i] += md->v_patch_b[i];
-        layernorm(e, md->vn2w, md->vn2b, ne, 1e-5f);
+    }
+    matmat(E, md->v_patch_w, F, pin, ne, n);
+    #pragma omp parallel for schedule(static)
+    for (p = 0; p < n; p++) {
+        float *e = E + (size_t)p * ne;
+        int col = p % n_cols, row = p / n_cols;
         const float *ex = md->v_pos + (size_t)col * ne;                       // x table
         const float *ey = md->v_pos + ((size_t)md->pos_size + row) * ne;      // y table
+        for (int i = 0; i < ne; i++) e[i] += md->v_patch_b[i];
+        layernorm(e, md->vn2w, md->vn2b, ne, 1e-5f);
         for (int i = 0; i < ne; i++) e[i] += ex[i] + ey[i];
         layernorm(e, md->vn3w, md->vn3b, ne, 1e-5f);
         rmsnorm_plain(e, ne, 1e-6f);
-        matvec(out + (size_t)p * ne, md->mm_v, e, ne, ne);
     }
-    free(vec); free(e);
+    matmat(out, md->mm_v, E, ne, ne, n);
+    free(F); free(E);
     *n_tokens = n;
     return out;
 }
