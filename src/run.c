@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <winsock2.h>   // must precede windows.h
@@ -156,8 +157,23 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     strcpy(sa.sun_path, path);
     remove(path);                                       // stale socket from a previous run
     if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 4) != 0) {
-        fprintf(stderr, "bind/listen on %s failed (error %d) - note the socket's directory must exist\n",
-                path, sock_err());
+        // self-diagnosing on purpose: a relative path that LOOKS absolute is
+        // the classic miss (PowerShell does not expand %TEMP% — that literal
+        // directory really got created once), as is a directory created AT
+        // the socket path after reading "the directory must exist"
+        int err = sock_err();
+        char full[576];
+#ifdef _WIN32
+        if (!_fullpath(full, path, sizeof full)) snprintf(full, sizeof full, "%s", path);
+#else
+        snprintf(full, sizeof full, "%s", path);
+#endif
+        struct stat st;
+        fprintf(stderr, "bind/listen failed (error %d) on %s\n  resolved: %s\n  %s\n",
+                err, path, full,
+                stat(full, &st) == 0 && (st.st_mode & S_IFDIR)
+                ? "a DIRECTORY sits at the socket path itself - remove it; only the PARENT must exist"
+                : "the socket's PARENT directory must exist, and the path itself must be free");
         return;
     }
     fprintf(stderr, "listening on %s - one conversation per connection, Ctrl-C to stop\n", path);
