@@ -262,15 +262,17 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             pos += n - 1 - skip;
             total += n - skip;
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
+            double t1 = now_sec();                       // prefill done (incl. the first pick)
             int g = 0, fail = 0;
             for (;; g++) {                               // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
                 best = model_forward_next(&m, &kv, best, pos++);
             }
-            double dt = now_sec() - t0;
-            fprintf(stderr, "turn: %d in, %d out, %.2fs (%.2f tok/s)\n",
-                    total, g + 1, dt, (total + g + 1) / (dt > 0 ? dt : 1e-9));
+            double dt = now_sec() - t1, dp = t1 - t0;
+            fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",
+                    total, dp, total / (dp > 0 ? dp : 1e-9),
+                    g + 1, dt, (g + 1) / (dt > 0 ? dt : 1e-9));
             if (fail || pos + 1 >= SERVE_SEQ) break;     // client gone or context full
         }
         sock_close(c);
