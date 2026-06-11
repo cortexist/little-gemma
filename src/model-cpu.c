@@ -231,7 +231,7 @@ static float *build_per_layer(struct model *m, int token, const float *inp_scale
 // n_embd input exactly as the layers should see it (token embeddings arrive
 // pre-scaled by sqrt(n_embd); media embeddings arrive as the projector made
 // them). ple_token selects the per-layer-input row, or -1 for none (media
-// positions on PLE models contribute zero PLE — and the 12B has no PLE).
+// positions on PLE models pass the padding token, 0).
 static void forward_core(struct model *m, struct kvcache *kv, const float *x_in, int ple_token,
                          int pos, float *logits) {
     const struct config *c = &m->cfg;
@@ -389,8 +389,11 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
 }
 
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
+    // On PLE models a media position takes the PADDING token's (id 0)
+    // per-layer row beside the usual projection of its embedding — the
+    // reference does exactly this for embedding batches.
     for (int i = 0; i < n; i++)
-        forward_core(m, kv, rows + (size_t)i * m->cfg.n_embd, -1, pos0 + i, NULL);
+        forward_core(m, kv, rows + (size_t)i * m->cfg.n_embd, 0, pos0 + i, NULL);
 }
 
 // Forward + greedy pick. On the CPU this is just a scan over the logits; the

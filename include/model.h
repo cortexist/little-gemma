@@ -98,8 +98,9 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
 // rows is [n][n_embd], row i enters the model at position pos0+i exactly as
 // given — media embeddings are NOT sqrt(n_embd)-scaled (only real token
 // lookups are; the reference scales by `ubatch.token ? sqrt(n_embd) : 1`).
-// On models with per-layer inputs (PLE) the media positions get zero PLE
-// rows; the 12B — the model the media path exists for — has no PLE.
+// On models with per-layer inputs (PLE) a media position takes the padding
+// token's (id 0) per-layer row beside the usual projection of its embedding,
+// matching the reference; the 12B has no PLE at all.
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0);
 
 #endif // MODEL_H

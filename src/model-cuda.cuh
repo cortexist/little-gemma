@@ -841,15 +841,19 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
 }
 
 // Embedding form (media tokens): the rows enter exactly as given — media
-// embeddings are NOT sqrt(n_embd)-scaled (only real token lookups are). A PLE
-// model gets zero PLE rows for these positions; the 12B has no PLE at all.
+// embeddings are NOT sqrt(n_embd)-scaled (only real token lookups are). On a
+// PLE model a media position takes the PADDING token's (id 0) per-layer row
+// beside the usual projection of its embedding — the reference does exactly
+// this for embedding batches; the 12B has no PLE at all.
 static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float *rows, int pos0) {
     const struct config *c = &m->cfg;
     CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)PREFILL_B * c->n_embd * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
     int has_ple = model_has_ple(m);
-    if (has_ple)
-        CUDA_CHECK(cudaMemset(d_ipl, 0, (size_t)PREFILL_B * c->n_embd_per_layer * c->n_layer * 4));
+    if (has_ple) {
+        int pad[PREFILL_B] = { 0 };
+        build_per_layer_n(m, pad);
+    }
     chunk_layers(m, kv, has_ple);
 }
 
@@ -939,8 +943,7 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
         CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)i * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
         int pos = pos0 + i;
         CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
-        if (model_has_ple(m))
-            CUDA_CHECK(cudaMemset(d_ipl, 0, (size_t)m->cfg.n_embd_per_layer * m->cfg.n_layer * 4));
+        if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row
         forward_graph(m, kv, 0);
     }
 }
