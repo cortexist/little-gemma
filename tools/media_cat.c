@@ -231,6 +231,7 @@ int main(int argc, char **argv) {
     }
 
     // decode and send each media argument, in order, then the question line
+    int n_frames = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc) {
             int w, h;
@@ -239,6 +240,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "media_cat: %s -> %dx%d (%d tokens)\n", argv[i], w, h, (w / PATCH) * (h / PATCH));
             if (send_frame(s, MEDIA_FRAME_IMAGE, w, h, rgb, (uint32_t)(3 * w * h)) != 0) return 1;
             free(rgb);
+            n_frames++;
         } else if (!strcmp(argv[i], "-a") && i + 1 < argc) {
             int n;
             int16_t *pcm = prep_audio(argv[++i], &n);
@@ -246,14 +248,22 @@ int main(int argc, char **argv) {
             fprintf(stderr, "media_cat: %s -> %.2fs (%d tokens)\n", argv[i], n / (double)RATE, n / FRAME);
             if (send_frame(s, MEDIA_FRAME_AUDIO, 0, 0, pcm, (uint32_t)(2 * n)) != 0) return 1;
             free(pcm);
+            n_frames++;
         } else if (!strcmp(argv[i], "-t") && i + 1 < argc) {
             const char *t = argv[++i];
             if (send_frame(s, MEDIA_FRAME_TEXT, 0, 0, t, (uint32_t)strlen(t)) != 0) return 1;
+            n_frames++;
         } else {
             question = argv[i];
         }
     }
-    if (!question) { fprintf(stderr, "media_cat: no question given\n"); return 1; }
+    // text is optional when media was sent: a spoken question, or a written
+    // note shown to the camera, is a complete turn by itself — the model does
+    // not distinguish words it hears (or reads off an image) from words typed
+    if (!question) {
+        if (n_frames) question = "";
+        else { fprintf(stderr, "media_cat: no question and no media given\n"); return 1; }
+    }
     char line[8192];
     snprintf(line, sizeof line, "%s\n", question);
     if (send_all(s, line, strlen(line)) != 0) { fprintf(stderr, "send failed\n"); return 1; }
