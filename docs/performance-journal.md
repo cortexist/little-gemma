@@ -459,9 +459,39 @@ make re-reads free — gained **+49% prefill** (229 → 341 tok/s). Found with a
 20-line `LG_MTP_PROFILE=1` probe that splits the verify into halves with
 syncs.
 
-The verdict is the device-scoped story this journal keeps re-learning, now in
-one table (story prompt, 256 generated tokens, warm, best of 2; acceptance in
-parentheses; `llama-bench tg32` same day, same machine):
+**Prefill, measured honestly for the first time (2026-06-12).** Decode got
+benchmarked against llama.cpp at every step; prefill never seriously was —
+and the answer is humbling. Warm prefill rate (derived from Δtokens/Δtime
+across 64/512/2048-token prompts, which cancels the per-process repack and
+graph warmup) vs `llama-bench -p ... -n 0`:
+
+| device | model | little-gemma | llama.cpp pp512/pp2048 | ratio |
+|--------|-------|-------------:|-----------------------:|------:|
+| A5000  | E2B   |   ~810 | 7,942 / 7,927 | ~0.10× |
+| A5000  | E4B   |   ~560 | 4,610 / 4,773 | ~0.12× |
+| A5000  | 12B   |   ~255 | 2,206 / 2,096 | ~0.12× |
+| Orin   | E4B   |    ~55 |   500 / 473   | ~0.11× |
+| Orin   | 12B   |    ~20 |   207 / 194   | ~0.10× |
+
+A flat **~10× deficit on both devices** — which is itself the diagnosis. The
+chunk path amortizes *weight traffic* (the bandwidth story), but at B=16 the
+arithmetic side never gets dense enough: llama.cpp prefills at batch 512
+through tensor-core/MMQ GEMMs, reusing each weight tile 32× more and feeding
+units this codebase's warp-per-row dot kernel never touches. On the Orin the
+chunk path runs at ~17 GB/s of weight traffic against a ~60 GB/s bus —
+compute-shaped, not bandwidth-shaped, so "weights cross once per chunk"
+stopped being the binding constraint the moment the fused subs fixed the
+re-read bug. Why it never hurt: serve turns are short, decode dominates the
+interactive experience (where little-gemma leads on the Orin), the GPU
+encoder killed the worst prefill case (images), and `-sys` removed the
+skills re-prefill. The honest scorecard: **decode is this project's strong
+axis, prefill is llama.cpp's** — closing it would mean a genuinely tiled
+int8 GEMM and a much larger chunk size, which is llama.cpp's single most
+engineered code path re-done. Known, measured, deliberately not chased (yet).
+
+The MTP verdict is the device-scoped story this journal keeps re-learning,
+now in one table (story prompt, 256 generated tokens, warm, best of 2;
+acceptance in parentheses; `llama-bench tg32` same day, same machine):
 
 **RTX A5000 (Windows/WDDM):**
 

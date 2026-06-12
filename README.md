@@ -370,6 +370,13 @@ milliseconds) and wins on the Jetson — same binary, byte-identical output on
 both, faster only where the hardware says so. On the edge device this project
 actually targets, every row is ahead.
 
+For honesty's sake: those are *decode* tables, and decode is this project's
+strong axis. **Prefill is llama.cpp's** — its batch-512 tensor-core GEMMs
+prefill ~10× faster than the 16-token chunk path here, on both machines (the
+journal has the full measurement). It rarely shows in interactive serving —
+turns are short, `-sys` removed the skills re-prefill, the GPU encoder
+removed the image one — but on long documents llama.cpp wins the wait.
+
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
 Both **no CUDA, no SIMD intrinsics, 12 threads**, single-token generation:
