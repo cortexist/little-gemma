@@ -142,6 +142,7 @@ struct mtp *mtp_open(const char *path, const struct model *m) {
     t->n_layer  = (int)gguf_get_u32(ctx, AK("block_count"), 0);
     t->n_inner  = (int)gguf_get_u32(ctx, AK("embedding_length"), 0);
     t->n_bb     = (int)gguf_get_u32(ctx, AK("embedding_length_out"), 0);
+    if (!t->n_bb) t->n_bb = (int)gguf_get_u32(ctx, AK("n_embd_backbone"), 0);   // E4B vintage
     t->n_head   = (int)gguf_get_u32(ctx, AK("attention.head_count"), 0);
     t->n_ff     = (int)gguf_get_u32(ctx, AK("feed_forward_length"), 0);
     t->eps      = gguf_get_f32(ctx, AK("attention.layer_norm_rms_epsilon"), 1e-6f);
