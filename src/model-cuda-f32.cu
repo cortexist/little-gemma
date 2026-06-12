@@ -112,6 +112,10 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     for (int j = 0; j < PREFILL_B; j++)
         matmul_q(d_out + (size_t)j * m, t, d_x + (size_t)j * k, k, m);
 }
+static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    for (int j = 0; j < 2; j++)
+        matmul_q(d_out + (size_t)j * m, t, d_x + (size_t)j * k, k, m);
+}
 // The f32 backend dots the float activation directly — no quantize epilogues.
 static struct actq actq_for(int k) { (void)k; return AQ0; }
 static void act_quantize(const float *d_x, int k) { (void)d_x; (void)k; }

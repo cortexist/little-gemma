@@ -15,6 +15,16 @@
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
 const int model_kv_host = 1;     // this backend's kvcache rows are host memory
 
+// The verify pair, sequentially: byte-identical to plain decoding by
+// construction (they ARE the same forwards), and last_hidden lands on the
+// last valid position automatically — the second forward only runs on accept.
+int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
+    out[0] = model_forward_next(m, kv, tok0, pos);
+    if (out[0] != tok1) return 1;
+    out[1] = model_forward_next(m, kv, tok1, pos + 1);
+    return 2;
+}
+
 // The host draft path in mtp.c does all the work on this backend.
 #include "mtp-internal.h"
 int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,

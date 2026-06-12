@@ -123,6 +123,15 @@ void        mtp_free(struct mtp *t);
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
               int token, int pos);
 
+// Verify a draft: feed tok0 at pos and tok1 (the draft) at pos+1 in one
+// batched step. out[0] = greedy successor of tok0 (always valid); out[1] =
+// successor of tok1 (valid only when out[0] == tok1, i.e. the draft held).
+// Returns tokens advanced: 2 on accept, 1 on reject. The backend leaves its
+// h_prev at the last valid position either way, so drafting chains. With
+// greedy verification the emitted text is IDENTICAL to plain greedy decoding
+// — only the number of forwards per token changes.
+int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out);
+
 // 1 if this backend's kvcache rows live in host memory (the CPU backend);
 // the CUDA backends keep them — and the draft head — on the device.
 extern const int model_kv_host;

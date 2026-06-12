@@ -346,13 +346,24 @@ static void client(const char *path) {
     sock_close(s);
 }
 
+// Print one generated token unless it is scaffolding; tracks the thought-
+// channel-name state (the name between <|channel> and <channel|> stays hidden).
+static void emit_token(struct tokenizer *tk, int tok, int *in_thought, int ch_open, int ch_close) {
+    if (tok == ch_open)  { *in_thought = 1; return; }
+    if (tok == ch_close) { *in_thought = 0; return; }
+    if (!*in_thought && !tokenizer_is_special(tk, tok)) {
+        print_piece(tokenizer_token_text(tk, tok));
+        fflush(stdout);
+    }
+}
+
 // Tokenize the prompt under the Gemma chat template, generate greedily, report tok/s.
-// `mtp_path` (optional) loads a gemma4-assistant draft head and runs it as an
-// ORACLE: one draft per generated token, scored against what the target then
-// actually picks. Greedy verify means drafts can never change the output; the
-// acceptance rate printed at the end is the correctness gate for the draft
-// head (a right implementation accepts well over half, a wrong one near none).
-// The throughput win comes later, when the CUDA port batches the verify.
+// `mtp_path` (optional) loads a gemma4-assistant draft head and decodes
+// SPECULATIVELY at block 2: draft the successor of each fresh token, then
+// verify [token, draft] as one batched target step — two tokens for one
+// pass's weight traffic when the draft holds. Greedy verification means the
+// output is byte-identical to plain greedy decoding, always; only tok/s and
+// the acceptance rate move.
 static void generate(const struct gguf_context *ctx, const char *prompt, const char *mtp_path) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
@@ -398,24 +409,31 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = now_sec() - tp;
 
-    // greedy generation
+    // greedy generation — plain, or speculative at block 2 with -mtp
     double tg = now_sec();
     int g = 0, n_draft = 0, n_accept = 0;
-    for (; g < N_GEN; g++) {
+    while (g < N_GEN) {
         if (best == eot || best == eos) break;               // end of turn
-        if (best == ch_open)  in_thought = 1;                // channel name starts
-        else if (best == ch_close) in_thought = 0;           // channel name ends
-        else if (!in_thought && !tokenizer_is_special(tk, best)) {
-            print_piece(tokenizer_token_text(tk, best));
-            fflush(stdout);
+        emit_token(tk, best, &in_thought, ch_open, ch_close);
+        if (!t) {
+            best = model_forward_next(&m, &kv, best, pos++);
+            g++;
+            continue;
         }
-        // draft the successor of `best` before its forward runs (the cache
-        // holds positions < pos, exactly what the head cross-attends)
-        int draft = t ? mtp_draft(t, &m, &kv, best, pos) : -1;
-        best = model_forward_next(&m, &kv, best, pos++);
-        if (t) {
-            n_draft++;
-            if (best == draft) n_accept++;
+        // draft the successor of `best`, then verify the pair in one step
+        int draft = mtp_draft(t, &m, &kv, best, pos);
+        int out2[2];
+        int adv = model_forward2(&m, &kv, best, draft, pos, out2);
+        n_draft++;
+        pos += adv;
+        g += adv;
+        if (adv == 2) {                                      // draft confirmed
+            n_accept++;
+            if (draft == eot || draft == eos) { best = draft; continue; }
+            emit_token(tk, draft, &in_thought, ch_open, ch_close);
+            best = out2[1];
+        } else {
+            best = out2[0];
         }
     }
     double t_gen = now_sec() - tg;

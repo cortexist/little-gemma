@@ -328,7 +328,11 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
 // (the per-column re-reads hit L1). Activations sit at column stride k (int8)
 // and k/32 (scales), exactly as the producers' epilogues laid them out. Each
 // column's accumulation order matches the one-column kernel, so the result is
-// bit-identical to PREFILL_B separate matmul_q calls.
+// bit-identical to NB separate matmul_q calls. NB is a template parameter so
+// the register accumulators stay compile-sized: <PREFILL_B> is the frozen
+// prefill instantiation (identical codegen to the former constant), <2> is
+// the MTP verify pair — separate instruction streams, like d_attn's RING.
+template <int NB>
 __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
                                            const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -336,9 +340,9 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     if (warp >= m) return;
     const unsigned char *row = wbase + (size_t)warp * (k / blck) * ts;
     int nb = k / blck, gpb = blck / 32;
-    float s[PREFILL_B];
+    float s[NB];
     #pragma unroll
-    for (int j = 0; j < PREFILL_B; j++) s[j] = 0.0f;
+    for (int j = 0; j < NB; j++) s[j] = 0.0f;
 
     int nsub = 0;
     if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
@@ -350,7 +354,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         for (int si = lane; si < total; si += 32) {
             int b = si / nsub, sj = si % nsub;
             const unsigned char *blk = row + (size_t)b * ts;
-            for (int j = 0; j < PREFILL_B; j++) {
+            for (int j = 0; j < NB; j++) {
                 const int8_t *xqb = xq + (size_t)j * k + (size_t)b * blck;
                 const float2 *xdsb = xds + (size_t)j * (k / 32) + (size_t)b * gpb;
                 switch (type) {
@@ -366,7 +370,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         const float *wr = (const float *)row;
         for (int i = lane; i < k; i += 32) {
             float w = wr[i];
-            for (int j = 0; j < PREFILL_B; j++) s[j] += w * x[(size_t)j * k + i];
+            for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
         }
     } else {                                             // bf16 / f16: one uint32 = 2 elements
         const uint16_t *wr = (const uint16_t *)row;
@@ -374,12 +378,12 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
             uint32_t two = ld32(wr + i);
             float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
             float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
-            for (int j = 0; j < PREFILL_B; j++)
+            for (int j = 0; j < NB; j++)
                 s[j] += w0 * x[(size_t)j * k + i] + w1 * x[(size_t)j * k + i + 1];
         }
     }
     #pragma unroll
-    for (int j = 0; j < PREFILL_B; j++) {
+    for (int j = 0; j < NB; j++) {
         float v = s[j];
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
         if (lane == 0) out[(size_t)j * m + warp] = v;
@@ -392,5 +396,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    matmul_i8r_n_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+}
+static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
+    int blck = ggml_blck_size(t->type), ts;
+    const unsigned char *w = rweight(t, &ts);
+    int blocks = (m + 7) / 8;
+    matmul_i8r_n_kernel<2><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
