@@ -498,13 +498,26 @@ device whose bus does 60 and whose dp4a does an order of magnitude more.
 llama.cpp's MMQ runs many warps per shared-memory tile and reuses each
 unpacked weight fragment across both tile axes — different kernel species.
 The honest scorecard: **decode is this project's strong axis, prefill is
-llama.cpp's.** No low-hanging fruit remains; the next rung is a real tiled
-int8 GEMM for the chunk path (a contained, decode-risk-free project — the
-frozen-kernel discipline means prefill kernels can be rewritten wholesale),
-plausibly worth 3–5×, still short of MMQ. Where the gap is *felt*: image
-turns (266 tokens now prefill-bound at ~5 s on Orin after the GPU encoder
-removed the embed cost) and document ingestion; short `-sys`-warmed chat
-turns mostly hide it.
+llama.cpp's.** Where the gap is *felt*: image turns (266 tokens now
+prefill-bound at ~5 s on Orin after the GPU encoder removed the embed cost)
+and document ingestion; short `-sys`-warmed chat turns mostly hide it.
+
+**Confirmed dead-end (don't repeat): shared-staged activations for the chunk
+matmul.** The scattered-activation theory said each lane's 4-byte loads drag
+32-byte sectors, so staging each activation k-slice into shared memory
+(coalesced, lane order preserved — byte-identical by construction) should
+recover the waste. Falsified on both devices: A5000 341 → 276 prompt tok/s,
+Orin chunk-matmul time 26.7 → 44.6 s. The activations were L2-resident all
+along and the L2 absorbed the scatter; the staging traffic, barriers, and
+shared-memory latency only added cost. Which sharpens the diagnosis to its
+final form: the chunk matmul is **issue-bound on the unpack+dp4a instruction
+stream itself** — every dp4a costs several mask/shift ALU ops, one warp per
+row offers no way to amortize them further, and no memory-system tweak
+changes that. The real rung, now the only rung: int8 **tensor-core `mma`**
+with MMQ-style weight tiles. Integer accumulation is exact, so even that can
+stay byte-identical if per-sub-block scale order is preserved — but it is a
+rewrite of the kernel's whole shape, not an afternoon. (Experiment preserved
+in history: WIP commit + revert, c02cbe9.)
 
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
