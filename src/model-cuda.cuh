@@ -1069,8 +1069,10 @@ extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int
 // [0, pos-1] full — so two NEW wrappers below pin those arguments and the
 // frozen decode entry points stay untouched. Assistant weights are dequantized
 // once to f16 on the device (77M params, ~150 MB); h_prev is g_hidden, which
-// the decode graph already maintains. Sync and un-captured for now — the
-// async overlap (draft on g_side while the target verifies) is step 2c.
+// the decode graph already maintains. The whole draft CAPTURES into one CUDA
+// graph (position read on-device from d_dpos, like decode's d_pos), so a
+// round costs one graph launch + one 4-byte readback instead of ~30 raw
+// launches — on WDDM that launch tax was most of the draft's wall time.
 
 __global__ static void mtp_matvec_h(float *out, const __half *W, const float *x, int k, int m) {
     int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -1086,11 +1088,12 @@ __global__ static void mtp_matvec_h(float *out, const __half *W, const float *x,
     if (!lane) out[row] = s;
 }
 
-// NeoX rope at a plain host-int position (the draft is not graph-captured, so
-// nothing needs to be device-resident). No freq factors: the assistant has none.
-__global__ static void mtp_rope(float *v, int half, int hd, int pos, float base, int total) {
+// NeoX rope at the device-resident draft position (static graph node). No
+// freq factors: the assistant has none.
+__global__ static void mtp_rope(float *v, int half, int hd, const int *dp, float base, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
+    int pos = *dp;
     int head = idx / half, i = idx % half;
     float *vh = v + (size_t)head * hd;
     float freq = powf(base, -2.0f * (float)i / (float)hd);
@@ -1104,13 +1107,14 @@ __global__ static void mtp_add_scale(float *x, const float *o, int n, float sc) 
     if (i < n) x[i] = (x[i] + o[i]) * sc;
 }
 
+// The draft at *dp sees the cache as a query at *dp - 1 (see the host draft).
 __global__ static void mtp_attn_h(float *xb, const float *q, const __half *Kc, const __half *Vc,
-                                  int hd, int kv_dim, int gqa, int pos, struct actq aq) {
-    d_attn<false, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, pos, 0, 0, 0, aq);
+                                  int hd, int kv_dim, int gqa, const int *dp, struct actq aq) {
+    d_attn<false, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, 0, 0, aq);
 }
 __global__ static void mtp_attn_swa(float *xb, const float *q, const float *Kc, const float *Vc,
-                                    int hd, int kv_dim, int gqa, int pos, int window, int seq, struct actq aq) {
-    d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, pos, 0, window, seq, aq);
+                                    int hd, int kv_dim, int gqa, const int *dp, int window, int seq, struct actq aq) {
+    d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, window, seq, aq);
 }
 
 struct mtp_ld {
@@ -1124,6 +1128,9 @@ struct mtp_cuda {
     float *out_norm;
     float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *logits;            // device scratch
     int *d_tok;
+    int *d_dpos;                  // device-resident draft position (static graph)
+    cudaGraphExec_t graph;
+    int warmups;
 };
 
 static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type -> device f16
@@ -1179,7 +1186,8 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
             && cudaMalloc(&mc->g1, (size_t)t->n_ff * 4) == cudaSuccess
             && cudaMalloc(&mc->g2, (size_t)t->n_ff * 4) == cudaSuccess
             && cudaMalloc(&mc->logits, (size_t)t->n_vocab * 4) == cudaSuccess
-            && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess;
+            && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess
+            && cudaMalloc(&mc->d_dpos, sizeof(int)) == cudaSuccess;
     if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-cuda
         fprintf(stderr, "mtp: device upload failed, drafting disabled\n");
         free(mc->l); free(mc);
@@ -1188,28 +1196,14 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
     return mc;
 }
 
-extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
-                                int token, int pos) {
-    if (t->cuda == (void *)-1) return -1;
-    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
-    if (!mc) {
-        mc = mtp_cuda_init(t);
-        t->cuda = mc ? (void *)mc : (void *)-1;
-        if (!mc) return -1;
-    }
+// Every launch in the draft, position read from mc->d_dpos — capturable.
+static void mtp_draft_launches(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                               struct mtp_cuda *mc) {
     const struct config *c = &m->cfg;
     const int ni = t->n_inner, nb = t->n_bb, nff = t->n_ff;
     const float eps = t->eps;
 
-    // input: the target's sqrt-scaled embedding of `token` ++ g_hidden
-    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
-    if (!erow) return -1;
-    float sc = sqrtf((float)nb);
-    for (int i = 0; i < nb; i++) erow[i] *= sc;
-    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
-    free(erow);
     CUDA_CHECK(cudaMemcpyAsync(mc->cat + nb, g_hidden, (size_t)nb * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-
     mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->x, mc->pre, mc->cat, 2 * nb, ni);
 
     for (int L = 0; L < t->n_layer; L++) {
@@ -1221,19 +1215,18 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
         rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->h, mc->x, dl->attn_norm, ni, eps, AQ0);
         mtp_matvec_h<<<gridn(q_dim * 32), 256>>>(mc->q, dl->q, mc->h, ni, q_dim);
         rmsnorm_kernel<<<t->n_head, 256>>>(mc->q, mc->q, dl->q_norm, hd, eps, AQ0);
-        mtp_rope<<<gridn(t->n_head * (hd / 2)), 256>>>(mc->q, hd / 2, hd, pos,
+        mtp_rope<<<gridn(t->n_head * (hd / 2)), 256>>>(mc->q, hd / 2, hd, mc->d_dpos,
                                                        bl->local ? t->base_swa : t->base_full,
                                                        t->n_head * (hd / 2));
-        // the draft at `pos` sees the cache as a query at pos-1, window-1
         if (bl->local)
             mtp_attn_swa<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
                     (const float *)kv->k[src], (const float *)kv->v[src],
-                    hd, kv->kv_dim[src], gqa, pos - 1,
+                    hd, kv->kv_dim[src], gqa, mc->d_dpos,
                     c->sliding_window > 0 ? c->sliding_window - 1 : 0, kv->seq[src], AQ0);
         else
             mtp_attn_h<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
                     (const __half *)kv->k[src], (const __half *)kv->v[src],
-                    hd, kv->kv_dim[src], gqa, pos - 1, AQ0);
+                    hd, kv->kv_dim[src], gqa, mc->d_dpos, AQ0);
         mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->o, dl->o, mc->xb, q_dim, ni);
         rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->o, mc->o, dl->post_attn, ni, eps, AQ0);
         mtp_add_scale<<<gridn(ni), 256>>>(mc->x, mc->o, ni, 1.0f);
@@ -1252,6 +1245,42 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
     if (t->softcap > 0.0f)
         softcap_kernel<<<gridn(t->n_vocab), 256>>>(mc->logits, t->softcap, t->n_vocab);
     argmax_kernel<<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
+}
+
+extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                                int token, int pos) {
+    if (t->cuda == (void *)-1) return -1;
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc) {
+        mc = mtp_cuda_init(t);
+        t->cuda = mc ? (void *)mc : (void *)-1;
+        if (!mc) return -1;
+    }
+    const int nb = t->n_bb;
+
+    // uploads stay outside the graph (fixed buffers, varying data)
+    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
+    if (!erow) return -1;
+    float sc = sqrtf((float)nb);
+    for (int i = 0; i < nb; i++) erow[i] *= sc;
+    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
+    free(erow);
+    CUDA_CHECK(cudaMemcpy(mc->d_dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+
+    if (mc->warmups < 2) {
+        mc->warmups++;
+        mtp_draft_launches(t, m, kv, mc);
+    } else {
+        if (!mc->graph) {
+            cudaGraph_t graph;
+            CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            mtp_draft_launches(t, m, kv, mc);
+            CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&mc->graph, graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        CUDA_CHECK(cudaGraphLaunch(mc->graph, cudaStreamPerThread));
+    }
 
     int best = -1;
     CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
@@ -1270,6 +1299,8 @@ extern "C" void mtp_free_device(struct mtp *t) {
     cudaFree(mc->pre); cudaFree(mc->head); cudaFree(mc->out_norm);
     cudaFree(mc->cat); cudaFree(mc->x); cudaFree(mc->h); cudaFree(mc->q); cudaFree(mc->xb);
     cudaFree(mc->o); cudaFree(mc->g1); cudaFree(mc->g2); cudaFree(mc->logits); cudaFree(mc->d_tok);
+    cudaFree(mc->d_dpos);
+    if (mc->graph) cudaGraphExecDestroy(mc->graph);
     free(mc->l);
     free(mc);
     t->cuda = NULL;
