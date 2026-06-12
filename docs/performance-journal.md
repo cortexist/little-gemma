@@ -541,6 +541,26 @@ promises, so the next round starts with ncu on the Orin rather than another
 theory — this journal has been burned twice this week by plausible
 bottleneck stories.
 
+**Round two, ncu-led (same day).** First profile sample looked like an
+occupancy story — 17% achieved on the small k/v matmuls (4–8 CTAs on 8 SMs
+at 128 rows per CTA) — and an adaptive warps-per-CTA launch fixed exactly
+that… for zero total gain, because two sampled launches were not the
+workload: the big gate/up/down matmuls dominate and were already at 72%
+occupancy. (Sampling lesson re-learned within the hour; the fix stays — it
+is correct and free.) The REAL profile of the dominant launches: 72%
+occupancy, **24% SM throughput, with 40% of issue cycles stalled on the MIO
+queue** — the kernel drowns in small shared-memory instructions. The obvious
+counter (fragment-major staging: each lane's A fragments as one 128-bit
+shared load instead of four 32-bit) was built, gated correct, and
+**regressed both devices** — the scattered stores it requires plus the
+128-bit load's four bank phases cost more than the instruction count saved.
+Reverted; third falsified micro-theory this week. Round-two net: Orin E4B
+55.3 → **68.9** (+25%), 12B 21.0 → **26.5** (+26%), A5000 → ~306 (+9%).
+The MIO diagnosis stands and points at structure, not micro-layout: fewer
+shared *transactions per mma* needs more mma per staged byte — 32 rows per
+warp (B fragments amortized twice), or conflict-free swizzled staging done
+properly. Next round.
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):
