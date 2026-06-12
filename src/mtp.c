@@ -156,6 +156,8 @@ struct mtp *mtp_open(const char *path, const struct model *m) {
     t->post = gguf_find_tensor(ctx, "next_token.post_projection.weight");
     if (!t->pre)  t->pre  = gguf_find_tensor(ctx, "nextn.pre_projection.weight");
     if (!t->post) t->post = gguf_find_tensor(ctx, "nextn.post_projection.weight");
+    if (!t->pre)  t->pre  = gguf_find_tensor(ctx, "mtp.pre_projection.weight");   // E4B vintage
+    if (!t->post) t->post = gguf_find_tensor(ctx, "mtp.post_projection.weight");
     t->head = gguf_find_tensor(ctx, "token_embd.weight");
     const struct gguf_tensor *on = gguf_find_tensor(ctx, "output_norm.weight");
     t->out_norm = on ? (const float *)on->data : NULL;
