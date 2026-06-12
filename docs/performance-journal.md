@@ -481,13 +481,30 @@ units this codebase's warp-per-row dot kernel never touches. On the Orin the
 chunk path runs at ~17 GB/s of weight traffic against a ~60 GB/s bus —
 compute-shaped, not bandwidth-shaped, so "weights cross once per chunk"
 stopped being the binding constraint the moment the fused subs fixed the
-re-read bug. Why it never hurt: serve turns are short, decode dominates the
-interactive experience (where little-gemma leads on the Orin), the GPU
-encoder killed the worst prefill case (images), and `-sys` removed the
-skills re-prefill. The honest scorecard: **decode is this project's strong
-axis, prefill is llama.cpp's** — closing it would mean a genuinely tiled
-int8 GEMM and a much larger chunk size, which is llama.cpp's single most
-engineered code path re-done. Known, measured, deliberately not chased (yet).
+re-read bug.
+
+The follow-up investigation (stage profile + chunk-size sweep, both devices)
+pinned it precisely. `LG_PREFILL_PROFILE=1` splits a 1,968-token chunked
+prefill: on the Orin **matmul is 73%** of the time (26.7 s — by itself ~7×
+llama.cpp's whole prefill), attention 16%, elementwise 6%, PLE 5%; on the
+A5000 the split is 56/19/19/6 (launch overhead pads the small kernels under
+WDDM). And the cheap lever is *exhausted*: sweeping `PREFILL_B` 16→32→64
+(byte-identical at every size, decode untouched by construction — the chunk
+path is separate entry points) moved the Orin +1% at 32 and −15% at 64
+(register spills from the `s[NB]` accumulators). The warp-per-row shape
+itself is the ceiling: one warp per output row, weights unpacked through
+serial ALU chains feeding one dp4a stream, ~20 GB/s and ~1 int8-TOPS on a
+device whose bus does 60 and whose dp4a does an order of magnitude more.
+llama.cpp's MMQ runs many warps per shared-memory tile and reuses each
+unpacked weight fragment across both tile axes — different kernel species.
+The honest scorecard: **decode is this project's strong axis, prefill is
+llama.cpp's.** No low-hanging fruit remains; the next rung is a real tiled
+int8 GEMM for the chunk path (a contained, decode-risk-free project — the
+frozen-kernel discipline means prefill kernels can be rewritten wholesale),
+plausibly worth 3–5×, still short of MMQ. Where the gap is *felt*: image
+turns (266 tokens now prefill-bound at ~5 s on Orin after the GPU encoder
+removed the embed cost) and document ingestion; short `-sys`-warmed chat
+turns mostly hide it.
 
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
