@@ -995,6 +995,42 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
 // hidden, so the next draft chains correctly on accept and reject alike. A
 // rejected pair's cache rows are overwritten by the next step before any
 // query at those positions runs — causality makes rollback unnecessary.
+// Device-only slice of the verify: layers at B=2 plus the head at both rows.
+// Everything reads d_pos on-device, so node parameters never vary -> this
+// captures into a static CUDA graph exactly like decode does (the un-captured
+// form costs ~1030 raw launches per step, which is precisely where sync MTP
+// went to die on WDDM machines).
+static void verify_layers_and_head(struct model *m, struct kvcache *kv, int has_ple) {
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
+    rmsnorm_kernel<<<2, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(2 * n_embd));
+    matmul_q_2(d_logits2, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
+    if (c->logit_softcap > 0.0f)
+        softcap_kernel<<<gridn(2 * c->n_vocab), 256>>>(d_logits2, c->logit_softcap, 2 * c->n_vocab);
+    argmax_kernel<<<1, 1024>>>(d_logits2, c->n_vocab, d_best2);
+    argmax_kernel<<<1, 1024>>>(d_logits2 + c->n_vocab, c->n_vocab, d_best2 + 1);
+}
+
+static cudaGraphExec_t g_graph2_exec = NULL;
+static int g_graph2_warmups = 0;
+static void verify_graph(struct model *m, struct kvcache *kv, int has_ple) {
+    if (g_graph2_warmups < 2) {                  // one-time mallocs (ensure_act) finish un-captured
+        g_graph2_warmups++;
+        verify_layers_and_head(m, kv, has_ple);
+        return;
+    }
+    if (!g_graph2_exec) {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        verify_layers_and_head(m, kv, has_ple);
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&g_graph2_exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaGraphLaunch(g_graph2_exec, cudaStreamPerThread));
+}
+
 extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd;
@@ -1013,15 +1049,8 @@ extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
 
     int has_ple = model_has_ple(m);
-    if (has_ple) build_per_layer_n(m, toks, 2, matmul_q_2);
-    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
-
-    rmsnorm_kernel<<<2, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(2 * n_embd));
-    matmul_q_2(d_logits2, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
-    if (c->logit_softcap > 0.0f)
-        softcap_kernel<<<gridn(2 * c->n_vocab), 256>>>(d_logits2, c->logit_softcap, 2 * c->n_vocab);
-    argmax_kernel<<<1, 1024>>>(d_logits2, c->n_vocab, d_best2);
-    argmax_kernel<<<1, 1024>>>(d_logits2 + c->n_vocab, c->n_vocab, d_best2 + 1);
+    if (has_ple) build_per_layer_n(m, toks, 2, matmul_q_2);   // un-captured, like decode's PLE build
+    verify_graph(m, kv, has_ple);
     CUDA_CHECK(cudaMemcpy(out, d_best2, 2 * sizeof(int), cudaMemcpyDeviceToHost));
 
     int adv = out[0] == tok1 ? 2 : 1;
