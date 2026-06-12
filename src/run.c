@@ -409,28 +409,36 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = now_sec() - tp;
 
-    // greedy generation — plain, or speculative at block 2 with -mtp
+    // greedy generation — plain, or speculative at block 2 with -mtp.
+    // g counts EMITTED tokens, so the spec path stops at exactly the same
+    // N_GEN boundary as plain decoding (an accepted draft past the cap is
+    // simply never printed).
     double tg = now_sec();
+    double t_draft = 0, t_verify = 0;
     int g = 0, n_draft = 0, n_accept = 0;
     while (g < N_GEN) {
         if (best == eot || best == eos) break;               // end of turn
         emit_token(tk, best, &in_thought, ch_open, ch_close);
+        g++;
         if (!t) {
             best = model_forward_next(&m, &kv, best, pos++);
-            g++;
             continue;
         }
         // draft the successor of `best`, then verify the pair in one step
+        double t0 = now_sec();
         int draft = mtp_draft(t, &m, &kv, best, pos);
+        double t1 = now_sec();
         int out2[2];
         int adv = model_forward2(&m, &kv, best, draft, pos, out2);
+        t_draft += t1 - t0;
+        t_verify += now_sec() - t1;
         n_draft++;
         pos += adv;
-        g += adv;
         if (adv == 2) {                                      // draft confirmed
             n_accept++;
-            if (draft == eot || draft == eos) { best = draft; continue; }
+            if (draft == eot || draft == eos || g >= N_GEN) { best = draft; continue; }
             emit_token(tk, draft, &in_thought, ch_open, ch_close);
+            g++;
             best = out2[1];
         } else {
             best = out2[0];
@@ -444,8 +452,9 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     fprintf(stderr, "gen:    %d tokens in %.2fs (%.2f tok/s)\n",
             g, t_gen, g / (t_gen > 0 ? t_gen : 1e-9));
     if (t && n_draft)
-        fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%)\n",
-                n_accept, n_draft, 100.0 * n_accept / n_draft);
+        fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
+                n_accept, n_draft, 100.0 * n_accept / n_draft,
+                n_draft, t_draft, 1e3 * t_draft / n_draft, t_verify, 1e3 * t_verify / n_draft);
 
     mtp_free(t);
     kvcache_free(&kv);
