@@ -55,6 +55,11 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 #define PATCH    48
 #define MIN_TOK  252   // gemma4v (E2B/E4B) trains at 252..280 tokens; the 12B
 #define MAX_TOK  280   // accepts down to 40, so always-high-res suits both
+// -n overrides the token budget downward: a robot camera at 1 FPS cares about
+// prefill latency, not detail — 40-64 tokens is a ~300x300 view and prefills
+// in well under a second where 266 takes several. The runner only validates
+// geometry, so any 48-multiple is legal; the model trades acuity for speed.
+static int g_max_tok = MAX_TOK, g_min_tok = MIN_TOK;
 #define RATE     16000
 #define FRAME    640
 
@@ -65,8 +70,8 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 // rounding the reference uses — round first, then sqrt-rescale if out of range).
 static void target_size(int w, int h, int *ow, int *oh) {
     const float fa = (float)PATCH;
-    const long long min_px = (long long)MIN_TOK * PATCH * PATCH;
-    const long long max_px = (long long)MAX_TOK * PATCH * PATCH;
+    const long long min_px = (long long)g_min_tok * PATCH * PATCH;
+    const long long max_px = (long long)g_max_tok * PATCH * PATCH;
     int hb = (int)roundf((float)h / fa) * PATCH;
     int wb = (int)roundf((float)w / fa) * PATCH;
     if (hb < PATCH) hb = PATCH;
@@ -253,6 +258,10 @@ int main(int argc, char **argv) {
             const char *t = argv[++i];
             if (send_frame(s, MEDIA_FRAME_TEXT, 0, 0, t, (uint32_t)strlen(t)) != 0) return 1;
             n_frames++;
+        } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
+            g_max_tok = atoi(argv[++i]);
+            if (g_max_tok < 1) g_max_tok = 1;
+            if (g_min_tok > g_max_tok) g_min_tok = g_max_tok;
         } else {
             question = argv[i];
         }
