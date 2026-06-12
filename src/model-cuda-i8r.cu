@@ -514,10 +514,24 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     }
 }
 
+// Chunk-matmul work by weight type (MACs), for the mma-kernel coverage
+// question: which types must the tensor-core path handle to matter?
+static double g_cov[40];
+static void matmul_coverage_print(void) {
+    double tot = 0;
+    for (int i = 0; i < 40; i++) tot += g_cov[i];
+    if (tot <= 0) return;
+    fprintf(stderr, "chunk matmul coverage by type (%% of MACs):");
+    for (int i = 0; i < 40; i++)
+        if (g_cov[i] > 0) fprintf(stderr, "  type%d %.1f%%", i, 100.0 * g_cov[i] / tot);
+    fprintf(stderr, "\n");
+}
+
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
+    if (t->type < 40) g_cov[t->type] += (double)k * m;
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);

@@ -550,6 +550,7 @@ static void ensure_scratch(struct model *m) {
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static void matmul_coverage_print(void);
 static struct actq actq_for(int k);
 static void act_quantize(const float *d_x, int k);
 
@@ -1030,6 +1031,7 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     if (pf_on() && i > 0)
         fprintf(stderr, "prefill profile (%d chunk tokens): matmul %.2fs, attention %.2fs, elementwise %.2fs, ple %.2fs\n",
                 i, g_pf_mm, g_pf_attn, g_pf_elem, g_pf_ple);
+    if (pf_on() && i > 0) matmul_coverage_print();
     for (; i < n; i++)                                // remainder: the per-token path (no head)
         forward_token(m, kv, tokens[i], pos0 + i, 0);
 }
