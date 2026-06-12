@@ -691,6 +691,143 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         }
 }
 
+// ==== the q6_K twin (mma.m16n8k16) ==========================================
+// Same CTA shape and double-buffered activation staging as the q4_K kernel;
+// what changes is the A side. q6_K carries a per-16-element int8 scale, so the
+// k16 mma covers exactly one sub-block per instruction — exact integer dot,
+// one float scale after, and no min term at all (6-bit values are signed).
+// Validated the same way: .scratch/mma6_test.cu pins the m16n8k16 fragment
+// mapping (A 2 regs row gid/gid+8, B 1 reg col gid, C as in k32) against a
+// double reference before this kernel existed.
+//
+// Two layout notes earned by inspection rather than the profiler:
+// - block_q6_Kr is 212 B: 4-aligned but NOT 16-aligned, so staging reads are
+//   ld32 (like the dp4a path), never uint4.
+// - the unpacked tile is staged SUB-BLOCK-MAJOR ([sjl][16 rows][16 B]): a
+//   linear [row][128] layout has a 32-word row stride, which would land all
+//   eight gid lanes of a fragment read on one bank (8-way serialization);
+//   sub-block-major makes the fragment read's 32 addresses hit 32 banks.
+
+__device__ static uint32_t q6w(uint32_t l, uint32_t h, int hin, int sh) {
+    uint32_t lo = hin ? (l >> 4) & 0x0F0F0F0Fu : l & 0x0F0F0F0Fu;
+    return __vsub4(lo | (((h >> sh) & 0x03030303u) << 4), 0x20202020u);
+}
+
+__global__ static void __launch_bounds__(256)
+matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
+                      const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
+    float2 *sBxds = (float2 *)(sh + 2 * 16 * 256);                 // [2 bufs][16 cols][8]
+    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [warps][2 tiles][8 sjl][16][16]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    const int gid = lane >> 2, tid = lane & 3;
+    const int nbk = k / 256;
+    int8_t *sAw = sA + warp * 2 * 2048;
+    float acc[2][2][4];                                            // [tile][h][slot]
+    #pragma unroll
+    for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
+
+    // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
+    int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
+    const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
+
+    mma_stage_b(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);         // prologue: block 0 in flight
+    asm volatile("cp.async.commit_group;\n");
+
+    for (int blk = 0; blk < nbk; blk++) {
+        int buf = blk & 1;
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();                                           // staged data visible CTA-wide
+        if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
+            mma_stage_b(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            asm volatile("cp.async.commit_group;\n");
+        }
+        const int8_t *sBb = sB + buf * 16 * 256;
+        const float2 *sBxd = sBxds + buf * 16 * 8;
+
+        const block_q6_Kr *hp = (const block_q6_Kr *)(myrow + (size_t)blk * ts);
+        uint32_t sw[4];                                            // my row's 16 int8 scales
+        sw[0] = ((const uint32_t *)hp->scales)[0]; sw[1] = ((const uint32_t *)hp->scales)[1];
+        sw[2] = ((const uint32_t *)hp->scales)[2]; sw[3] = ((const uint32_t *)hp->scales)[3];
+        float dF = d_fp16(hp->d);
+
+        #pragma unroll
+        for (int ni = 0; ni < 2; ni++) {                           // 128-element halves
+            // stage: lane (ar, hi) unpacks 32 ql bytes + their qh bits for
+            // both nibble halves — low nibbles are sub-blocks hi*2/+1, high
+            // nibbles hi*2+4/+5 (same bytes, shifted) — into both tiles
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                int ar = lane & 15, hi = lane >> 4;
+                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                const block_q6_Kr *bp = (const block_q6_Kr *)(wbase + (size_t)row * nbk * ts) + blk;
+                const uint8_t *qlp = bp->ql + ni * 64 + hi * 32;
+                const uint8_t *qhp = bp->qh + ni * 32;
+                int8_t *sAt = sAw + t * 2048 + ar * 16;
+                int shl = hi * 2;
+                #pragma unroll
+                for (int c = 0; c < 2; c++) {                      // 16-byte halves of the 32
+                    uint32_t *plo = (uint32_t *)(sAt + (hi * 2 + c) * 256);
+                    uint32_t *phi = (uint32_t *)(sAt + (hi * 2 + 4 + c) * 256);
+                    #pragma unroll
+                    for (int wi = 0; wi < 4; wi++) {
+                        uint32_t l = ld32(qlp + c * 16 + wi * 4), q = ld32(qhp + c * 16 + wi * 4);
+                        plo[wi] = q6w(l, q, 0, shl);
+                        phi[wi] = q6w(l, q, 1, shl + 4);
+                    }
+                }
+            }
+            __syncwarp();
+            #pragma unroll
+            for (int sjl = 0; sjl < 8; sjl++) {                    // one k16 sub-block per mma
+                int sj = ni * 8 + sjl;
+                float dscL = dF * (int8_t)(sw[sj >> 2] >> (8 * (sj & 3)));
+                float dsc[2][2];                                   // [tile][row-half]
+                #pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    dsc[t][0] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid);
+                    dsc[t][1] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid + 8);
+                }
+                int ga = ni * 4 + (sjl >> 1);                      // activation 32-group
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    int colb = h * 8 + gid;
+                    uint32_t b0 = *(uint32_t *)(sBb + colb * 256 + ni * 128 + sjl * 16 + tid * 4);
+                    float2 xd0 = sBxd[(h * 8 + tid * 2) * 8 + ga];
+                    float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * 8 + ga];
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {                  // both tiles ride one B load
+                        const int8_t *sAt = sAw + t * 2048 + sjl * 256;
+                        uint32_t a0 = *(uint32_t *)(sAt + gid * 16 + tid * 4);
+                        uint32_t a1 = *(uint32_t *)(sAt + (gid + 8) * 16 + tid * 4);
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                            "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "r"(a0), "r"(a1), "r"(b0));
+                        acc[t][h][0] += xd0.x * dsc[t][0] * (float)c0;
+                        acc[t][h][1] += xd1.x * dsc[t][0] * (float)c1;
+                        acc[t][h][2] += xd0.x * dsc[t][1] * (float)c2;
+                        acc[t][h][3] += xd1.x * dsc[t][1] * (float)c3;
+                    }
+                }
+            }
+            __syncwarp();                                          // all reads done before re-stage
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 2; t++)
+        for (int h = 0; h < 2; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
+            if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
+            if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+        }
+}
+
 // Chunk-matmul work by weight type (MACs), for the mma-kernel coverage
 // question: which types must the tensor-core path handle to matter?
 static double g_cov[40];
@@ -711,13 +848,20 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type < 40) g_cov[t->type] += (double)k * m;
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
-    if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
+    if ((t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K) && PREFILL_B == 16 && !no_mma) {
         static int sms = 0;
         if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
         int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
         while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
-        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * 32;
-        matmul_q4k_mma_kernel<<<(m + 32 * wpc - 1) / (32 * wpc), 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        int blocks = (m + 32 * wpc - 1) / (32 * wpc);
+        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2);   // B staging, common
+        if (t->type == GGML_TYPE_Q4_K) {
+            shm += (size_t)wpc * 2 * 2 * 16 * 32;                  // A: [tile][half][16][32]
+            matmul_q4k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        } else {
+            shm += (size_t)wpc * 2 * 2048;                         // A: [tile][8 sjl][16][16]
+            matmul_q6k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        }
         return;
     }
     int rows_per_block = 256 / 32;
