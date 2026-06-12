@@ -110,6 +110,13 @@ run -c <socket>
   audio frames.
 - `-mtp` → also load a gemma4-assistant draft head and decode speculatively;
   see "Speculative decoding" below. Output is identical, only speed changes.
+- `-sys <file>` → prefill the file as a system turn ONCE at server start;
+  every `-s` session then begins with it already in context. This is the
+  skills-in-context pattern without the TTFT tax: a client that reconnects
+  per exchange (a robot, an agent pipeline) stops re-paying the skills
+  prefill on every connection — the saved cache rows are restored at session
+  start (a long previous session can wrap the sliding-window rings over
+  them), so each conversation starts byte-identically fresh.
 
 ```
 > run -m model.gguf -p "The capital of France is"
