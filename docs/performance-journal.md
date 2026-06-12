@@ -519,6 +519,28 @@ stay byte-identical if per-sub-block scale order is preserved — but it is a
 rewrite of the kernel's whole shape, not an afternoon. (Experiment preserved
 in history: WIP commit + revert, c02cbe9.)
 
+**The mma kernel, round one (shipped).** Built in three gated steps: a
+coverage probe (q4_K is 85% of chunk MACs on both Q4_K_M models — v1 handles
+only it, everything else stays dp4a), a correctness skeleton validated
+against a double-precision reference in a standalone harness (where the
+tensor-core ordering measured slightly *closer* to the truth than the
+shipping kernel, 1.01e-3 vs 1.14e-3 max rel err — the artifact behind this
+path's gate relaxation), then the production kernel: per CTA 128 rows × 16
+columns, one `mma.m16n8k32` pair per sub-block, nibble pairs unpacked once
+per shared 32-byte qs span, block headers held in lane registers with
+shuffle-broadcast scale pairs, and double-buffered `cp.async` activation
+staging (which bought +17% on the A5000 and ~nothing on the Orin — and
+briefly shipped with an unreachable branch that silently skipped staging the
+scale pairs; the output-equality gate caught it inside one test cycle).
+Result: **Orin E4B prefill 55.3 → 68.8 tok/s (+25%), 12B 21.0 → 26.5
+(+26%); A5000 281 → 306 (+9%)** — deterministic, output equal to the dp4a
+path on every test prompt, decode and MTP byte-identity untouched
+(`LG_NO_MMA=1` reverts at runtime). Honest position: the implied q4_K-kernel
+speedup is ~1.45×, far from the ~5× the instruction-density argument
+promises, so the next round starts with ncu on the Orin rather than another
+theory — this journal has been burned twice this week by plausible
+bottleneck stories.
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):
