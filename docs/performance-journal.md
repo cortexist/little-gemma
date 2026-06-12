@@ -573,6 +573,49 @@ prompt: E4B 55 → 78 (1.41×), 12B 21 → 30 (1.43×); against llama.cpp's
 500/207 the ratio moved from ~0.11 to ~0.15 — honest distance remaining,
 honest progress made, every step gated.
 
+**The camera budget (2026-06-12).** The production target got concrete: a
+robot camera feeding one frame per second, reduced resolution, **prefill
+under 0.5 s per frame**. That budget is paid in *chunk passes* — each
+16-token chunk streams the full weights once, ~170-180 ms on Orin E4B — and
+a short turn was spending most of its time outside the chunks entirely:
+every leftover token under 16 ran as a single, a full decode pass each.
+Fix: **pad the remainder to a full chunk** (repeat the last real token; the
+pad rows' KV is overwritten by the next segment before anything reads it —
+every consumer writes position p before its attention reads p). Real rows'
+math is the chunk path's, byte-identical; the only output change vs the
+*old binary* was one late greedy-tie flip on one prompt, the relaxed-gate
+class this journal already admits. A 71-token E4B image turn: 2.92 → 0.97 s;
+the 12B's 54-token turn: 3.57 → 2.20 s.
+
+Then the encoder got the same scrutiny, and gave up its factor of five in
+two one-screen commits. The GPU encoder's GEMM was a classic 16×16 tile —
+and its inner loop read `w[threadIdx.x][i]`, a 16-float stride that lands a
+warp's 16 columns on **2 of the 32 shared banks**: 8-way serialization on
+the hottest load in the kernel. One pad column (`w[TS][TS+1]`) spreads them
+across 16 banks — a one-line change, float order untouched, byte-identical:
+35-token embed 1.1 → 0.5 s. Then the structural twin of the chunk path's
+own lesson: 16-position tiles re-streamed the entire ~300 MB encoder once
+per tile row (~20× per camera frame). Register tiling — 64×64 output tiles,
+each thread holding 4×4 outputs, k-slabs staged k-major so a thread's four
+values are one float4 read — streams weights once per 64 positions and
+feeds 16 FMAs per 8 shared loads. Ascending-k accumulation per output is
+unchanged, so results stayed byte-identical (the `LG_MEDIA_VERIFY` oracle
+diffs are bit-for-bit the same before and after). Encoder embed, Orin E4B,
+warm: 35-token **1.1 → 0.2 s**, 54-token 1.8 → 0.3, 266-token 10.5 → 3.6.
+
+Scorecard against the budget, Orin E4B at `-n 40` (35 image tokens, quality
+spot-checked intact): embed 0.2 s ✓, turn prefill 0.82 s ✗ — the frame
+loop now fits 1 FPS, but prefill is still 1.6× the 0.5 s target. The math
+of what remains: the 52-token turn spends **5 chunk passes** because run.c
+prefills leading text, image rows, and trailing text as three separate
+calls, each padding up to its own chunk boundary; perfectly packed it would
+be 4, and 0.5 s buys ~3 at today's kernel. So the remaining levers, in
+order: pack the turn into one stream (an API seam change — segments must
+carry token ids for PLE alongside embedding rows), the q6_K mma variant
+(~25% of chunk matmul time still rides dp4a), and trimming the turn under
+48 tokens. The 12B is parked for camera duty: 370 ms per chunk pass puts
+even a perfectly packed turn at ~1.1 s.
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):
