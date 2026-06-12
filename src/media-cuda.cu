@@ -42,26 +42,46 @@ struct vcuda {
 
 // ---- kernels ----------------------------------------------------------------
 
-// C[t][n] = A[t][k] . W[n][k] — classic 16x16 shared-memory tiles, weights f16.
-// The w tile is padded one column: the dot loop reads w[threadIdx.x][i], a
-// 16-float stride that would land a warp's 16 columns on 2 of the 32 shared
-// banks (8-way serialization, on the loop's hottest load). One pad column
-// makes the stride 17 and the 16 addresses hit 16 distinct banks.
-#define TS 16
+// C[t][n] = A[t][k] . W[n][k] — 64x64 register-tiled GEMM: 16x16 threads, each
+// holding a 4x4 patch of outputs in registers. Two wins over the plain 16x16
+// tiling this replaced: every weight slab is read from global memory once per
+// 64 positions instead of per 16 (the whole encoder, ~300MB, was re-streamed
+// once per tile row), and the inner loop's 8 shared loads feed 16 FMAs where
+// the old loop paid 2 loads per FMA. The k-slabs are staged k-major so a
+// thread's 4 a-values and 4 w-values are each one float4 read. Each output
+// still accumulates in plain ascending-k order: same floats, same order,
+// byte-identical results — only the thread-to-output mapping changed.
+#define TS 16                   // k-slab depth, and threads per block side
+#define BT 64                   // output tile side (4 outputs per thread per side)
 static __global__ void k_gemm(float *C, const float *A, const __half *W, int T, int K, int N) {
-    __shared__ float a[TS][TS], w[TS][TS + 1];
-    int tn = blockIdx.x * TS + threadIdx.x;             // output column = weight row
-    int tt = blockIdx.y * TS + threadIdx.y;             // position
-    float acc = 0.0f;
+    __shared__ float a[TS][BT + 4], w[TS][BT + 4];      // +4: float4-aligned, conflict-free
+    int t0 = blockIdx.y * BT, n0 = blockIdx.x * BT;
+    int tid = threadIdx.y * TS + threadIdx.x;
+    float acc[4][4] = { 0 };
     for (int k0 = 0; k0 < K; k0 += TS) {
-        int wr = blockIdx.x * TS + threadIdx.y;         // weight row this thread stages
-        a[threadIdx.y][threadIdx.x] = tt < T ? A[(size_t)tt * K + k0 + threadIdx.x] : 0.0f;
-        w[threadIdx.y][threadIdx.x] = wr < N ? __half2float(W[(size_t)wr * K + k0 + threadIdx.x]) : 0.0f;
+        for (int e = tid; e < BT * TS; e += TS * TS) {  // stage both slabs, k-major
+            int r = e >> 4, i = e & (TS - 1);
+            a[i][r] = t0 + r < T ? A[(size_t)(t0 + r) * K + k0 + i] : 0.0f;
+            w[i][r] = n0 + r < N ? __half2float(W[(size_t)(n0 + r) * K + k0 + i]) : 0.0f;
+        }
         __syncthreads();
-        for (int i = 0; i < TS; i++) acc += a[threadIdx.y][i] * w[threadIdx.x][i];
+        for (int i = 0; i < TS; i++) {
+            float av[4], wv[4];
+            *(float4 *)av = *(const float4 *)&a[i][threadIdx.y * 4];
+            *(float4 *)wv = *(const float4 *)&w[i][threadIdx.x * 4];
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++) acc[y][x] += av[y] * wv[x];
+        }
         __syncthreads();
     }
-    if (tt < T && tn < N) C[(size_t)tt * N + tn] = acc;
+    for (int y = 0; y < 4; y++) {
+        int tt = t0 + threadIdx.y * 4 + y;
+        if (tt >= T) break;
+        for (int x = 0; x < 4; x++) {
+            int tn = n0 + threadIdx.x * 4 + x;
+            if (tn < N) C[(size_t)tt * N + tn] = acc[y][x];
+        }
+    }
 }
 
 // out[row] = rms_norm(in[row]) * w   (w NULL = plain norm). One block per row.
@@ -298,8 +318,8 @@ extern "C" float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w
     free(F); free(pa);
 
     dim3 blk(TS, TS);
-    dim3 g_sq((ne + TS - 1) / TS, (np + TS - 1) / TS);          // [np][768] outputs
-    dim3 g_up((4 * ne + TS - 1) / TS, (np + TS - 1) / TS);      // [np][3072]
+    dim3 g_sq((ne + BT - 1) / BT, (np + BT - 1) / BT);          // [np][768] outputs
+    dim3 g_up((4 * ne + BT - 1) / BT, (np + BT - 1) / BT);      // [np][3072]
     int nadd = (int)(((size_t)np * ne + 255) / 256);
 
     k_gemm<<<g_sq, blk>>>(vc->X, vc->F, vc->patch16, np, ne, ne);
@@ -329,7 +349,7 @@ extern "C" float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w
 
     int out_x = n_cols / mg, out_y = n_rows / mg, n = out_x * out_y;
     k_pool<<<n, 256>>>(vc->pooled, vc->X, n_cols, out_x, ne, sqrtf((float)ne));
-    k_gemm<<<dim3((md->n_embd + TS - 1) / TS, (n + TS - 1) / TS), blk>>>
+    k_gemm<<<dim3((md->n_embd + BT - 1) / BT, (n + BT - 1) / BT), blk>>>
         (vc->rows, vc->pooled, vc->mmv, n, ne, md->n_embd);
     k_rms<<<n, 256>>>(vc->rows, vc->rows, NULL, md->n_embd, eps);
 
