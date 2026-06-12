@@ -559,7 +559,19 @@ Reverted; third falsified micro-theory this week. Round-two net: Orin E4B
 The MIO diagnosis stands and points at structure, not micro-layout: fewer
 shared *transactions per mma* needs more mma per staged byte — 32 rows per
 warp (B fragments amortized twice), or conflict-free swizzled staging done
-properly. Next round.
+properly.
+
+**Round three: the structural answer worked.** Two 16-row tiles per warp —
+every B fragment pair and xds scale read now feeds two mma instead of one —
+took the Orin to **E4B 78.2 prompt tok/s (+41% over dp4a) and 12B 30.0
+(+43%)**, deterministic, output still equal to the dp4a path. The dominant
+launch went 734 → 513 µs with SM throughput up at 27% — while *occupancy
+fell* to 43% (sixteen accumulator floats per lane cost registers), which is
+the next visible lever: a register diet to win CTAs back, or eating further
+into the MIO stall that remains. Prefill journey so far, Orin, 1,982-token
+prompt: E4B 55 → 78 (1.41×), 12B 21 → 30 (1.43×); against llama.cpp's
+500/207 the ratio moved from ~0.11 to ~0.15 — honest distance remaining,
+honest progress made, every step gated.
 
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
