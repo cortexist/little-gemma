@@ -570,8 +570,13 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
     }
 }
 
-__global__ static void __launch_bounds__(256, 4)   // 4 CTAs/SM: 64-reg cap (was 80 free-running,
-matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,   // = 3 CTAs and 43% occupancy)
+// Plain launch bounds on purpose: capping to 64 regs for a 4th CTA (and the
+// max shared carveout that would seat it) BOTH regressed the Orin — tighter
+// scheduling and a smaller L1 cost more than the occupancy bought. 80 regs,
+// 3 CTAs, 43% occupancy is this shape's measured optimum; round 4's notes
+// have the numbers.
+__global__ static void __launch_bounds__(256)
+matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                       const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
