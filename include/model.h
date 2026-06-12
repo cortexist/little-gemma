@@ -72,10 +72,24 @@ struct kvcache {
     int    *f16;       // per layer: 1 if rows are stored as f16 (global layers)
     void  **k;         // per layer: [seq * kv_dim] f32 or f16, NULL if reusing
     void  **v;
+    void  **px_k;      // saved system-prefix rows (see kvcache_save_prefix), or NULL
+    void  **px_v;
 };
 
 int  kvcache_init(struct kvcache *kv, const struct model *m, int max_seq);
 void kvcache_free(struct kvcache *kv);
+
+// The system-prefix trick that rescues TTFT for skills-in-context serving:
+// prefill the skills turn ONCE at server start, save its cache rows, and
+// restore them at each session start so every conversation begins at position
+// n already knowing the skills — instead of re-prefilling them per session.
+// Global layers' rows below n can never be overwritten (sessions only write
+// at their own positions), but the sliding-window RINGS wrap during a long
+// session and clobber prefix rows — restore repairs them. Per owning layer
+// the saved state is the first min(n, seq) rows, which is the exact ring
+// content at position n whether or not the prefix itself wrapped.
+void kvcache_save_prefix(struct kvcache *kv, int n);
+void kvcache_restore_prefix(struct kvcache *kv, int n);
 
 // Run one token at sequence position `pos` (0-based). Reads/writes the kv cache
 // and writes cfg.n_vocab logits into `logits` (caller-allocated). This is the

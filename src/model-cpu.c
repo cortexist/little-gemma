@@ -15,6 +15,33 @@
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
 const int model_kv_host = 1;     // this backend's kvcache rows are host memory
 
+void kvcache_save_prefix(struct kvcache *kv, int n) {
+    kv->px_k = calloc((size_t)kv->n_layer, sizeof(void *));
+    kv->px_v = calloc((size_t)kv->n_layer, sizeof(void *));
+    if (!kv->px_k || !kv->px_v) return;
+    for (int L = 0; L < kv->n_layer; L++) {
+        if (!kv->k[L]) continue;                       // reuse layer: nothing stored
+        int rows = n < kv->seq[L] ? n : kv->seq[L];
+        size_t bytes = (size_t)rows * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
+        kv->px_k[L] = malloc(bytes);
+        kv->px_v[L] = malloc(bytes);
+        if (!kv->px_k[L] || !kv->px_v[L]) return;
+        memcpy(kv->px_k[L], kv->k[L], bytes);
+        memcpy(kv->px_v[L], kv->v[L], bytes);
+    }
+}
+
+void kvcache_restore_prefix(struct kvcache *kv, int n) {
+    if (!kv->px_k) return;
+    for (int L = 0; L < kv->n_layer; L++) {
+        if (!kv->px_k[L]) continue;
+        int rows = n < kv->seq[L] ? n : kv->seq[L];
+        size_t bytes = (size_t)rows * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
+        memcpy(kv->k[L], kv->px_k[L], bytes);
+        memcpy(kv->v[L], kv->px_v[L], bytes);
+    }
+}
+
 // The verify pair, sequentially: byte-identical to plain decoding by
 // construction (they ARE the same forwards), and last_hidden lands on the
 // last valid position automatically — the second forward only runs on accept.
@@ -178,6 +205,7 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer;
     kv->max_seq = max_seq;
+    kv->px_k = kv->px_v = NULL;
     kv->kv_dim = calloc((size_t)c->n_layer, sizeof(int));
     kv->seq = calloc((size_t)c->n_layer, sizeof(int));
     kv->f16 = calloc((size_t)c->n_layer, sizeof(int));
@@ -210,8 +238,11 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
 void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
     for (int L = 0; L < kv->n_layer; L++) { free(kv->k[L]); free(kv->v[L]); }
+    if (kv->px_k) for (int L = 0; L < kv->n_layer; L++) { free(kv->px_k[L]); free(kv->px_v[L]); }
+    free(kv->px_k); free(kv->px_v);
     free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq); free(kv->f16);
     kv->k = kv->v = NULL; kv->kv_dim = kv->seq = kv->f16 = NULL;
+    kv->px_k = kv->px_v = NULL;
 }
 
 // ---- the forward pass -----------------------------------------------------

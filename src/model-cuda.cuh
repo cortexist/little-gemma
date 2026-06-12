@@ -558,6 +558,7 @@ static void act_quantize(const float *d_x, int k);
 extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer; kv->max_seq = max_seq;
+    kv->px_k = kv->px_v = NULL;
     kv->kv_dim = (int *)calloc((size_t)c->n_layer, sizeof(int));
     kv->seq = (int *)calloc((size_t)c->n_layer, sizeof(int));
     kv->f16 = (int *)calloc((size_t)c->n_layer, sizeof(int));
@@ -587,8 +588,39 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
 extern "C" void kvcache_free(struct kvcache *kv) {
     if (!kv) return;
     for (int L = 0; L < kv->n_layer; L++) { cudaFree(kv->k[L]); cudaFree(kv->v[L]); }
+    if (kv->px_k) for (int L = 0; L < kv->n_layer; L++) { cudaFree(kv->px_k[L]); cudaFree(kv->px_v[L]); }
+    free(kv->px_k); free(kv->px_v);
     free(kv->k); free(kv->v); free(kv->kv_dim); free(kv->seq); free(kv->f16);
     kv->k = kv->v = NULL; kv->kv_dim = kv->seq = kv->f16 = NULL;
+    kv->px_k = kv->px_v = NULL;
+}
+
+// System-prefix save/restore (see model.h): device-to-device copies of the
+// first min(n, seq) rows of every owning layer. Restore rides the per-thread
+// stream, so it is ordered before the session's first prefill launch.
+extern "C" void kvcache_save_prefix(struct kvcache *kv, int n) {
+    kv->px_k = (void **)calloc((size_t)kv->n_layer, sizeof(void *));
+    kv->px_v = (void **)calloc((size_t)kv->n_layer, sizeof(void *));
+    if (!kv->px_k || !kv->px_v) return;
+    for (int L = 0; L < kv->n_layer; L++) {
+        if (!kv->k[L]) continue;
+        int rows = n < kv->seq[L] ? n : kv->seq[L];
+        size_t bytes = (size_t)rows * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
+        CUDA_CHECK(cudaMalloc(&kv->px_k[L], bytes));
+        CUDA_CHECK(cudaMalloc(&kv->px_v[L], bytes));
+        CUDA_CHECK(cudaMemcpy(kv->px_k[L], kv->k[L], bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(kv->px_v[L], kv->v[L], bytes, cudaMemcpyDeviceToDevice));
+    }
+}
+extern "C" void kvcache_restore_prefix(struct kvcache *kv, int n) {
+    if (!kv->px_k) return;
+    for (int L = 0; L < kv->n_layer; L++) {
+        if (!kv->px_k[L]) continue;
+        int rows = n < kv->seq[L] ? n : kv->seq[L];
+        size_t bytes = (size_t)rows * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
+        CUDA_CHECK(cudaMemcpyAsync(kv->k[L], kv->px_k[L], bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(kv->v[L], kv->px_v[L], bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    }
 }
 
 // ====================  forward pass (device-resident)  ======================

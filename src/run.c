@@ -135,7 +135,8 @@ static int recv_n(sock_t s, void *buf, int n) {
     return 0;
 }
 
-static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj) {
+static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
+                  const char *syspath) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
     struct model m;
@@ -149,6 +150,49 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     }
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
+
+    // The system prefix (-sys): the skills/guidelines turn is prefilled ONCE
+    // here and its cache rows saved; every session then starts at position
+    // n_sys with the skills already in context, instead of paying their whole
+    // prefill again per connection — the difference between an instant first
+    // token and a many-second one when the skills run long (robotic chat
+    // reconnects per exchange). BOS lives in this prefix when it exists.
+    int n_sys = 0;
+    if (syspath) {
+        FILE *f = fopen(syspath, "rb");
+        char *text = NULL;
+        long fl = 0;
+        if (f) { fseek(f, 0, SEEK_END); fl = ftell(f); fseek(f, 0, SEEK_SET); }
+        if (!f || fl <= 0 || fl > 12000 || !(text = malloc((size_t)fl + 32)) ||
+            fread(text, 1, (size_t)fl, f) != (size_t)fl) {
+            fprintf(stderr, "-sys: cannot read %s (must be 1..12000 bytes)\n", syspath);
+            if (f) fclose(f);
+            free(text);
+            return;
+        }
+        fclose(f);
+        while (fl > 0 && (text[fl - 1] == '\n' || text[fl - 1] == '\r')) fl--;
+        text[fl] = 0;
+        size_t cap = (size_t)fl + 64;
+        char *chat = malloc(cap);
+        int *sysv = malloc(4096 * sizeof(int));
+        if (!chat || !sysv) { free(text); free(chat); free(sysv); return; }
+        snprintf(chat, cap, "<|turn>system\n%s<turn|>\n", text);
+        int n = tokenizer_encode(tk, chat, sysv, 4096);
+        free(text); free(chat);
+        if (n <= 0 || n >= 4096 || n + 256 >= SERVE_SEQ) {
+            fprintf(stderr, "-sys: prefix is %d tokens — too long for this server\n", n);
+            free(sysv);
+            return;
+        }
+        double t0 = now_sec();
+        model_prefill(&m, &kv, sysv, n, 0);
+        kvcache_save_prefix(&kv, n);
+        free(sysv);
+        n_sys = n;
+        fprintf(stderr, "system prefix: %d tokens prefilled once in %.2fs (%s)\n",
+                n_sys, now_sec() - t0, syspath);
+    }
 
     sock_t ls = INVALID_SOCKET;
     struct sockaddr_un sa;
@@ -186,7 +230,10 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         sock_t c = accept(ls, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
         fprintf(stderr, "session start\n");
-        int pos = 0;                                     // kv cache restarts with each session
+        int pos = n_sys;                                 // each session restarts right after the
+        kvcache_restore_prefix(&kv, n_sys);              // system prefix (at 0 when there is none);
+                                                         // restore repairs ring rows a long previous
+                                                         // session may have wrapped over
         char line[8192], chat[8704];
         int promptv[4096];
         for (;;) {
@@ -252,11 +299,12 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             // encoded+prefilled in one go right before each media span, whose
             // rows then prefill as embeddings; the question line closes the
             // turn. Only the very first encode of the conversation keeps its
-            // BOS; the first turn opens it, later turns first close the
+            // BOS (when a -sys prefix exists, the BOS already lives there);
+            // the first turn opens plainly, later turns first close the
             // previous model turn, whose <turn|> was never fed back.
-            int skip = pos == 0 ? 0 : 1;                 // tokenizer_encode always prepends BOS
+            int skip = (pos == 0) ? 0 : 1;               // tokenizer_encode always prepends BOS
             int n = 0, total = 0, best;
-            int tl = snprintf(chat, sizeof chat, pos == 0 ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
+            int tl = snprintf(chat, sizeof chat, pos == n_sys ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
             for (int i = 0; i < n_seg; i++) {
                 if (seg[i].kind == MEDIA_FRAME_TEXT) {
                     tl += snprintf(chat + tl, sizeof chat - tl, "%s", seg[i].text);
@@ -463,7 +511,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL;
+    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL, *syspath = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
@@ -471,10 +519,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c") && i + 1 < argc)  cpath  = argv[++i];
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
         else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
+        else if (!strcmp(argv[i], "-sys") && i + 1 < argc) syspath = argv[++i];
     }
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
-        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-p \"prompt\" | -s <socket>]\n"
+        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-sys <skills.txt>] [-p \"prompt\" | -s <socket>]\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
@@ -487,7 +536,7 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
-    if (spath)       serve(ctx, spath, mmproj);
+    if (spath)       serve(ctx, spath, mmproj, syspath);
     else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);
