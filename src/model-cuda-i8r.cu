@@ -557,12 +557,12 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [16 cols][256] one block span
     float2 *sBxds = (float2 *)(sh + 16 * 256);                     // [16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 16 * 256 + 16 * 8 * 8);        // [8 warps][16 rows][32]
+    int8_t *sA    = (int8_t *)(sh + 16 * 256 + 16 * 8 * 8);        // [8 warps][2 halves][16 rows][32]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = blockIdx.x * 128 + warp * 16;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
-    int8_t *sAw = sA + warp * 16 * 32;
+    int8_t *sAw = sA + warp * 2 * 16 * 32;
     float acc[2][4];
     #pragma unroll
     for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[h][s] = 0.0f;
@@ -587,49 +587,56 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         uint32_t s2 = ((const uint32_t *)hp->scales)[2];
         float dD, dM; d_dm(&hp->d, &dD, &dM);
 
-        for (int sj = 0; sj < 8; sj++) {
-            uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
-            float dscL = dD * sc, mnmL = dM * mm;                  // my ROW's pair, in my lane
-            int qoff = (sj >> 1) * 32, half = sj & 1;
-
-            // stage this sub-block's 16 rows x 32 unpacked s8 (warp-synchronous)
+        for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS:
+            int qoff = sjp * 32;                                   // they share the same 32 qs
+            // bytes, so one load pass stages both unpacked halves (sAw holds 2 sub-blocks)
             {
                 int ar = lane & 15, hi = lane >> 4;                // row, which 16B half
                 const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)(r0 + ar < m ? r0 + ar : m - 1) * nbk * ts) + blk;
                 uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
-                uint32_t *dst = (uint32_t *)(sAw + ar * 32 + hi * 16);
-                dst[0] = (uint32_t)nib4(q4.x, half); dst[1] = (uint32_t)nib4(q4.y, half);
-                dst[2] = (uint32_t)nib4(q4.z, half); dst[3] = (uint32_t)nib4(q4.w, half);
+                uint32_t *lo = (uint32_t *)(sAw + ar * 32 + hi * 16);
+                uint32_t *hh = (uint32_t *)(sAw + 16 * 32 + ar * 32 + hi * 16);
+                lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
+                lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
+                hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
+                hh[2] = (uint32_t)nib4(q4.z, 1); hh[3] = (uint32_t)nib4(q4.w, 1);
             }
             __syncwarp();
-            uint32_t a0 = *(uint32_t *)(sAw + gid * 32 + tid * 4);
-            uint32_t a1 = *(uint32_t *)(sAw + (gid + 8) * 32 + tid * 4);
-            uint32_t a2 = *(uint32_t *)(sAw + gid * 32 + tid * 4 + 16);
-            uint32_t a3 = *(uint32_t *)(sAw + (gid + 8) * 32 + tid * 4 + 16);
-            __syncwarp();                                          // frags read before next overwrite
-
-            float dsc0 = __shfl_sync(0xffffffffu, dscL, gid);
-            float dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
-            float mnm0 = __shfl_sync(0xffffffffu, mnmL, gid);
-            float mnm1 = __shfl_sync(0xffffffffu, mnmL, gid + 8);
-
             #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                int colb = h * 8 + gid;
-                uint32_t b0 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4);
-                uint32_t b1 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4 + 16);
-                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                    : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-                float2 xd0 = sBxds[(h * 8 + tid * 2) * 8 + sj];
-                float2 xd1 = sBxds[(h * 8 + tid * 2 + 1) * 8 + sj];
-                acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
-                acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
-                acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
-                acc[h][3] += xd1.x * (dsc1 * (float)c3 - mnm1 * xd1.y);
+            for (int half = 0; half < 2; half++) {
+                int sj = sjp * 2 + half;
+                uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
+                float dscL = dD * sc, mnmL = dM * mm;              // my ROW's pair, in my lane
+                const int8_t *sAh = sAw + half * 16 * 32;
+                uint32_t a0 = *(uint32_t *)(sAh + gid * 32 + tid * 4);
+                uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4);
+                uint32_t a2 = *(uint32_t *)(sAh + gid * 32 + tid * 4 + 16);
+                uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4 + 16);
+
+                float dsc0 = __shfl_sync(0xffffffffu, dscL, gid);
+                float dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
+                float mnm0 = __shfl_sync(0xffffffffu, mnmL, gid);
+                float mnm1 = __shfl_sync(0xffffffffu, mnmL, gid + 8);
+
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    int colb = h * 8 + gid;
+                    uint32_t b0 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4);
+                    uint32_t b1 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4 + 16);
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    float2 xd0 = sBxds[(h * 8 + tid * 2) * 8 + sj];
+                    float2 xd1 = sBxds[(h * 8 + tid * 2 + 1) * 8 + sj];
+                    acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
+                    acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
+                    acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
+                    acc[h][3] += xd1.x * (dsc1 * (float)c3 - mnm1 * xd1.y);
+                }
             }
+            __syncwarp();                                          // both halves read before re-stage
         }
     }
 
@@ -663,7 +670,7 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
-        size_t shm = 16 * 256 + 16 * 8 * sizeof(float2) + 8 * 16 * 32;   // sB + sBxds + sA = 9 KB
+        size_t shm = 16 * 256 + 16 * 8 * sizeof(float2) + 8 * 2 * 16 * 32;   // sB + sBxds + sA = 13 KB
         matmul_q4k_mma_kernel<<<(m + 127) / 128, 256, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         return;
     }
