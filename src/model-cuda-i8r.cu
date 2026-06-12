@@ -570,8 +570,8 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
     }
 }
 
-__global__ static void __launch_bounds__(256)
-matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
+__global__ static void __launch_bounds__(256, 4)   // 4 CTAs/SM: 64-reg cap (was 80 free-running,
+matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,   // = 3 CTAs and 43% occupancy)
                       const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
