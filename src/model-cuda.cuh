@@ -1,6 +1,6 @@
-// Shared CUDA backend: everything except the matmul. Included by exactly one
-// compute file per binary — model-cuda-f32.cu (f32 dequant dot) or
-// model-cuda-i8r.cu (int8 dot) — each of which defines matmul_q. The forward
+﻿// Shared CUDA backend: everything except the matmul. Included by exactly one
+// compute file per binary â€” model-cuda-f32.cu (f32 dequant dot) or
+// model-cuda-i8r.cu (int8 dot) â€” each of which defines matmul_q. The forward
 // pass, the kv cache, and every non-matmul kernel (rmsnorm, rope, attention,
 // elementwise) are identical across both, so they live here. This is a
 // single-include unit, not a normal header: it holds definitions, and the
@@ -25,7 +25,7 @@ extern "C" {
 
 // kvcache rows live on the device here, and so will the draft head: the CUDA
 // MTP port (device-side assistant + batched verify + async overlap) is the
-// in-progress follow-up — until it lands, drafting on this backend declines.
+// in-progress follow-up â€” until it lands, drafting on this backend declines.
 extern "C" const int model_kv_host = 0;
 
 // The device draft is implemented at the end of this file (it needs d_attn,
@@ -75,7 +75,7 @@ __device__ static void d_gsm(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
 // vanishes; the int8 backend hands out its buffers via actq_for (seam, below).
 
 // Per 32-element group: the int8 values, plus scale and value-sum packed as one
-// float2 — a single load serves both (the sum is ≤ 32·127, exact as a float).
+// float2 â€” a single load serves both (the sum is â‰¤ 32Â·127, exact as a float).
 struct actq { int8_t *xq; float2 *xds; };
 static const struct actq AQ0 = { NULL, NULL };
 
@@ -93,7 +93,7 @@ __device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
 // ====================  non-matmul compute kernels  =========================
 
 // RMSNorm over `rows` vectors of length n. w (length n, shared across rows) or NULL.
-// One block per row — 1024 threads for the lone full-width row (a 256-thread
+// One block per row â€” 1024 threads for the lone full-width row (a 256-thread
 // block leaves the SM mostly idle and every other SM entirely idle), 256 for
 // the small per-head rows.
 #define NORM_THREADS(n) ((n) >= 1024 ? 1024 : 256)
@@ -118,7 +118,7 @@ __global__ static void rmsnorm_kernel(float *out, const float *x, const float *w
 }
 
 // The tail of every sub-layer is "rmsnorm the output, add it to the residual,
-// maybe scale" — three round-trips through global memory as separate kernels.
+// maybe scale" â€” three round-trips through global memory as separate kernels.
 // Fused: one block normalizes x (length n), accumulates into acc, applies the
 // optional per-layer output scale os, and (epilogue) quantizes the result.
 // The body is shared with the chunk form below via `row`; this decode entry
@@ -169,7 +169,7 @@ __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos,
 }
 // The chunk form: row r holds the chunk's r-th token, at position *d_pos + r.
 // A separate kernel (not a `rows` parameter) so the decode graph keeps the
-// division-free original — its tiny latency-bound nodes notice every cycle.
+// division-free original â€” its tiny latency-bound nodes notice every cycle.
 __global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff,
                                      int total, int rows) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -189,17 +189,17 @@ __global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_po
 // tokens -> the forward captures into a static CUDA graph). window=0 means full causal.
 // Online softmax: each warp walks its strided slice of timesteps holding a running
 // (max, sum) and a per-lane V accumulator in registers, rescaling when the max moves;
-// the warps' partials merge once at the end. Shared memory is nwarp*hd — independent
+// the warps' partials merge once at the end. Shared memory is nwarp*hd â€” independent
 // of how long the context is (the score-array version capped max_seq at ~12k). Scale 1.0.
 // The body is shared with the chunk form via (pos, qoff); the decode entry pins
 // qoff to 0 so the captured graph keeps the original instruction stream. RING is
 // a compile-time flag (one template, separate instruction streams): the ring
-// mapping — position start+t lives in cache row (start+t) % seq, T never exceeds
-// seq so the modulo is one conditional subtract per timestep — exists ONLY in the
+// mapping â€” position start+t lives in cache row (start+t) % seq, T never exceeds
+// seq so the modulo is one conditional subtract per timestep â€” exists ONLY in the
 // sliding-window instantiation. The global layers, whose per-timestep loop grows
 // with context and notices every added instruction, keep the ring-free body
 // (their rows are positions: a full-length buffer never wraps). KT is the cache
-// storage type — __half on global layers halves what attention reads per
+// storage type â€” __half on global layers halves what attention reads per
 // timestep, the dominant per-token traffic at a long context; the dot itself
 // stays f32 (the conversion rides the load).
 #define ATTN_HD_MAX 512   // per-lane V accumulator: ATTN_HD_MAX/32 registers
@@ -219,7 +219,7 @@ __device__ static void d_attn(float *xb, const float *q, const KT *Kc, const KT 
     #pragma unroll
     for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
     float m = -INFINITY, s = 0.0f;
-    // one WARP per timestep — the lanes split the K dot, so the row is read with
+    // one WARP per timestep â€” the lanes split the K dot, so the row is read with
     // coalesced 128-byte loads; the V row follows while the score is still warm.
     for (int t = warp; t < T; t += nwarp) {
         int r = s0 + t;
@@ -302,7 +302,7 @@ __global__ static void attn_swa_kernel(float *xb, const float *q, const float *K
                                        int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
     d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, seq, aq);
 }
-// Chunk forms: grid (n_head, chunk) — query blockIdx.y sits at *d_pos + blockIdx.y,
+// Chunk forms: grid (n_head, chunk) â€” query blockIdx.y sits at *d_pos + blockIdx.y,
 // so a batched chunk is causal by construction: every query reads only positions
 // at or before its own, even though the whole chunk's k/v were written before the
 // launch (the ring keeps PREFILL_B spare rows so those writes never land on a row
@@ -345,7 +345,7 @@ __global__ static void kv_write_ring_n_kernel(float *dst, const float *src, cons
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n * rows) dst[(size_t)((*d_pos + i / n) % seq) * n + i % n] = src[i];
 }
-// f16 forms, for global layers: the row rounds through half once here — the
+// f16 forms, for global layers: the row rounds through half once here â€” the
 // single numerics-changing step in the pipeline (round-to-nearest, matching
 // the CPU backend's f16_of bit for bit). Global layers never ring.
 __global__ static void kv_write_h_kernel(__half *dst, const float *src, const int *d_pos, int n) {
@@ -422,7 +422,7 @@ static void ensure_weights(struct model *m) {
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
     // copying the blob would hold the weights TWICE in the same physical
-    // memory — a 12B that fits fine OOMs at this very malloc. Pin and map the
+    // memory â€” a 12B that fits fine OOMs at this very malloc. Pin and map the
     // host blob for the GPU instead: zero extra bytes, and decode streams the
     // same LPDDR either way. Discrete GPUs keep the copy (reading weights
     // over PCIe every token would be the opposite of the point).
@@ -467,7 +467,7 @@ static int kv_src_dev(const struct model *m, int L) {
 // weight matrix then crosses the memory bus once per CHUNK instead of once per
 // token. The activation buffers below are allocated PREFILL_B rows wide; decode
 // and the chunk remainder simply use row 0. Swept 8/16/32 on a 2.4k-token
-// prompt (E2B): 327/369/373 tok/s — 16 takes ~99% of 32's rate at half the
+// prompt (E2B): 327/369/373 tok/s â€” 16 takes ~99% of 32's rate at half the
 // matmul kernel's per-lane accumulators and half the scratch.
 #define PREFILL_B 16
 
@@ -485,7 +485,7 @@ static int scratch_ok = 0;
 
 // Fork/join: a graph is a dependency DAG, not a tape. Independent matmuls that
 // read the same activation (k+v beside q; up beside gate) are recorded on a side
-// stream between two events, so they run CONCURRENTLY in the replayed graph —
+// stream between two events, so they run CONCURRENTLY in the replayed graph â€”
 // the small latency-bound matmuls hide under the bigger one for free. matmul_q
 // launches on g_launch; the forward points it at the side stream inside a fork.
 static cudaStream_t g_launch = cudaStreamPerThread, g_side;
@@ -537,15 +537,15 @@ static void ensure_scratch(struct model *m) {
     scratch_ok = 1;
 }
 
-// The backend seam — the including .cu defines these four.
+// The backend seam â€” the including .cu defines these four.
 // matmul_q: d_out[m] = W . d_x with W the quantized tensor t (all device ptrs).
 //   The int8 backend reads d_x's quantization from its buffers, already filled
 //   by a producer kernel's epilogue (actq_for) or by act_quantize.
-// matmul_q_n: the PREFILL_B-column form — d_out[j*m..] = W . d_x[j*k..] for the
+// matmul_q_n: the PREFILL_B-column form â€” d_out[j*m..] = W . d_x[j*k..] for the
 //   whole chunk in one launch, so W streams from memory once per chunk.
 // actq_for(k): the backend's epilogue buffers for a k-length activation that is
-//   about to feed matmul_q (the f32 backend returns AQ0 — no quantization).
-// act_quantize: quantize d_x explicitly — for the one activation no kernel
+//   about to feed matmul_q (the f32 backend returns AQ0 â€” no quantization).
+// act_quantize: quantize d_x explicitly â€” for the one activation no kernel
 //   produces (the host-uploaded embedding); no-op for f32.
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
@@ -649,7 +649,7 @@ static int build_per_layer(struct model *m, int token) {
     return 1;
 }
 
-// The chunk form: PLE inputs for PREFILL_B tokens — one [n_layer*ple] record
+// The chunk form: PLE inputs for PREFILL_B tokens â€” one [n_layer*ple] record
 // per token, laid out back to back in d_ipl. Same math per token; the bf16
 // projection (the big matmul here) reads its weights once for the whole chunk.
 typedef void (*matmul_fn)(float *, const struct gguf_tensor *, const float *, int, int);
@@ -682,7 +682,7 @@ static int build_per_layer_n(struct model *m, const int *tokens, int B, matmul_f
     return 1;
 }
 
-// Device-only slice of the forward — the part a CUDA graph will capture: all layers
+// Device-only slice of the forward â€” the part a CUDA graph will capture: all layers
 // plus the final norm and output projection. dx already holds the scaled embedding and
 // d_ipl the PLE inputs; every op runs on the (per-thread) default stream with no host
 // work or sync, so it is stream-capturable. KV-cache writes use async copies for the
@@ -777,12 +777,12 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
 
 // Final norm + tied output projection. Split from the layers so prefill can
 // replay a graph without it: a prompt token's logits are never read, and the
-// n_vocab×n_embd head is the single largest matmul in the model.
+// n_vocabÃ—n_embd head is the single largest matmul in the model.
 static void forward_head(struct model *m) {
     const struct config *c = &m->cfg;
     rmsnorm_kernel<<<1, NORM_THREADS(c->n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), c->n_embd, c->rms_eps, actq_for(c->n_embd));
     // keep the post-norm hidden for the MTP draft head (a static graph node;
-    // 15 KB D2D, measured no decode cost — see the journal)
+    // 15 KB D2D, measured no decode cost â€” see the journal)
     CUDA_CHECK(cudaMemcpyAsync(g_hidden, dx, (size_t)c->n_embd * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, c->n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
@@ -797,19 +797,39 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
 // One prefill chunk's layer loop: the forward for the PREFILL_B positions
 // whose inputs already sit in dx (and whose PLE rows, if the model has them,
 // sit in d_ipl), at positions *d_pos..*d_pos+B-1, head skipped. The math is
-// exactly B single-token forwards — every kernel above carries a row dimension
-// that decode launches at 1 — but each weight matrix crosses the memory bus
+// exactly B single-token forwards â€” every kernel above carries a row dimension
+// that decode launches at 1 â€” but each weight matrix crosses the memory bus
 // ONCE per chunk instead of once per token, and prefill is bandwidth-bound,
 // so that factor is most of its cost. Per layer, the whole chunk's k/v are
 // written to the cache before its queries run; causality holds because each
 // query reads only up to its own position. Runs un-captured (and without the
 // fork/join forks): a chunk already amortizes launch latency over its B tokens.
+// LG_PREFILL_PROFILE=1: per-stage wall time across a whole prefill, with a
+// sync after each stage group (slows the run; for attribution only).
+static double g_pf_mm = 0, g_pf_attn = 0, g_pf_elem = 0, g_pf_ple = 0;
+static int g_pf_on = -1;
+static int pf_on(void) {
+    if (g_pf_on < 0) g_pf_on = getenv("LG_PREFILL_PROFILE") != NULL;
+    return g_pf_on;
+}
+static double pf_tick(double *acc) {
+    static double last;
+    if (!pf_on()) return 0;
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    double now;
+    { struct timespec ts; timespec_get(&ts, TIME_UTC); now = (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec; }
+    if (acc) *acc += now - last;
+    last = now;
+    return now;
+}
+
 static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B, matmul_fn mm) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
     const float *d_rope_freqs = dW(m, "rope_freqs.weight");
 
+    pf_tick(NULL);
     for (int L = 0; L < c->n_layer; L++) {
         const int local = m->is_local[L];
         const int hd = m->head_dim[L], n_head_kv = m->n_head_kv[L];
@@ -820,6 +840,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
 
         // ---- attention ----
         rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
+        pf_tick(&g_pf_elem);
 
         int src = kv_src_dev(m, L);
         const int has_kv = L < c->n_kv_start;
@@ -830,6 +851,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         }
         mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        pf_tick(&g_pf_mm);
         rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
         if (has_kv) {
@@ -848,6 +870,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             }
         }
         const void *Kc = kv->k[src], *Vc = kv->v[src];
+        pf_tick(&g_pf_elem);
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
         size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
@@ -858,18 +881,25 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         else
             attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
 
+        pf_tick(&g_pf_attn);
         mm(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
+        pf_tick(&g_pf_mm);
         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
+        pf_tick(&g_pf_elem);
         mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
         mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        pf_tick(&g_pf_mm);
         geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
+        pf_tick(&g_pf_elem);
         mm(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
+        pf_tick(&g_pf_mm);
         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
                                        has_ple ? NULL : os, has_ple ? actq_for(B * n_embd) : AQ0);
+        pf_tick(&g_pf_elem);
 
         // ---- per-layer input (PLE) ----
         if (has_ple) {
@@ -878,6 +908,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
             mm(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
             rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
+            pf_tick(&g_pf_ple);
         }
     }
 }
@@ -909,10 +940,10 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
     chunk_layers(m, kv, model_has_ple(m), PREFILL_B, matmul_q_n);
 }
 
-// Embedding form (media tokens): the rows enter exactly as given — media
+// Embedding form (media tokens): the rows enter exactly as given â€” media
 // embeddings are NOT sqrt(n_embd)-scaled (only real token lookups are). On a
 // PLE model a media position takes the PADDING token's (id 0) per-layer row
-// beside the usual projection of its embedding — the reference does exactly
+// beside the usual projection of its embedding â€” the reference does exactly
 // this for embedding batches; the 12B has no PLE at all.
 static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float *rows, int pos0) {
     const struct config *c = &m->cfg;
@@ -931,10 +962,10 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
 // launch latency that leaves the GPU idle ~30% of each token. The graph is fully STATIC
 // because every per-token-varying input (token position, hence the kv-write offset, the
 // rope angle, and the attention range) is read on-device from d_pos, which model_forward
-// updates before each launch — so node parameters never change and one exec graph serves
+// updates before each launch â€” so node parameters never change and one exec graph serves
 // all tokens. The first two tokens run un-captured so ensure_act's one-time cudaMalloc
 // (illegal mid-capture) is already done before capture. (Requires the per-thread default
-// stream — see CMakeLists — since the legacy default stream cannot be captured.)
+// stream â€” see CMakeLists â€” since the legacy default stream cannot be captured.)
 static cudaGraphExec_t g_graph_exec[2] = { NULL, NULL };   // [1]=layers+head (decode), [0]=layers only (prefill)
 static int g_graph_warmups = 0;
 static void forward_graph(struct model *m, struct kvcache *kv, int head) {
@@ -992,10 +1023,13 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     for (; n - i >= PREFILL_B; i += PREFILL_B)        // full chunks: weights read once per chunk
         forward_chunk(m, kv, tokens + i, pos0 + i);
     // The warmup tokens exist so ensure_act's one-time cudaMallocs precede graph
-    // capture; one chunk does all of them (its activations are B× decode's), so
-    // skip straight to capture — otherwise a chunk-aligned prompt would push the
+    // capture; one chunk does all of them (its activations are BÃ— decode's), so
+    // skip straight to capture â€” otherwise a chunk-aligned prompt would push the
     // two un-captured tokens and the capture itself into the generation timer.
     if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
+    if (pf_on() && i > 0)
+        fprintf(stderr, "prefill profile (%d chunk tokens): matmul %.2fs, attention %.2fs, elementwise %.2fs, ple %.2fs\n",
+                i, g_pf_mm, g_pf_attn, g_pf_elem, g_pf_ple);
     for (; i < n; i++)                                // remainder: the per-token path (no head)
         forward_token(m, kv, tokens[i], pos0 + i, 0);
 }
@@ -1018,7 +1052,7 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
 }
 
 // The MTP verify step: tok0 at pos and tok1 (the draft) at pos+1 as ONE B=2
-// chunk — each weight matrix crosses memory once for the pair, which is the
+// chunk â€” each weight matrix crosses memory once for the pair, which is the
 // entire economics of speculative decoding on a bandwidth-bound device. The
 // head runs at BOTH rows (the only place that happens; prefill always skips
 // it). out[0] = greedy successor of tok0, always valid; out[1] = successor of
@@ -1026,7 +1060,7 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
 // draft confirmed). g_hidden is left holding the LAST VALID row's post-norm
 // hidden, so the next draft chains correctly on accept and reject alike. A
 // rejected pair's cache rows are overwritten by the next step before any
-// query at those positions runs — causality makes rollback unnecessary.
+// query at those positions runs â€” causality makes rollback unnecessary.
 // Device-only slice of the verify: layers at B=2 plus the head at both rows.
 // Everything reads d_pos on-device, so node parameters never vary -> this
 // captures into a static CUDA graph exactly like decode does (the un-captured
@@ -1054,7 +1088,7 @@ static double now_sec_dev(void) {
 }
 
 // LG_MTP_PROFILE=1: run the verify un-captured with syncs around its two
-// halves and report — the tool that finds where a 2x-over-theory round goes.
+// halves and report â€” the tool that finds where a 2x-over-theory round goes.
 static void verify_profiled(struct model *m, struct kvcache *kv, int has_ple) {
     static double tl = 0, th = 0;
     static int n = 0;
@@ -1123,17 +1157,17 @@ extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int
 // ==== MTP: the draft head, on the device =====================================
 // The gemma4-assistant forward from src/mtp.c as ~30 kernel launches per
 // draft. Almost everything is REUSE: rmsnorm_kernel (pre/post norms and, with
-// grid = heads, the per-head q norm — exactly how decode uses it),
+// grid = heads, the per-head q norm â€” exactly how decode uses it),
 // geglu_kernel, softcap_kernel, argmax_kernel, and above all the d_attn
 // template: a draft for position `pos` sees the cache exactly as a query at
-// pos-1 with the window shrunk by one — [pos-window+1, pos-1] sliding,
-// [0, pos-1] full — so two NEW wrappers below pin those arguments and the
+// pos-1 with the window shrunk by one â€” [pos-window+1, pos-1] sliding,
+// [0, pos-1] full â€” so two NEW wrappers below pin those arguments and the
 // frozen decode entry points stay untouched. Assistant weights are dequantized
 // once to f16 on the device (77M params, ~150 MB); h_prev is g_hidden, which
 // the decode graph already maintains. The whole draft CAPTURES into one CUDA
 // graph (position read on-device from d_dpos, like decode's d_pos), so a
 // round costs one graph launch + one 4-byte readback instead of ~30 raw
-// launches — on WDDM that launch tax was most of the draft's wall time.
+// launches â€” on WDDM that launch tax was most of the draft's wall time.
 
 __global__ static void mtp_matvec_h(float *out, const __half *W, const float *x, int k, int m) {
     int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -1257,7 +1291,7 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
     return mc;
 }
 
-// Every launch in the draft, position read from mc->d_dpos — capturable.
+// Every launch in the draft, position read from mc->d_dpos â€” capturable.
 static void mtp_draft_launches(struct mtp *t, const struct model *m, const struct kvcache *kv,
                                struct mtp_cuda *mc) {
     const struct config *c = &m->cfg;
