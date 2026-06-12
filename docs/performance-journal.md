@@ -364,6 +364,136 @@ with `nvidia-smi --lock-gpu-clocks`; the idle-parked clock swings short runs by
    function whose row pins to 0 for decode. Decode re-measured equal to within
    0.1% on all three models.
 
+3. **The kv cache stops paying for layers that don't need it.** Two facts about
+   Gemma 4's cache were being ignored: layers past `n_kv_start` never write a
+   row (they reuse an earlier layer's KV — their pointers are now simply NULL),
+   and a sliding-window layer can never look back past its 512-position window,
+   so storing `max_seq` rows for it is pure waste. SWA layers now keep a
+   **ring** of `sliding_window + 16` rows — position `p` lives in row
+   `p % seq`, and the 16 spare rows are load-bearing: a prefill chunk writes
+   all of its positions before its queries run, and the pad keeps those writes
+   off rows an earlier query in the chunk still needs. Byte-identical, on the
+   CPU backend too (its rings are window-exact). The frozen-kernel lesson
+   struck a **third** time here: the ring needs one conditional subtract per
+   timestep in the attention loop, and adding it to the shared `d_attn` body
+   cost the *global* layers 8% at long context — so `RING` became a template
+   parameter and the global instantiation keeps its ring-free instruction
+   stream, bit-frozen. At an 8K-context server config the cache drops E2B
+   852 → 243 MiB and 12B 5,556 → 1,093 MiB; E2B's worst case (131K positions)
+   falls from ~10.7 GiB to ~0.5 GiB.
+
+4. **f16 KV on the global layers.** At long context the per-token cost is
+   dominated by attention *reads* of the few global full-length KV layers, so
+   their rows now store as f16 — capacity and read traffic halved — while the
+   SWA rings stay f32 (a few hundred rows save nothing meaningful). This is
+   the project's one deliberate numerics change beyond step 1: each KV value
+   rounds through f16 once at write, with the CPU's float→half conversion
+   bit-matched to the GPU's `cvt.rn.f16.f32` so the backends stay comparable.
+   The first attempt read the f16 rows with scalar half loads and *lost* 1.8%
+   — attention on this machine is issue-bound, and the added convert
+   instructions ate the bandwidth win — flipping to `__half2` paired loads
+   (two elements per 32-bit load, the wide-loads lesson yet again) turned it
+   into gen +1.3% and prefill +3–4% at 4K context.
+
+## After the roadmap: the encoders learn the same lessons
+
+Multimodal work (see the README) replayed two of this journal's themes in
+miniature, so the numbers belong here too. The E2B/E4B vision encoder
+(gemma4v, a 16-block ViT — ~1 TFLOP per 266-token image) first ran as host
+C: naive loops took **~8 minutes** per image; OpenMP actually linked to the
+CUDA targets, cache blocking, file-scoped fast-math (where the *naive* dot
+loop vectorizes and a hand-unrolled one defeats MSVC's pattern match), and
+hoisting locals out of OpenMP-outlined regions brought it to **14.7 s**; the
+same seven-kernel forward on the GPU — with the host path kept in-binary as
+numeric oracle (`LG_MEDIA_VERIFY=1`; max |diff| 5.3e-5) — runs it in
+**0.8 s**. And the 12B's "thin" encoder-free embedder was quietly re-streaming
+its 106 MB f32 patch linear once per patch (the exact disease batched prefill
+cures); batching its two matmuls over all patches took it from 3.4 s to
+**0.5 s** per image. Ship the readable host implementation first, then offload
+with the host as the oracle — that pattern is now load-bearing twice.
+
+## MTP: a draft head that borrows the whole model
+
+Gemma 4's **multi-token prediction** assistant is a tiny transformer (E2B's:
+4 blocks, 256 wide, 77M params) that predicts the token *after* next — and
+its design is almost parasitic. It owns **no K or V projections at all**:
+every block cross-attends straight into the *target's* KV cache (SWA blocks
+read the last sliding-window KV layer, the full block the last global one).
+Its inputs are the target's own embedding of the freshly chosen token
+concatenated with the target's last hidden state; a pre-projection squeezes
+that into its width, a post-projection lifts it back out. On the CUDA side
+the cross-attention is the frozen `d_attn` template called through two new
+wrappers with `pos-1` and `window-1` — a draft for position `pos` sees the
+cache exactly as a query at `pos-1` — so no decode entry point changed.
+
+Speculative decoding at **block 2** (one draft per round, deeper blocks
+regressed in the fork that pioneered this): draft the successor of the fresh
+token, then verify `[token, draft]` as one **B=2 chunk** through the
+`matmul_q_n` seam, with the head — for once — evaluated at both rows. Greedy
+verification makes the strongest correctness claim available: **the output is
+byte-identical to plain greedy decoding**, gated on every change below, plus
+run-twice determinism (the multi-graph rule). The draft head itself was
+validated the cheap way first: run it as a pure oracle on the CPU backend and
+read the acceptance rate — a correct head accepts 70–87% on factual text
+(42–58% on prose, where the future is genuinely harder to guess), a wrong one
+accepts nothing. It accepted 85.7% on its first run. Both the verify pair and
+the draft (~30 launches, position read on-device like decode's `d_pos`)
+capture into their own static CUDA graphs.
+
+**The bug this uncovered reaches far beyond MTP.** The B=2 verify should cost
+about one decode pass (weights cross DRAM once for the pair — the entire
+economics of speculation on a bandwidth-bound device). Measured on the Orin
+NX: **2.0×** a decode pass. Step 2 above contains the sentence "the
+per-column re-reads hit L1" — and that sentence is *discrete-GPU thinking*.
+The chunk matmul's `sub_*` helpers re-load each weight byte once per
+activation column; on the Orin the in-place q4_K/q5_K weights are zero-copy
+(`cudaHostRegister`, the integrated-GPU path), and **Tegra GPU reads of
+host-registered memory are uncached** — every re-read pays full DRAM, so
+chunk weight traffic scaled with B. Prefill had been quietly paying up to B×
+on the Orin since zero-copy landed. The fix: `sub_*_n<NB>` templates that
+load each weight sub-block into registers once and dot all NB columns inside,
+float order preserved exactly — byte-identical, decode's subs untouched. The
+verify fell to 1.28× a decode pass, **Orin prefill roughly doubled** (~25 →
+56 prompt tok/s at 617 tokens), and even the A5000 — whose L1 was supposed to
+make re-reads free — gained **+49% prefill** (229 → 341 tok/s). Found with a
+20-line `LG_MTP_PROFILE=1` probe that splits the verify into halves with
+syncs.
+
+The verdict is the device-scoped story this journal keeps re-learning, now in
+one table (story prompt, 256 generated tokens, warm, best of 2; acceptance in
+parentheses; `llama-bench tg32` same day, same machine):
+
+**RTX A5000 (Windows/WDDM):**
+
+| model | little-gemma | + MTP | llama.cpp CUDA |
+|-------|-------------:|------:|---------------:|
+| E2B Q3_K_M | 182.3 | 141.9 (42%) | 148.4 ± 6.6 |
+| E4B Q4_K_M | 114.7 | 101.9 (45%) | 116.3 ± 1.3 |
+| 12B Q4_K_M |  60.5 |  42.0 (58%) |  64.3 ± 0.3 |
+
+MTP **loses across the board on Windows** — not because the math is wrong
+(the output is byte-identical) but because each round needs two D2H syncs the
+host cannot avoid (the draft token feeds the verify's inputs), and WDDM
+prices every sync in milliseconds against a 5 ms token. The fork that
+inspired this work measured the same: on this machine, MTP doesn't pay.
+
+**Jetson Orin NX 16GB (Linux, integrated GPU, zero-copy weights):**
+
+| model | little-gemma | + MTP | llama.cpp CUDA |
+|-------|-------------:|------:|---------------:|
+| E4B Q4_K_M | 16.80 | **17.76** (49%) | 13.36 ± 0.04 |
+| 12B Q4_K_M |  8.27 |   7.79 (51%) |  7.04 ± 0.04 |
+
+On the device that ships, E4B with MTP decodes at **1.33×** llama.cpp — and
+the 49%-acceptance prose prompt is the *worst* case; list-style answers
+accept 87% and reach 19.8 tok/s (+14.7% over plain). The 12B still loses with
+MTP even at ~100% acceptance on easy text: its assistant is 1024 wide with a
+537 MB (f16-uploaded) LM head, and a ~33 ms draft against a 121 ms decode
+pass eats the margin — keeping the assistant's weights quantized on the
+device and routing its big matmuls through the existing int8 machinery is the
+known next lever. Per-machine verdicts, per-model verdicts: the same binary,
+byte-identical output everywhere, faster only where the hardware says so.
+
 3. **Reuse-layer NULL + sliding-window ring.** The cache was paying ~5× over
    minimum. Layers past `n_kv_start` (20 of E2B's 35) only ever read another
    layer's buffers — they now allocate nothing. Sliding-window layers can never
