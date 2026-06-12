@@ -576,21 +576,23 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
     float2 *sBxds = (float2 *)(sh + 2 * 16 * 256);                 // [2 bufs][16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [warps][2 halves][16][32]
+    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [warps][2 tiles][2 halves][16][32]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     // warps per CTA is a LAUNCH choice: small matmuls (k/v projections) need
-    // small CTAs so the grid still covers the SMs — the profiler showed 17%
-    // achieved occupancy on them at a fixed 128 rows per CTA (8 SMs, 4-8 CTAs)
-    const int r0 = blockIdx.x * (16 * (blockDim.x >> 5)) + warp * 16;
+    // small CTAs so the grid still covers the SMs. Each warp owns TWO 16-row
+    // tiles: the B fragments and xds scales are loaded once and feed both
+    // tiles' mma — the profiler put 40% of issue cycles on the MIO queue, and
+    // halving the shared traffic per mma is the structural answer.
+    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
-    int8_t *sAw = sA + warp * 2 * 16 * 32;
-    float acc[2][4];
+    int8_t *sAw = sA + warp * 2 * 2 * 16 * 32;
+    float acc[2][2][4];                                            // [tile][h][slot]
     #pragma unroll
-    for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[h][s] = 0.0f;
+    for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
-    // this lane's staging row (lanes 16..31 mirror 0..15 for the header regs)
-    int rowL = r0 + (lane & 15); if (rowL >= m) rowL = m - 1;
+    // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
+    int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
 
     mma_stage_b(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);         // prologue: block 0 in flight
@@ -615,13 +617,16 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
 
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS:
             int qoff = sjp * 32;                                   // they share the same 32 qs
-            // bytes, so one load pass stages both unpacked halves (sAw holds 2 sub-blocks)
-            {
-                int ar = lane & 15, hi = lane >> 4;                // row, which 16B half
-                const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)(r0 + ar < m ? r0 + ar : m - 1) * nbk * ts) + blk;
+            // bytes, so one load pass stages both unpacked halves, both tiles
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                int ar = lane & 15, hi = lane >> 4;                // row-in-tile, which 16B half
+                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)row * nbk * ts) + blk;
                 uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
-                uint32_t *lo = (uint32_t *)(sAw + ar * 32 + hi * 16);
-                uint32_t *hh = (uint32_t *)(sAw + 16 * 32 + ar * 32 + hi * 16);
+                int8_t *sAt = sAw + t * 2 * 16 * 32;
+                uint32_t *lo = (uint32_t *)(sAt + ar * 32 + hi * 16);
+                uint32_t *hh = (uint32_t *)(sAt + 16 * 32 + ar * 32 + hi * 16);
                 lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
                 lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
                 hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
@@ -632,47 +637,53 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
             for (int half = 0; half < 2; half++) {
                 int sj = sjp * 2 + half;
                 uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
-                float dscL = dD * sc, mnmL = dM * mm;              // my ROW's pair, in my lane
-                const int8_t *sAh = sAw + half * 16 * 32;
-                uint32_t a0 = *(uint32_t *)(sAh + gid * 32 + tid * 4);
-                uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4);
-                uint32_t a2 = *(uint32_t *)(sAh + gid * 32 + tid * 4 + 16);
-                uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4 + 16);
-
-                float dsc0 = __shfl_sync(0xffffffffu, dscL, gid);
-                float dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
-                float mnm0 = __shfl_sync(0xffffffffu, mnmL, gid);
-                float mnm1 = __shfl_sync(0xffffffffu, mnmL, gid + 8);
-
+                float dscL = dD * sc, mnmL = dM * mm;              // my header ROW's pair
+                float dsc[2][2], mnm[2][2];                        // [tile][row-half]
+                #pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    dsc[t][0] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid);
+                    dsc[t][1] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid + 8);
+                    mnm[t][0] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid);
+                    mnm[t][1] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid + 8);
+                }
                 #pragma unroll
                 for (int h = 0; h < 2; h++) {
                     int colb = h * 8 + gid;
                     uint32_t b0 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4);
                     uint32_t b1 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4 + 16);
-                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
                     float2 xd0 = sBxd[(h * 8 + tid * 2) * 8 + sj];
                     float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * 8 + sj];
-                    acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
-                    acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
-                    acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
-                    acc[h][3] += xd1.x * (dsc1 * (float)c3 - mnm1 * xd1.y);
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {                  // both tiles ride one B load
+                        const int8_t *sAh = sAw + t * 2 * 16 * 32 + half * 16 * 32;
+                        uint32_t a0 = *(uint32_t *)(sAh + gid * 32 + tid * 4);
+                        uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4);
+                        uint32_t a2 = *(uint32_t *)(sAh + gid * 32 + tid * 4 + 16);
+                        uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4 + 16);
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                        acc[t][h][0] += xd0.x * (dsc[t][0] * (float)c0 - mnm[t][0] * xd0.y);
+                        acc[t][h][1] += xd1.x * (dsc[t][0] * (float)c1 - mnm[t][0] * xd1.y);
+                        acc[t][h][2] += xd0.x * (dsc[t][1] * (float)c2 - mnm[t][1] * xd0.y);
+                        acc[t][h][3] += xd1.x * (dsc[t][1] * (float)c3 - mnm[t][1] * xd1.y);
+                    }
                 }
             }
-            __syncwarp();                                          // both halves read before re-stage
+            __syncwarp();                                          // all reads done before re-stage
         }
     }
 
     #pragma unroll
-    for (int h = 0; h < 2; h++) {
-        int col0 = h * 8 + tid * 2;
-        int rA = r0 + gid, rB = r0 + gid + 8;
-        if (rA < m) { out[(size_t)col0 * m + rA] = acc[h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[h][1]; }
-        if (rB < m) { out[(size_t)col0 * m + rB] = acc[h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[h][3]; }
-    }
+    for (int t = 0; t < 2; t++)
+        for (int h = 0; h < 2; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
+            if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
+            if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+        }
 }
 
 // Chunk-matmul work by weight type (MACs), for the mma-kernel coverage
@@ -698,10 +709,10 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
         static int sms = 0;
         if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
-        int wpc = 8;                                     // warps (16-row stripes) per CTA: shrink
-        while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
-        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 16 * 32;
-        matmul_q4k_mma_kernel<<<(m + 16 * wpc - 1) / (16 * wpc), 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
+        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
+        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * 32;
+        matmul_q4k_mma_kernel<<<(m + 32 * wpc - 1) / (32 * wpc), 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         return;
     }
     int rows_per_block = 256 / 32;
