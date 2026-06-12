@@ -121,21 +121,27 @@ gen:    2 tokens in 1.48s (1.35 tok/s)
 ### Serving over a Unix-domain socket (`-s`)
 
 `-s` turns the runner into a tiny conversation server — no HTTP, no JSON, no web
-security surface; transport concerns (TCP exposure, TLS, auth) belong to `socat`
-and to whatever chat server or agent sits downstream:
+security surface; transport concerns (TCP exposure, TLS, auth) belong to `nc`,
+`socat`, and whatever chat server or agent sits downstream:
 
 ```
 run-cuda-i8r -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
-echo "What is the capital of France?" | socat - UNIX-CONNECT:/tmp/lg.sock
+echo "What is the capital of France?" | nc -N -U /tmp/lg.sock
 ```
+
+(The `-N` matters: it half-closes the socket when stdin ends, which is how the
+server learns the conversation is over. Without it, plain `nc` holds its write
+side open, the server politely waits for your next turn, and both sides sit
+there forever. Don't use `-q 0` instead — that one quits on a timer and can
+cut the answer off mid-stream.)
 
 The protocol is the simplest thing that works, designed so raw media frames can
 join it later without breaking anything:
 
 - **A connection is a conversation.** The kv cache lives for the connection, so
   multi-turn context is free; close the connection (or just stop typing into
-  socat) to end the session. One conversation is served at a time — decode is
-  batch-1, and the listen backlog is the queue.
+  the client) to end the session. One conversation is served at a time — decode
+  is batch-1, and the listen backlog is the queue.
 - **A line is a user turn.** Each newline-terminated line is wrapped in the
   Gemma chat template and prefilled.
 - **The reply is the raw token stream**, special tokens included — the thinking
@@ -146,7 +152,7 @@ join it later without breaking anything:
   no sampler and no repetition penalty, so a degenerate loop would otherwise
   spin until the context filled (observed: 8,098 tokens of the same sentence).
   A capped turn ends with a visible `[SERVE_GEN cap]<turn|>`.
-- A clean half-close (e.g. socat after stdin EOF) still receives the full turn
+- A clean half-close (e.g. `nc -N` after stdin EOF) still receives the full turn
   in flight; only a hard reset aborts generation early — checked between
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.
 
