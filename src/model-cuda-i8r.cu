@@ -514,6 +514,134 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     }
 }
 
+// ==== the tensor-core chunk matmul (q4_K, prefill only) ======================
+// The dp4a chunk kernel above is issue-bound: every 4-element dot pays its own
+// unpack ALU chain, one warp per row, ~1 int8-TOPS on the Orin (the journal's
+// prefill chapter has the full audit trail — B-sweeps and memory staging were
+// measured dead ends). Here one mma.m16n8k32 instruction does 4,096 MACs, so
+// a warp covers 16 rows x 16 columns and each unpacked weight nibble feeds 16
+// columns through one instruction instead of 16 dp4a chains.
+//
+// Q4_K only (85% of chunk MACs on both Q4_K_M models — the coverage probe
+// below); everything else stays on the dp4a kernel. PREFILL ONLY: decode and
+// the B=2 MTP verify never run this, so their byte-identity gates are
+// untouched. The integer sub-block dots here are EXACT (s32 accumulate, same
+// values dp4a produces); only the float ORDER of combining sub-block
+// contributions differs — each (row, column) is summed by one lane in
+// ascending k — so chunked prefill is no longer byte-identical to per-token
+// prefill, the same gate relaxation the online-softmax step shipped with
+// (deterministic + numerically equivalent; the step-2 harness measured this
+// kernel slightly CLOSER to a double reference than the dp4a path).
+// LG_NO_MMA=1 forces the dp4a path back for A/B.
+//
+// Per CTA: 8 warps, 128 rows x 16 columns. Per q4_K block (256 weights), the
+// CTA stages all 16 columns' activations once (two barriers per block, ten
+// per typical k); per sub-block, each warp stages its 16 rows' unpacked
+// nibbles warp-synchronously (no CTA barrier), builds fragments by direct
+// shared reads (the lane mapping is the documented m16n8k32 layout — see
+// .scratch/mma_test.cu, the validating harness), and shuffle-broadcasts the
+// per-row scale pairs from the 16 lanes that hold block headers in registers.
+
+__device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = (s0 >> (8 * j)) & 63; *m = (s1 >> (8 * j)) & 63; }
+    else {
+        int b = 8 * (j - 4);
+        *d = ((s2 >> b) & 0x0F) | (((s0 >> (b + 6)) & 3) << 4);
+        *m = (((s2 >> b) >> 4) & 0x0F) | (((s1 >> (b + 6)) & 3) << 4);
+    }
+}
+
+__global__ static void __launch_bounds__(256)
+matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
+                      const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;                                  // [16 cols][256] one block span
+    float2 *sBxds = (float2 *)(sh + 16 * 256);                     // [16 cols][8]
+    int8_t *sA    = (int8_t *)(sh + 16 * 256 + 16 * 8 * 8);        // [8 warps][16 rows][32]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * 128 + warp * 16;
+    const int gid = lane >> 2, tid = lane & 3;
+    const int nbk = k / 256;
+    int8_t *sAw = sA + warp * 16 * 32;
+    float acc[2][4];
+    #pragma unroll
+    for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[h][s] = 0.0f;
+
+    // this lane's staging row (lanes 16..31 mirror 0..15 for the header regs)
+    int rowL = r0 + (lane & 15); if (rowL >= m) rowL = m - 1;
+    const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
+
+    for (int blk = 0; blk < nbk; blk++) {
+        __syncthreads();                                           // prev block's sB reads done
+        for (int t = threadIdx.x; t < 16 * 64; t += 256) {         // 16 cols x 256 B, word-wise
+            int col = t >> 6, w4 = (t & 63) * 4;
+            *(uint32_t *)(sB + col * 256 + w4) = ld32(xq + (size_t)col * k + blk * 256 + w4);
+        }
+        for (int t = threadIdx.x; t < 16 * 8; t += 256)
+            sBxds[t] = xds[(size_t)(t >> 3) * (k / 32) + blk * 8 + (t & 7)];
+        __syncthreads();
+
+        const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
+        uint32_t s0 = ((const uint32_t *)hp->scales)[0];
+        uint32_t s1 = ((const uint32_t *)hp->scales)[1];
+        uint32_t s2 = ((const uint32_t *)hp->scales)[2];
+        float dD, dM; d_dm(&hp->d, &dD, &dM);
+
+        for (int sj = 0; sj < 8; sj++) {
+            uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
+            float dscL = dD * sc, mnmL = dM * mm;                  // my ROW's pair, in my lane
+            int qoff = (sj >> 1) * 32, half = sj & 1;
+
+            // stage this sub-block's 16 rows x 32 unpacked s8 (warp-synchronous)
+            {
+                int ar = lane & 15, hi = lane >> 4;                // row, which 16B half
+                const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)(r0 + ar < m ? r0 + ar : m - 1) * nbk * ts) + blk;
+                uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
+                uint32_t *dst = (uint32_t *)(sAw + ar * 32 + hi * 16);
+                dst[0] = (uint32_t)nib4(q4.x, half); dst[1] = (uint32_t)nib4(q4.y, half);
+                dst[2] = (uint32_t)nib4(q4.z, half); dst[3] = (uint32_t)nib4(q4.w, half);
+            }
+            __syncwarp();
+            uint32_t a0 = *(uint32_t *)(sAw + gid * 32 + tid * 4);
+            uint32_t a1 = *(uint32_t *)(sAw + (gid + 8) * 32 + tid * 4);
+            uint32_t a2 = *(uint32_t *)(sAw + gid * 32 + tid * 4 + 16);
+            uint32_t a3 = *(uint32_t *)(sAw + (gid + 8) * 32 + tid * 4 + 16);
+            __syncwarp();                                          // frags read before next overwrite
+
+            float dsc0 = __shfl_sync(0xffffffffu, dscL, gid);
+            float dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
+            float mnm0 = __shfl_sync(0xffffffffu, mnmL, gid);
+            float mnm1 = __shfl_sync(0xffffffffu, mnmL, gid + 8);
+
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                int colb = h * 8 + gid;
+                uint32_t b0 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4);
+                uint32_t b1 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4 + 16);
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                float2 xd0 = sBxds[(h * 8 + tid * 2) * 8 + sj];
+                float2 xd1 = sBxds[(h * 8 + tid * 2 + 1) * 8 + sj];
+                acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
+                acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
+                acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
+                acc[h][3] += xd1.x * (dsc1 * (float)c3 - mnm1 * xd1.y);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int h = 0; h < 2; h++) {
+        int col0 = h * 8 + tid * 2;
+        int rA = r0 + gid, rB = r0 + gid + 8;
+        if (rA < m) { out[(size_t)col0 * m + rA] = acc[h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[h][1]; }
+        if (rB < m) { out[(size_t)col0 * m + rB] = acc[h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[h][3]; }
+    }
+}
+
 // Chunk-matmul work by weight type (MACs), for the mma-kernel coverage
 // question: which types must the tensor-core path handle to matter?
 static double g_cov[40];
@@ -532,6 +660,13 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     if (t->type < 40) g_cov[t->type] += (double)k * m;
+    static int no_mma = -1;
+    if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
+    if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
+        size_t shm = 16 * 256 + 16 * 8 * sizeof(float2) + 8 * 16 * 32;   // sB + sBxds + sA = 9 KB
+        matmul_q4k_mma_kernel<<<(m + 127) / 128, 256, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        return;
+    }
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
     matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
