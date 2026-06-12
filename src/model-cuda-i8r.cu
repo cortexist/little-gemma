@@ -559,11 +559,13 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
     // pieces = exactly 256), and the first 128 ALSO stage one float2 of sBxds
     // with a plain store (1 KB - not worth an async path; same double-buffer
     // safety, it lands in the buffer nobody reads until after the barrier).
-    int col = tix >> 4, off = (tix & 15) * 16;
-    unsigned dst = (unsigned)__cvta_generic_to_shared(sB + buf * 16 * 256 + col * 256 + off);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(xq + (size_t)col * k + blk * 256 + off));
-    if (tix < 16 * 8) {
-        int xcol = tix >> 3, g = tix & 7;
+    for (int t = tix; t < 16 * 16; t += blockDim.x) {
+        int col = t >> 4, off = (t & 15) * 16;
+        unsigned dst = (unsigned)__cvta_generic_to_shared(sB + buf * 16 * 256 + col * 256 + off);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(xq + (size_t)col * k + blk * 256 + off));
+    }
+    for (int t = tix; t < 16 * 8; t += blockDim.x) {
+        int xcol = t >> 3, g = t & 7;
         sBxds[buf * 16 * 8 + xcol * 8 + g] = xds[(size_t)xcol * (k / 32) + blk * 8 + g];
     }
 }
@@ -574,9 +576,12 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
     float2 *sBxds = (float2 *)(sh + 2 * 16 * 256);                 // [2 bufs][16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [8 warps][2 halves][16][32]
+    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [warps][2 halves][16][32]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = blockIdx.x * 128 + warp * 16;
+    // warps per CTA is a LAUNCH choice: small matmuls (k/v projections) need
+    // small CTAs so the grid still covers the SMs — the profiler showed 17%
+    // achieved occupancy on them at a fixed 128 rows per CTA (8 SMs, 4-8 CTAs)
+    const int r0 = blockIdx.x * (16 * (blockDim.x >> 5)) + warp * 16;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
     int8_t *sAw = sA + warp * 2 * 16 * 32;
@@ -691,8 +696,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
-        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + 8 * 2 * 16 * 32;   // sB x2 + sBxds x2 + sA = 18 KB
-        matmul_q4k_mma_kernel<<<(m + 127) / 128, 256, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        static int sms = 0;
+        if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
+        int wpc = 8;                                     // warps (16-row stripes) per CTA: shrink
+        while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
+        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 16 * 32;
+        matmul_q4k_mma_kernel<<<(m + 16 * wpc - 1) / (16 * wpc), 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         return;
     }
     int rows_per_block = 256 / 32;
