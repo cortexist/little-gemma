@@ -615,17 +615,28 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
 
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS:
             int qoff = sjp * 32;                                   // they share the same 32 qs
-            // bytes, so one load pass stages both unpacked halves (sAw holds 2 sub-blocks)
+            // bytes, so one load pass stages both unpacked halves. The layout
+            // is FRAGMENT-major — sAw[half][consumer lane][4 slots] — so each
+            // lane later pulls its whole A fragment set as ONE 128-bit shared
+            // load instead of four 32-bit ones: the profiler put 40% of issue
+            // cycles on the MIO queue, and shared instruction COUNT is what
+            // feeds it (the byte count is unchanged).
             {
-                int ar = lane & 15, hi = lane >> 4;                // row, which 16B half
+                int ar = lane & 15, hi = lane >> 4;                // row, which 16B k-half
                 const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)(r0 + ar < m ? r0 + ar : m - 1) * nbk * ts) + blk;
                 uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
-                uint32_t *lo = (uint32_t *)(sAw + ar * 32 + hi * 16);
-                uint32_t *hh = (uint32_t *)(sAw + 16 * 32 + ar * 32 + hi * 16);
-                lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
-                lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
-                hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
-                hh[2] = (uint32_t)nib4(q4.z, 1); hh[3] = (uint32_t)nib4(q4.w, 1);
+                int cl = (ar & 7) * 4;                             // consumer lanes cl..cl+3
+                int sl = hi * 2 + (ar >> 3);                       // their fragment slot
+                uint32_t *F0 = (uint32_t *)sAw;                    // nibble half 0
+                uint32_t *F1 = (uint32_t *)(sAw + 32 * 16);        // nibble half 1
+                F0[(cl + 0) * 4 + sl] = (uint32_t)nib4(q4.x, 0);
+                F0[(cl + 1) * 4 + sl] = (uint32_t)nib4(q4.y, 0);
+                F0[(cl + 2) * 4 + sl] = (uint32_t)nib4(q4.z, 0);
+                F0[(cl + 3) * 4 + sl] = (uint32_t)nib4(q4.w, 0);
+                F1[(cl + 0) * 4 + sl] = (uint32_t)nib4(q4.x, 1);
+                F1[(cl + 1) * 4 + sl] = (uint32_t)nib4(q4.y, 1);
+                F1[(cl + 2) * 4 + sl] = (uint32_t)nib4(q4.z, 1);
+                F1[(cl + 3) * 4 + sl] = (uint32_t)nib4(q4.w, 1);
             }
             __syncwarp();
             #pragma unroll
@@ -633,11 +644,8 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                 int sj = sjp * 2 + half;
                 uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
                 float dscL = dD * sc, mnmL = dM * mm;              // my ROW's pair, in my lane
-                const int8_t *sAh = sAw + half * 16 * 32;
-                uint32_t a0 = *(uint32_t *)(sAh + gid * 32 + tid * 4);
-                uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4);
-                uint32_t a2 = *(uint32_t *)(sAh + gid * 32 + tid * 4 + 16);
-                uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4 + 16);
+                uint4 av = *(const uint4 *)(sAw + half * 32 * 16 + lane * 16);
+                uint32_t a0 = av.x, a1 = av.y, a2 = av.z, a3 = av.w;
 
                 float dsc0 = __shfl_sync(0xffffffffu, dscL, gid);
                 float dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
