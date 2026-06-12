@@ -124,25 +124,31 @@ static const struct gguf_tensor *wq_l(struct mtp *t, int L, const char *suffix) 
 struct mtp *mtp_open(const char *path, const struct model *m) {
     struct gguf_context *ctx = load_gguf(path);
     if (!ctx) return NULL;
+    // converter vintages disagree on the separator: E2B files say
+    // "gemma4-assistant", E4B says "gemma4_assistant" — and the metadata key
+    // prefix follows the arch string, so read keys through it either way
     const char *arch = gguf_get_str(ctx, "general.architecture", "");
-    if (strcmp(arch, "gemma4-assistant") != 0) {
+    if (strcmp(arch, "gemma4-assistant") != 0 && strcmp(arch, "gemma4_assistant") != 0) {
         fprintf(stderr, "mtp: %s is a '%s' gguf, want gemma4-assistant\n", path, arch);
         free_gguf(ctx);
         return NULL;
     }
+    char key[96];
+    #define AK(suffix) (snprintf(key, sizeof key, "%s.%s", arch, suffix), key)
 
     struct mtp *t = calloc(1, sizeof *t);
     if (!t) { free_gguf(ctx); return NULL; }
     t->ctx = ctx;
-    t->n_layer  = (int)gguf_get_u32(ctx, "gemma4-assistant.block_count", 0);
-    t->n_inner  = (int)gguf_get_u32(ctx, "gemma4-assistant.embedding_length", 0);
-    t->n_bb     = (int)gguf_get_u32(ctx, "gemma4-assistant.embedding_length_out", 0);
-    t->n_head   = (int)gguf_get_u32(ctx, "gemma4-assistant.attention.head_count", 0);
-    t->n_ff     = (int)gguf_get_u32(ctx, "gemma4-assistant.feed_forward_length", 0);
-    t->eps      = gguf_get_f32(ctx, "gemma4-assistant.attention.layer_norm_rms_epsilon", 1e-6f);
-    t->base_full= gguf_get_f32(ctx, "gemma4-assistant.rope.freq_base", 1e6f);
-    t->base_swa = gguf_get_f32(ctx, "gemma4-assistant.rope.freq_base_swa", 1e4f);
-    t->softcap  = gguf_get_f32(ctx, "gemma4-assistant.final_logit_softcapping", 0.0f);
+    t->n_layer  = (int)gguf_get_u32(ctx, AK("block_count"), 0);
+    t->n_inner  = (int)gguf_get_u32(ctx, AK("embedding_length"), 0);
+    t->n_bb     = (int)gguf_get_u32(ctx, AK("embedding_length_out"), 0);
+    t->n_head   = (int)gguf_get_u32(ctx, AK("attention.head_count"), 0);
+    t->n_ff     = (int)gguf_get_u32(ctx, AK("feed_forward_length"), 0);
+    t->eps      = gguf_get_f32(ctx, AK("attention.layer_norm_rms_epsilon"), 1e-6f);
+    t->base_full= gguf_get_f32(ctx, AK("rope.freq_base"), 1e6f);
+    t->base_swa = gguf_get_f32(ctx, AK("rope.freq_base_swa"), 1e4f);
+    t->softcap  = gguf_get_f32(ctx, AK("final_logit_softcapping"), 0.0f);
+    #undef AK
     // the next-token projections — "nextn." in today's files, "next_token."
     // once the converter says what it means
     t->pre  = gguf_find_tensor(ctx, "next_token.pre_projection.weight");
