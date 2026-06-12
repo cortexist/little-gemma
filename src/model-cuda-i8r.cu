@@ -514,87 +514,13 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     }
 }
 
-// The TILED chunk form — prefill's kernel, take two. The kernel above lets
-// each lane load its own 4-byte activation fragments straight from global
-// memory at scattered addresses, so every useful word drags a 32-byte sector;
-// at B=16 that waste turned out to be the prefill ceiling (the profile put
-// the chunk matmul at 73% of Orin prefill while moving only ~20 GB/s).
-// Here the whole CTA stages each activation k-slice into SHARED memory once,
-// coalesced, and the eight warps' dots read it from there. The per-lane
-// sub-block sequence is the kernel above's sequence, sliced — every slice
-// holds a multiple-of-32 sub-block count for every quant type, so each lane
-// sees the same sub-blocks in the same ascending order and the result stays
-// BYTE-IDENTICAL. Weights are untouched (their per-lane loads are already
-// 16-byte-aligned vectors). Prefill-only: decode never runs this.
-#define TILE_K 1024                  // staged slice; divides every blck (256, 32)
-template <int NB>
-__global__ static void matmul_i8r_ts_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
-                                            const int8_t *xq, const float2 *xds, int k, int m) {
-    extern __shared__ unsigned char sh[];
-    int8_t *sxq  = (int8_t *)sh;                          // [NB][TILE_K]
-    float2 *sxds = (float2 *)(sh + (size_t)NB * TILE_K);  // [NB][TILE_K/32]
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int row = blockIdx.x * (blockDim.x >> 5) + warp;      // row >= m still helps stage
-    const unsigned char *wrow = row < m ? wbase + (size_t)row * (k / blck) * ts : NULL;
-    int gpb = blck / 32;
-    int nsub = 0;
-    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
-    else if (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K) nsub = 16;
-    else if (type == GGML_TYPE_Q8_0) nsub = 1;
-    float s[NB];
-    #pragma unroll
-    for (int j = 0; j < NB; j++) s[j] = 0.0f;
-
-    for (int k0 = 0; k0 < k; k0 += TILE_K) {
-        int kn = k - k0 < TILE_K ? k - k0 : TILE_K;       // k is a multiple of blck
-        __syncthreads();
-        for (int t4 = threadIdx.x; t4 < NB * (kn / 4); t4 += blockDim.x) {
-            int col = t4 / (kn / 4), off = (t4 % (kn / 4)) * 4;
-            *(int *)(sxq + (size_t)col * TILE_K + off) = *(const int *)(xq + (size_t)col * k + k0 + off);
-        }
-        for (int tg = threadIdx.x; tg < NB * (kn / 32); tg += blockDim.x) {
-            int col = tg / (kn / 32), g = tg % (kn / 32);
-            sxds[(size_t)col * (TILE_K / 32) + g] = xds[(size_t)col * (k / 32) + k0 / 32 + g];
-        }
-        __syncthreads();
-        if (!wrow) continue;
-        int si0 = (k0 / blck) * nsub, si1 = si0 + (kn / blck) * nsub;
-        for (int si = si0 + lane; si < si1; si += 32) {
-            int b = si / nsub, sj = si % nsub;
-            const unsigned char *blk = wrow + (size_t)b * ts;
-            const int8_t *xq0 = sxq + (b * blck - k0);    // column 0 in shared; stride TILE_K
-            const float2 *xds0 = sxds + (b * gpb - k0 / 32);
-            switch (type) {
-                case GGML_TYPE_Q4_K: sub_q4_K_n<NB>((const block_q4_K *)blk, sj, xq0, TILE_K, xds0, TILE_K / 32, s); break;
-                case GGML_TYPE_Q5_K: sub_q5_K_n<NB>((const block_q5_K *)blk, sj, xq0, TILE_K, xds0, TILE_K / 32, s); break;
-                case GGML_TYPE_Q3_K: sub_q3_Kr_n<NB>((const block_q3_Kr *)blk, sj, xq0, TILE_K, xds0, TILE_K / 32, s); break;
-                case GGML_TYPE_Q6_K: sub_q6_Kr_n<NB>((const block_q6_Kr *)blk, sj, xq0, TILE_K, xds0, TILE_K / 32, s); break;
-                case GGML_TYPE_Q8_0: sub_q8_0_n<NB>((const block_q8_0 *)blk, xq0, TILE_K, xds0, TILE_K / 32, s); break;
-            }
-        }
-    }
-    if (!wrow) return;
-    #pragma unroll
-    for (int j = 0; j < NB; j++) {
-        float v = s[j];
-        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-        if (lane == 0) out[(size_t)j * m + row] = v;
-    }
-}
-
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    int nsub = ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0;
-    if (nsub) {
-        size_t shm = (size_t)PREFILL_B * TILE_K + (size_t)PREFILL_B * (TILE_K / 32) * sizeof(float2);
-        matmul_i8r_ts_kernel<PREFILL_B><<<blocks, 256, shm, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m);
-    } else {
-        matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
-    }
+    matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
 static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
