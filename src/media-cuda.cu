@@ -43,9 +43,13 @@ struct vcuda {
 // ---- kernels ----------------------------------------------------------------
 
 // C[t][n] = A[t][k] . W[n][k] — classic 16x16 shared-memory tiles, weights f16.
+// The w tile is padded one column: the dot loop reads w[threadIdx.x][i], a
+// 16-float stride that would land a warp's 16 columns on 2 of the 32 shared
+// banks (8-way serialization, on the loop's hottest load). One pad column
+// makes the stride 17 and the 16 addresses hit 16 distinct banks.
 #define TS 16
 static __global__ void k_gemm(float *C, const float *A, const __half *W, int T, int K, int N) {
-    __shared__ float a[TS][TS], w[TS][TS];
+    __shared__ float a[TS][TS], w[TS][TS + 1];
     int tn = blockIdx.x * TS + threadIdx.x;             // output column = weight row
     int tt = blockIdx.y * TS + threadIdx.y;             // position
     float acc = 0.0f;
