@@ -551,13 +551,30 @@ __device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, ui
     }
 }
 
+// One thread's share of staging activation block `blk` into buffer `buf`,
+// issued as cp.async so it overlaps the previous block's mma work.
+__device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
+                                   const int8_t *xq, const float2 *xds, int k, int blk, int tix) {
+    // 256 threads: all of them carry one 16 B cp.async of sB (16 cols x 16
+    // pieces = exactly 256), and the first 128 ALSO stage one float2 of sBxds
+    // with a plain store (1 KB - not worth an async path; same double-buffer
+    // safety, it lands in the buffer nobody reads until after the barrier).
+    int col = tix >> 4, off = (tix & 15) * 16;
+    unsigned dst = (unsigned)__cvta_generic_to_shared(sB + buf * 16 * 256 + col * 256 + off);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(xq + (size_t)col * k + blk * 256 + off));
+    if (tix < 16 * 8) {
+        int xcol = tix >> 3, g = tix & 7;
+        sBxds[buf * 16 * 8 + xcol * 8 + g] = xds[(size_t)xcol * (k / 32) + blk * 8 + g];
+    }
+}
+
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                       const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [16 cols][256] one block span
-    float2 *sBxds = (float2 *)(sh + 16 * 256);                     // [16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 16 * 256 + 16 * 8 * 8);        // [8 warps][2 halves][16 rows][32]
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
+    float2 *sBxds = (float2 *)(sh + 2 * 16 * 256);                 // [2 bufs][16 cols][8]
+    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [8 warps][2 halves][16][32]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = blockIdx.x * 128 + warp * 16;
     const int gid = lane >> 2, tid = lane & 3;
@@ -571,15 +588,19 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     int rowL = r0 + (lane & 15); if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
 
+    mma_stage_b(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);         // prologue: block 0 in flight
+    asm volatile("cp.async.commit_group;\n");
+
     for (int blk = 0; blk < nbk; blk++) {
-        __syncthreads();                                           // prev block's sB reads done
-        for (int t = threadIdx.x; t < 16 * 64; t += 256) {         // 16 cols x 256 B, word-wise
-            int col = t >> 6, w4 = (t & 63) * 4;
-            *(uint32_t *)(sB + col * 256 + w4) = ld32(xq + (size_t)col * k + blk * 256 + w4);
+        int buf = blk & 1;
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();                                           // staged data visible CTA-wide
+        if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
+            mma_stage_b(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            asm volatile("cp.async.commit_group;\n");
         }
-        for (int t = threadIdx.x; t < 16 * 8; t += 256)
-            sBxds[t] = xds[(size_t)(t >> 3) * (k / 32) + blk * 8 + (t & 7)];
-        __syncthreads();
+        const int8_t *sBb = sB + buf * 16 * 256;
+        const float2 *sBxd = sBxds + buf * 16 * 8;
 
         const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
         uint32_t s0 = ((const uint32_t *)hp->scales)[0];
@@ -621,15 +642,15 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                 #pragma unroll
                 for (int h = 0; h < 2; h++) {
                     int colb = h * 8 + gid;
-                    uint32_t b0 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4);
-                    uint32_t b1 = *(uint32_t *)(sB + colb * 256 + sj * 32 + tid * 4 + 16);
+                    uint32_t b0 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4);
+                    uint32_t b1 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4 + 16);
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                         : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-                    float2 xd0 = sBxds[(h * 8 + tid * 2) * 8 + sj];
-                    float2 xd1 = sBxds[(h * 8 + tid * 2 + 1) * 8 + sj];
+                    float2 xd0 = sBxd[(h * 8 + tid * 2) * 8 + sj];
+                    float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * 8 + sj];
                     acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
                     acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
                     acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
@@ -670,7 +691,7 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
-        size_t shm = 16 * 256 + 16 * 8 * sizeof(float2) + 8 * 2 * 16 * 32;   // sB + sBxds + sA = 13 KB
+        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + 8 * 2 * 16 * 32;   // sB x2 + sBxds x2 + sA = 18 KB
         matmul_q4k_mma_kernel<<<(m + 127) / 128, 256, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         return;
     }
