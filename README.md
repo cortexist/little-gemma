@@ -147,6 +147,12 @@ join it later without breaking anything:
 - **The reply is the raw token stream**, special tokens included — the thinking
   channel, the markers, and the closing `<turn|>` that downstream tools can
   split turns on. The server filters nothing; presentation is the client's job.
+- **Input is symmetric: control tokens pass through.** Special-token text in a
+  line (`<|tool>`, `<|tool_response>`, `<|think|>`, even `<turn|>`) encodes as
+  the real control tokens — so a client can speak the full Gemma 4 protocol,
+  tool calling included, with no tool-calling code in the runner. The flip
+  side is deliberate too: the server does not neutralize tags, so sanitizing
+  untrusted text belongs upstream, exactly where TLS and auth already live.
 - stdout/stderr are logging only; per-turn stats go to stderr.
 - A turn is capped at 1,024 output tokens (`SERVE_GEN`): greedy decoding has
   no sampler and no repetition penalty, so a degenerate loop would otherwise
