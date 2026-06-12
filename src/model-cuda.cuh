@@ -1032,7 +1032,23 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
         fprintf(stderr, "prefill profile (%d chunk tokens): matmul %.2fs, attention %.2fs, elementwise %.2fs, ple %.2fs\n",
                 i, g_pf_mm, g_pf_attn, g_pf_elem, g_pf_ple);
     if (pf_on() && i > 0) matmul_coverage_print();
-    for (; i < n; i++)                                // remainder: the per-token path (no head)
+    // Remainder: PAD to one more chunk instead of single-token forwards. A
+    // short serve turn (a robot camera frame, a one-line question) is MOSTLY
+    // remainder, and every single costs a full decode pass — a 71-token image
+    // turn spent more time in its ~20 stragglers than in its chunks. The pad
+    // repeats the last real token at the following positions; those kv rows
+    // are rewritten by whatever comes next (the next segment, the turn's
+    // final forward) before anything can read them — every consumer writes
+    // position p before its attention reads p, and reads stop at its own
+    // position. Real rows' math is the chunk path's: byte-identical.
+    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
+        int padded[PREFILL_B];
+        for (int j = 0; j < PREFILL_B; j++) padded[j] = tokens[i + (j < n - i ? j : n - i - 1)];
+        forward_chunk(m, kv, padded, pos0 + i);
+        if (g_graph_warmups < 2) g_graph_warmups = 2;
+        return;
+    }
+    for (; i < n; i++)                                // 0-1 tokens (or no room): singles
         forward_token(m, kv, tokens[i], pos0 + i, 0);
 }
 
@@ -1044,7 +1060,21 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
     for (; n - i >= PREFILL_B; i += PREFILL_B)
         forward_chunk_embd(m, kv, rows + (size_t)i * n_embd, pos0 + i);
     if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
-    for (; i < n; i++) {                              // remainder: one row through the no-head graph
+    // pad the remainder to a full chunk, exactly as model_prefill does (the
+    // last row repeats; the pad rows' kv is overwritten before it can be read)
+    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
+        float *padded = (float *)malloc((size_t)PREFILL_B * n_embd * 4);
+        if (padded) {
+            for (int j = 0; j < PREFILL_B; j++)
+                memcpy(padded + (size_t)j * n_embd,
+                       rows + (size_t)(i + (j < n - i ? j : n - i - 1)) * n_embd, (size_t)n_embd * 4);
+            forward_chunk_embd(m, kv, padded, pos0 + i);
+            free(padded);
+            if (g_graph_warmups < 2) g_graph_warmups = 2;
+            return;
+        }
+    }
+    for (; i < n; i++) {                              // 0-1 rows (or no room): singles
         CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)i * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
         int pos = pos0 + i;
         CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
