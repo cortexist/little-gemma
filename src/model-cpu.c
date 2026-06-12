@@ -13,6 +13,27 @@
 // ---- math kernels (plain f32; the part CUDA will replace) -----------------
 
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
+const int model_kv_host = 1;     // this backend's kvcache rows are host memory
+
+// The verify pair, sequentially: byte-identical to plain decoding by
+// construction (they ARE the same forwards), and last_hidden lands on the
+// last valid position automatically — the second forward only runs on accept.
+int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
+    out[0] = model_forward_next(m, kv, tok0, pos);
+    if (out[0] != tok1) return 1;
+    out[1] = model_forward_next(m, kv, tok1, pos + 1);
+    return 2;
+}
+
+// The host draft path in mtp.c does all the work on this backend.
+#include "mtp-internal.h"
+int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                      int token, int pos) {
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    return -1;
+}
+void mtp_free_device(struct mtp *t) { (void)t; }
+
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -367,6 +388,8 @@ static void forward_core(struct model *m, struct kvcache *kv, const float *x_in,
     // its kv writes, and the head is the largest matmul in the model.
     if (logits) {
         rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
+        if (m->last_hidden)                       // h_prev for the MTP draft head
+            memcpy(m->last_hidden, x, (size_t)n_embd * sizeof(float));
         matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
         if (c->logit_softcap > 0.0f) {
             float sc = c->logit_softcap;

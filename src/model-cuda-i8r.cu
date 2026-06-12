@@ -160,6 +160,132 @@ __device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const f
     return xds[0].x * d_fp16(p->d) * dot;
 }
 
+// Chunk-form siblings of the subs above: identical math in identical order
+// per column — but every weight byte is loaded ONCE into registers and dotted
+// against all NB activation columns. The scalar subs re-load the weight bytes
+// for each column; under L1 on a discrete GPU that re-load is free, which is
+// why nobody noticed — but the Orin reads its in-place (zero-copy,
+// cudaHostRegister'd) q4_K/q5_K weights UNCACHED, so there the re-loads
+// multiplied chunk weight traffic by NB: a B=2 MTP verify cost two full
+// decode passes, and prefill chunks paid up to Bx the same way.
+template <int NB>
+__device__ static void sub_q4_K_n(const block_q4_K *p, int sj, const int8_t *xq0, int k,
+                                  const float2 *xds0, int kg, float *s) {
+    uint8_t sc, mm; d_gsm32(sj, (const uint32_t *)p->scales, &sc, &mm);
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    uint4 qa = q[0], qb = q[1];
+    int w0 = nib4(qa.x, half), w1 = nib4(qa.y, half), w2 = nib4(qa.z, half), w3 = nib4(qa.w, half);
+    int w4 = nib4(qb.x, half), w5 = nib4(qb.y, half), w6 = nib4(qb.z, half), w7 = nib4(qb.w, half);
+    float d, mn; d_dm(&p->d, &d, &mn);
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int4 *a = (const int4 *)(xq0 + (size_t)j * k + sj * 32);
+        int4 a0 = a[0], a1 = a[1];
+        int dot = 0;
+        dot = __dp4a(w0, a0.x, dot); dot = __dp4a(w1, a0.y, dot);
+        dot = __dp4a(w2, a0.z, dot); dot = __dp4a(w3, a0.w, dot);
+        dot = __dp4a(w4, a1.x, dot); dot = __dp4a(w5, a1.y, dot);
+        dot = __dp4a(w6, a1.z, dot); dot = __dp4a(w7, a1.w, dot);
+        float2 xd = xds0[(size_t)j * kg + sj];
+        s[j] += xd.x * (d * sc * dot - mn * mm * xd.y);
+    }
+}
+template <int NB>
+__device__ static void sub_q5_K_n(const block_q5_K *p, int sj, const int8_t *xq0, int k,
+                                  const float2 *xds0, int kg, float *s) {
+    uint8_t sc, mm; d_gsm32(sj, (const uint32_t *)p->scales, &sc, &mm);
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    const uint4 *qh = (const uint4 *)p->qh;
+    int bitpos = 2 * g + half;
+    uint4 qa = q[0], qb = q[1], ha = qh[0], hb = qh[1];
+    int w0 = nib4(qa.x, half) | (int)(((ha.x >> bitpos) & 0x01010101u) << 4);
+    int w1 = nib4(qa.y, half) | (int)(((ha.y >> bitpos) & 0x01010101u) << 4);
+    int w2 = nib4(qa.z, half) | (int)(((ha.z >> bitpos) & 0x01010101u) << 4);
+    int w3 = nib4(qa.w, half) | (int)(((ha.w >> bitpos) & 0x01010101u) << 4);
+    int w4 = nib4(qb.x, half) | (int)(((hb.x >> bitpos) & 0x01010101u) << 4);
+    int w5 = nib4(qb.y, half) | (int)(((hb.y >> bitpos) & 0x01010101u) << 4);
+    int w6 = nib4(qb.z, half) | (int)(((hb.z >> bitpos) & 0x01010101u) << 4);
+    int w7 = nib4(qb.w, half) | (int)(((hb.w >> bitpos) & 0x01010101u) << 4);
+    float d, mn; d_dm(&p->d, &d, &mn);
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int4 *a = (const int4 *)(xq0 + (size_t)j * k + sj * 32);
+        int4 a0 = a[0], a1 = a[1];
+        int dot = 0;
+        dot = __dp4a(w0, a0.x, dot); dot = __dp4a(w1, a0.y, dot);
+        dot = __dp4a(w2, a0.z, dot); dot = __dp4a(w3, a0.w, dot);
+        dot = __dp4a(w4, a1.x, dot); dot = __dp4a(w5, a1.y, dot);
+        dot = __dp4a(w6, a1.z, dot); dot = __dp4a(w7, a1.w, dot);
+        float2 xd = xds0[(size_t)j * kg + sj];
+        s[j] += xd.x * (d * sc * dot - mn * mm * xd.y);
+    }
+}
+template <int NB>
+__device__ static void sub_q3_Kr_n(const block_q3_Kr *p, int sj, const int8_t *xq0, int k,
+                                   const float2 *xds0, int kg, float *s) {
+    int ni = sj >> 3, rem = sj & 7, jj = rem >> 1, half = rem & 1;
+    int shift = 2 * jj, bitpos = ni * 4 + jj;
+    const uint8_t *qs = p->qs + ni * 32 + half * 16;
+    const uint8_t *hm = p->hmask + half * 16;
+    int g_act = ni * 4 + jj;
+    int w[4];
+    for (int l = 0; l < 16; l += 4) {
+        uint32_t q32 = (ld32(qs + l) >> shift) & 0x03030303u;
+        uint32_t h32 = (ld32(hm + l) >> bitpos) & 0x01010101u;
+        w[l >> 2] = (int)__vsub4(q32, __vsub4(0x04040404u, h32 << 2));
+    }
+    float dd = d_fp16(p->d);
+    float sc8 = p->scales[sj];
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int8_t *xqg = xq0 + (size_t)j * k + g_act * 32 + half * 16;
+        int dot = 0;
+        for (int l = 0; l < 16; l += 4) dot = __dp4a(w[l >> 2], *(const int *)(xqg + l), dot);
+        s[j] += xds0[(size_t)j * kg + g_act].x * dd * sc8 * dot;
+    }
+}
+template <int NB>
+__device__ static void sub_q6_Kr_n(const block_q6_Kr *p, int sj, const int8_t *xq0, int k,
+                                   const float2 *xds0, int kg, float *s) {
+    int ni = sj >> 3, rem = sj & 7, grp = rem >> 1, hl = rem & 1;
+    int sh = grp * 2, off = (grp & 1) ? 32 : 0, hin = (grp >= 2);
+    const uint8_t *ql = p->ql + ni * 64 + off + hl * 16;
+    const uint8_t *qh = p->qh + ni * 32 + hl * 16;
+    int g_act = ni * 4 + grp;
+    int w[4];
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t l32 = ld32(ql + i);
+        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
+        uint32_t hi = ((ld32(qh + i) >> sh) & 0x03030303u) << 4;
+        w[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+    }
+    float dd = d_fp16(p->d);
+    float sc8 = p->scales[ni * 8 + 2 * grp + hl];
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int8_t *xqg = xq0 + (size_t)j * k + g_act * 32 + hl * 16;
+        int dot = 0;
+        for (int i = 0; i < 16; i += 4) dot = __dp4a(w[i >> 2], *(const int *)(xqg + i), dot);
+        s[j] += xds0[(size_t)j * kg + g_act].x * dd * sc8 * dot;
+    }
+}
+template <int NB>
+__device__ static void sub_q8_0_n(const block_q8_0 *p, const int8_t *xq0, int k,
+                                  const float2 *xds0, int kg, float *s) {
+    int8_t w[32];
+    for (int i = 0; i < 32; i++) w[i] = p->qs[i];
+    float dd = d_fp16(p->d);
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int8_t *xqb = xq0 + (size_t)j * k;
+        int dot = 0;
+        for (int i = 0; i < 32; i++) dot += (int)w[i] * xqb[i];
+        s[j] += xds0[(size_t)j * kg].x * dd * dot;
+    }
+}
+
 // out[i] = W[i,:] . x : one warp per output row. For K-quant/q8_0 weights the
 // lanes split the row's sub-blocks (integer dots); for bf16/f32/f16 they fall
 // back to the f32 path (lane 0). A shuffle reduces the per-lane partials.
@@ -328,7 +454,11 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
 // (the per-column re-reads hit L1). Activations sit at column stride k (int8)
 // and k/32 (scales), exactly as the producers' epilogues laid them out. Each
 // column's accumulation order matches the one-column kernel, so the result is
-// bit-identical to PREFILL_B separate matmul_q calls.
+// bit-identical to NB separate matmul_q calls. NB is a template parameter so
+// the register accumulators stay compile-sized: <PREFILL_B> is the frozen
+// prefill instantiation (identical codegen to the former constant), <2> is
+// the MTP verify pair — separate instruction streams, like d_attn's RING.
+template <int NB>
 __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
                                            const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -336,9 +466,9 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     if (warp >= m) return;
     const unsigned char *row = wbase + (size_t)warp * (k / blck) * ts;
     int nb = k / blck, gpb = blck / 32;
-    float s[PREFILL_B];
+    float s[NB];
     #pragma unroll
-    for (int j = 0; j < PREFILL_B; j++) s[j] = 0.0f;
+    for (int j = 0; j < NB; j++) s[j] = 0.0f;
 
     int nsub = 0;
     if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
@@ -350,23 +480,21 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         for (int si = lane; si < total; si += 32) {
             int b = si / nsub, sj = si % nsub;
             const unsigned char *blk = row + (size_t)b * ts;
-            for (int j = 0; j < PREFILL_B; j++) {
-                const int8_t *xqb = xq + (size_t)j * k + (size_t)b * blck;
-                const float2 *xdsb = xds + (size_t)j * (k / 32) + (size_t)b * gpb;
-                switch (type) {
-                    case GGML_TYPE_Q4_K: s[j] += sub_q4_K((const block_q4_K *)blk, sj, xqb, xdsb); break;
-                    case GGML_TYPE_Q5_K: s[j] += sub_q5_K((const block_q5_K *)blk, sj, xqb, xdsb); break;
-                    case GGML_TYPE_Q3_K: s[j] += sub_q3_Kr((const block_q3_Kr *)blk, sj, xqb, xdsb); break;
-                    case GGML_TYPE_Q6_K: s[j] += sub_q6_Kr((const block_q6_Kr *)blk, sj, xqb, xdsb); break;
-                    case GGML_TYPE_Q8_0: s[j] += sub_q8_0((const block_q8_0 *)blk, xqb, xdsb); break;
-                }
+            const int8_t *xq0 = xq + (size_t)b * blck;       // column 0; stride k per column
+            const float2 *xds0 = xds + (size_t)b * gpb;      // column 0; stride k/32
+            switch (type) {
+                case GGML_TYPE_Q4_K: sub_q4_K_n<NB>((const block_q4_K *)blk, sj, xq0, k, xds0, k / 32, s); break;
+                case GGML_TYPE_Q5_K: sub_q5_K_n<NB>((const block_q5_K *)blk, sj, xq0, k, xds0, k / 32, s); break;
+                case GGML_TYPE_Q3_K: sub_q3_Kr_n<NB>((const block_q3_Kr *)blk, sj, xq0, k, xds0, k / 32, s); break;
+                case GGML_TYPE_Q6_K: sub_q6_Kr_n<NB>((const block_q6_Kr *)blk, sj, xq0, k, xds0, k / 32, s); break;
+                case GGML_TYPE_Q8_0: sub_q8_0_n<NB>((const block_q8_0 *)blk, xq0, k, xds0, k / 32, s); break;
             }
         }
     } else if (type == GGML_TYPE_F32) {
         const float *wr = (const float *)row;
         for (int i = lane; i < k; i += 32) {
             float w = wr[i];
-            for (int j = 0; j < PREFILL_B; j++) s[j] += w * x[(size_t)j * k + i];
+            for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
         }
     } else {                                             // bf16 / f16: one uint32 = 2 elements
         const uint16_t *wr = (const uint16_t *)row;
@@ -374,12 +502,12 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
             uint32_t two = ld32(wr + i);
             float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
             float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
-            for (int j = 0; j < PREFILL_B; j++)
+            for (int j = 0; j < NB; j++)
                 s[j] += w0 * x[(size_t)j * k + i] + w1 * x[(size_t)j * k + i + 1];
         }
     }
     #pragma unroll
-    for (int j = 0; j < PREFILL_B; j++) {
+    for (int j = 0; j < NB; j++) {
         float v = s[j];
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
         if (lane == 0) out[(size_t)j * m + warp] = v;
@@ -392,5 +520,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    matmul_i8r_n_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+}
+static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
+    int blck = ggml_blck_size(t->type), ts;
+    const unsigned char *w = rweight(t, &ts);
+    int blocks = (m + 7) / 8;
+    matmul_i8r_n_kernel<2><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }

@@ -32,7 +32,7 @@ endif()
 # Shared, backend-agnostic sources. model.c = common host setup; media.c = the
 # multimodal embedders (host f32 compute, all backends share it); the compute
 # backend is model-cpu.c (CPU) or model-cuda-{f32,i8}.cu (CUDA), selected per target.
-set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c src/media.c)
+set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c src/media.c src/mtp.c)
 
 # --- CPU build -------------------------------------------------------------
 add_executable(run ${CORE} src/model-cpu.c)

@@ -41,6 +41,10 @@ struct model {
     int                       *ffn_len;    // per layer: feed-forward width (elastic FFN)
     int                       *head_dim;   // per layer: size of one attention head
     int                       *n_head_kv;  // per layer: number of key/value heads
+    float                     *last_hidden; // post-output-norm hidden of the most
+                                            // recent logits-producing forward — what
+                                            // the MTP draft head feeds on (n_embd;
+                                            // the CPU backend fills it each forward)
 };
 
 int  model_init(struct model *m, const struct gguf_context *ctx);
@@ -102,5 +106,34 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
 // token's (id 0) per-layer row beside the usual projection of its embedding,
 // matching the reference; the 12B has no PLE at all.
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0);
+
+// ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
+// A tiny transformer that predicts the token AFTER next by cross-attending
+// straight into the target's KV cache (it has no K/V projections of its own).
+// Greedy verify means drafts NEVER change the output — only how many target
+// forwards run per emitted token. Host implementation: needs the cache rows
+// in host memory (model_kv_host == 1; the CPU backend).
+struct mtp;
+struct mtp *mtp_open(const char *path, const struct model *m);
+void        mtp_free(struct mtp *t);
+// Draft the successor of `token` — the freshly chosen token for position
+// `pos`, whose own forward need not have run. The backend supplies the other
+// half of the head's input itself: the hidden state of the forward that chose
+// `token` (CPU: model.last_hidden; CUDA: kept on the device).
+int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
+              int token, int pos);
+
+// Verify a draft: feed tok0 at pos and tok1 (the draft) at pos+1 in one
+// batched step. out[0] = greedy successor of tok0 (always valid); out[1] =
+// successor of tok1 (valid only when out[0] == tok1, i.e. the draft held).
+// Returns tokens advanced: 2 on accept, 1 on reject. The backend leaves its
+// h_prev at the last valid position either way, so drafting chains. With
+// greedy verification the emitted text is IDENTICAL to plain greedy decoding
+// — only the number of forwards per token changes.
+int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out);
+
+// 1 if this backend's kvcache rows live in host memory (the CPU backend);
+// the CUDA backends keep them — and the draft head — on the device.
+extern const int model_kv_host;
 
 #endif // MODEL_H

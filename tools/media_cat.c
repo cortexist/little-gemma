@@ -269,12 +269,21 @@ int main(int argc, char **argv) {
     if (send_all(s, line, strlen(line)) != 0) { fprintf(stderr, "send failed\n"); return 1; }
     shutdown(s, SHUT_SEND);
 
-    // stream the reply until the server closes (it finishes the turn in flight)
-    char buf[4096];
-    int k;
-    while ((k = (int)recv(s, buf, sizeof buf, 0)) > 0) {
-        fwrite(buf, 1, (size_t)k, stdout);
+    // Stream the reply and exit at the turn marker. A one-turn client should
+    // not wait for the server to react to our half-close — the answer's end
+    // is in-band ("<turn|>"), and depending on connection teardown for it
+    // left the tool hanging on platforms where that notice arrives late.
+    // The 7-byte overlap catches a marker split across recv boundaries.
+    char buf[4096 + 8];
+    int hn = 0, k;
+    while ((k = (int)recv(s, buf + hn, 4096, 0)) > 0) {
+        fwrite(buf + hn, 1, (size_t)k, stdout);
         fflush(stdout);
+        buf[hn + k] = 0;
+        if (strstr(buf, "<turn|>")) break;
+        int keep = hn + k < 7 ? hn + k : 7;
+        memmove(buf, buf + hn + k - keep, (size_t)keep);
+        hn = keep;
     }
     putchar('\n');
     sock_close(s);

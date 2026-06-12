@@ -20,7 +20,16 @@
 extern "C" {
 #include "model.h"
 #include "quant.h"
+#include "mtp-internal.h"
 }
+
+// kvcache rows live on the device here, and so will the draft head: the CUDA
+// MTP port (device-side assistant + batched verify + async overlap) is the
+// in-progress follow-up — until it lands, drafting on this backend declines.
+extern "C" const int model_kv_host = 0;
+
+// The device draft is implemented at the end of this file (it needs d_attn,
+// the norm/geglu/argmax kernels and g_hidden, all defined below).
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
@@ -464,6 +473,11 @@ static int kv_src_dev(const struct model *m, int L) {
 
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
+static float *g_hidden;                 // post-output-norm hidden of the last
+                                        // head-bearing forward (the MTP draft
+                                        // head's h_prev; 15 KB, copied per token)
+static float *d_logits2;                // MTP verify: logits at both pair rows
+static int *d_best2;                    // MTP verify: argmax of each row
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
 static int *d_pos;                      // device-resident token position (for static graph)
 static int *d_best;                     // device-side argmax result
@@ -505,6 +519,9 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&dxb, B * q_max * 4)); CUDA_CHECK(cudaMalloc(&dkb, B * maxkv * 4));
     CUDA_CHECK(cudaMalloc(&dvb, B * maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, B * nff * 4));
     CUDA_CHECK(cudaMalloc(&dg2, B * nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
+    CUDA_CHECK(cudaMalloc(&g_hidden, (size_t)ne * 4));
+    CUDA_CHECK(cudaMalloc(&d_logits2, (size_t)2 * c->n_vocab * 4));   // MTP verify pair
+    CUDA_CHECK(cudaMalloc(&d_best2, 2 * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
@@ -532,6 +549,7 @@ static void ensure_scratch(struct model *m) {
 //   produces (the host-uploaded embedding); no-op for f32.
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static struct actq actq_for(int k);
 static void act_quantize(const float *d_x, int k);
 
@@ -602,9 +620,11 @@ static int build_per_layer(struct model *m, int token) {
 // The chunk form: PLE inputs for PREFILL_B tokens — one [n_layer*ple] record
 // per token, laid out back to back in d_ipl. Same math per token; the bf16
 // projection (the big matmul here) reads its weights once for the whole chunk.
-static int build_per_layer_n(struct model *m, const int *tokens) {
+typedef void (*matmul_fn)(float *, const struct gguf_tensor *, const float *, int, int);
+
+static int build_per_layer_n(struct model *m, const int *tokens, int B, matmul_fn mm) {
     const struct config *c = &m->cfg;
-    const int ple = c->n_embd_per_layer, B = PREFILL_B;
+    const int ple = c->n_embd_per_layer;
     if (ple <= 0) return 0;
     const struct gguf_tensor *pte = gguf_find_tensor(m->ctx, "per_layer_token_embd.weight");
     if (!pte) return 0;
@@ -623,7 +643,7 @@ static int build_per_layer_n(struct model *m, const int *tokens) {
     free(host);
 
     act_quantize(dx, B * c->n_embd);                  // dx came from the host, no producer kernel
-    matmul_q_n(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
+    mm(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
     scale_const_kernel<<<gridn(B * (int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), B * (int)total);
     rmsnorm_kernel<<<B * c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps, AQ0);
     combine_kernel<<<gridn(B * (int)total), 256>>>(d_ipl, d_proj, d_tok, 1.0f / sqrtf(2.0f), B * (int)total);
@@ -729,6 +749,9 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
 static void forward_head(struct model *m) {
     const struct config *c = &m->cfg;
     rmsnorm_kernel<<<1, NORM_THREADS(c->n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), c->n_embd, c->rms_eps, actq_for(c->n_embd));
+    // keep the post-norm hidden for the MTP draft head (a static graph node;
+    // 15 KB D2D, measured no decode cost — see the journal)
+    CUDA_CHECK(cudaMemcpyAsync(g_hidden, dx, (size_t)c->n_embd * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     matmul_q(dlogits, wq(m, "token_embd.weight"), dx, c->n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(c->n_vocab), 256>>>(dlogits, c->logit_softcap, c->n_vocab);
@@ -749,9 +772,9 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
 // written to the cache before its queries run; causality holds because each
 // query reads only up to its own position. Runs un-captured (and without the
 // fork/join forks): a chunk already amortizes launch latency over its B tokens.
-static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple) {
+static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B, matmul_fn mm) {
     const struct config *c = &m->cfg;
-    const int B = PREFILL_B, n_embd = c->n_embd, n_head = c->n_head;
+    const int n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
     const float *d_rope_freqs = dW(m, "rope_freqs.weight");
 
@@ -769,12 +792,12 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple) {
         int src = kv_src_dev(m, L);
         const int has_kv = L < c->n_kv_start;
         if (has_kv) {
-            matmul_q_n(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
+            mm(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) matmul_q_n(dvb, wv, dh, n_embd, kv_dim);
+            if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
             else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         }
-        matmul_q_n(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
         if (has_kv) {
@@ -803,25 +826,25 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple) {
         else
             attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
 
-        matmul_q_n(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
+        mm(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
-        matmul_q_n(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
-        matmul_q_n(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
+        mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
         geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
-        matmul_q_n(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
+        mm(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
                                        has_ple ? NULL : os, has_ple ? actq_for(B * n_embd) : AQ0);
 
         // ---- per-layer input (PLE) ----
         if (has_ple) {
             const int ple = c->n_embd_per_layer;
-            matmul_q_n(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
+            mm(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
             geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
-            matmul_q_n(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
+            mm(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
             rmsnorm_add_n_kernel<<<B, NORM_THREADS(n_embd)>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0);
         }
     }
@@ -850,8 +873,8 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
     free(rows);
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
-    build_per_layer_n(m, tokens);
-    chunk_layers(m, kv, model_has_ple(m));
+    build_per_layer_n(m, tokens, PREFILL_B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), PREFILL_B, matmul_q_n);
 }
 
 // Embedding form (media tokens): the rows enter exactly as given — media
@@ -866,9 +889,9 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
     int has_ple = model_has_ple(m);
     if (has_ple) {
         int pad[PREFILL_B] = { 0 };
-        build_per_layer_n(m, pad);
+        build_per_layer_n(m, pad, PREFILL_B, matmul_q_n);
     }
-    chunk_layers(m, kv, has_ple);
+    chunk_layers(m, kv, has_ple, PREFILL_B, matmul_q_n);
 }
 
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
@@ -960,6 +983,356 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
         if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row
         forward_graph(m, kv, 0);
     }
+}
+
+// The MTP verify step: tok0 at pos and tok1 (the draft) at pos+1 as ONE B=2
+// chunk — each weight matrix crosses memory once for the pair, which is the
+// entire economics of speculative decoding on a bandwidth-bound device. The
+// head runs at BOTH rows (the only place that happens; prefill always skips
+// it). out[0] = greedy successor of tok0, always valid; out[1] = successor of
+// tok1, valid only when out[0] == tok1. Returns how many tokens advanced (2 =
+// draft confirmed). g_hidden is left holding the LAST VALID row's post-norm
+// hidden, so the next draft chains correctly on accept and reject alike. A
+// rejected pair's cache rows are overwritten by the next step before any
+// query at those positions runs — causality makes rollback unnecessary.
+// Device-only slice of the verify: layers at B=2 plus the head at both rows.
+// Everything reads d_pos on-device, so node parameters never vary -> this
+// captures into a static CUDA graph exactly like decode does (the un-captured
+// form costs ~1030 raw launches per step, which is precisely where sync MTP
+// went to die on WDDM machines).
+static void verify_head(struct model *m) {
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+    rmsnorm_kernel<<<2, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(2 * n_embd));
+    matmul_q_2(d_logits2, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
+    if (c->logit_softcap > 0.0f)
+        softcap_kernel<<<gridn(2 * c->n_vocab), 256>>>(d_logits2, c->logit_softcap, 2 * c->n_vocab);
+    argmax_kernel<<<1, 1024>>>(d_logits2, c->n_vocab, d_best2);
+    argmax_kernel<<<1, 1024>>>(d_logits2 + c->n_vocab, c->n_vocab, d_best2 + 1);
+}
+static void verify_layers_and_head(struct model *m, struct kvcache *kv, int has_ple) {
+    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
+    verify_head(m);
+}
+
+static double now_sec_dev(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+// LG_MTP_PROFILE=1: run the verify un-captured with syncs around its two
+// halves and report — the tool that finds where a 2x-over-theory round goes.
+static void verify_profiled(struct model *m, struct kvcache *kv, int has_ple) {
+    static double tl = 0, th = 0;
+    static int n = 0;
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    double t0 = now_sec_dev();
+    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    double t1 = now_sec_dev();
+    verify_head(m);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    tl += t1 - t0; th += now_sec_dev() - t1;
+    if (++n % 50 == 0)
+        fprintf(stderr, "verify profile over %d: layers %.1fms ea, head %.1fms ea\n", n, 1e3 * tl / n, 1e3 * th / n);
+}
+
+static cudaGraphExec_t g_graph2_exec = NULL;
+static int g_graph2_warmups = 0;
+static void verify_graph(struct model *m, struct kvcache *kv, int has_ple) {
+    if (g_graph2_warmups < 2) {                  // one-time mallocs (ensure_act) finish un-captured
+        g_graph2_warmups++;
+        verify_layers_and_head(m, kv, has_ple);
+        return;
+    }
+    if (!g_graph2_exec) {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        verify_layers_and_head(m, kv, has_ple);
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&g_graph2_exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaGraphLaunch(g_graph2_exec, cudaStreamPerThread));
+}
+
+extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+    int toks[2] = { tok0, tok1 };
+
+    float *rows = (float *)malloc((size_t)2 * n_embd * 4);
+    if (!rows) { fprintf(stderr, "model_forward2: out of memory\n"); exit(1); }
+    float es = sqrtf((float)n_embd);
+    for (int j = 0; j < 2; j++) {
+        float *erow = dequantize_row(wq(m, "token_embd.weight"), toks[j], n_embd);
+        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
+        free(erow);
+    }
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)2 * n_embd * 4, cudaMemcpyHostToDevice));
+    free(rows);
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+
+    int has_ple = model_has_ple(m);
+    if (has_ple) build_per_layer_n(m, toks, 2, matmul_q_2);   // un-captured, like decode's PLE build
+    static int prof = -1;
+    if (prof < 0) prof = getenv("LG_MTP_PROFILE") != NULL;
+    if (prof) verify_profiled(m, kv, has_ple);
+    else      verify_graph(m, kv, has_ple);
+    CUDA_CHECK(cudaMemcpy(out, d_best2, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int adv = out[0] == tok1 ? 2 : 1;
+    CUDA_CHECK(cudaMemcpyAsync(g_hidden, dx + (size_t)(adv - 1) * n_embd, (size_t)n_embd * 4,
+                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    return adv;
+}
+
+// ==== MTP: the draft head, on the device =====================================
+// The gemma4-assistant forward from src/mtp.c as ~30 kernel launches per
+// draft. Almost everything is REUSE: rmsnorm_kernel (pre/post norms and, with
+// grid = heads, the per-head q norm — exactly how decode uses it),
+// geglu_kernel, softcap_kernel, argmax_kernel, and above all the d_attn
+// template: a draft for position `pos` sees the cache exactly as a query at
+// pos-1 with the window shrunk by one — [pos-window+1, pos-1] sliding,
+// [0, pos-1] full — so two NEW wrappers below pin those arguments and the
+// frozen decode entry points stay untouched. Assistant weights are dequantized
+// once to f16 on the device (77M params, ~150 MB); h_prev is g_hidden, which
+// the decode graph already maintains. The whole draft CAPTURES into one CUDA
+// graph (position read on-device from d_dpos, like decode's d_pos), so a
+// round costs one graph launch + one 4-byte readback instead of ~30 raw
+// launches — on WDDM that launch tax was most of the draft's wall time.
+
+__global__ static void mtp_matvec_h(float *out, const __half *W, const float *x, int k, int m) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= m) return;
+    const __half2 *w2 = (const __half2 *)(const void *)(W + (size_t)row * k);
+    float s = 0.0f;
+    for (int i = lane; i < k / 2; i += 32) {
+        float2 wf = __half22float2(w2[i]);
+        s += wf.x * x[2 * i] + wf.y * x[2 * i + 1];
+    }
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (!lane) out[row] = s;
+}
+
+// NeoX rope at the device-resident draft position (static graph node). No
+// freq factors: the assistant has none.
+__global__ static void mtp_rope(float *v, int half, int hd, const int *dp, float base, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int pos = *dp;
+    int head = idx / half, i = idx % half;
+    float *vh = v + (size_t)head * hd;
+    float freq = powf(base, -2.0f * (float)i / (float)hd);
+    float ang = (float)pos * freq;
+    float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
+    vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
+}
+
+__global__ static void mtp_add_scale(float *x, const float *o, int n, float sc) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = (x[i] + o[i]) * sc;
+}
+
+// The draft at *dp sees the cache as a query at *dp - 1 (see the host draft).
+__global__ static void mtp_attn_h(float *xb, const float *q, const __half *Kc, const __half *Vc,
+                                  int hd, int kv_dim, int gqa, const int *dp, struct actq aq) {
+    d_attn<false, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, 0, 0, aq);
+}
+__global__ static void mtp_attn_swa(float *xb, const float *q, const float *Kc, const float *Vc,
+                                    int hd, int kv_dim, int gqa, const int *dp, int window, int seq, struct actq aq) {
+    d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, window, seq, aq);
+}
+
+struct mtp_ld {
+    float *attn_norm, *q_norm, *post_attn, *ffn_norm, *post_ffw;   // f32, device
+    float out_scale;                                               // scalar, by value
+    __half *q, *o, *gate, *up, *down;
+};
+struct mtp_cuda {
+    struct mtp_ld *l;
+    __half *pre, *head;
+    float *out_norm;
+    float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *logits;            // device scratch
+    int *d_tok;
+    int *d_dpos;                  // device-resident draft position (static graph)
+    cudaGraphExec_t graph;
+    int warmups;
+};
+
+static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type -> device f16
+    size_t n = 1;
+    for (uint32_t i = 0; i < t->n_dims; i++) n *= t->dims[i];
+    float *f = (float *)malloc(n * 4);
+    __half *hh = (__half *)malloc(n * 2);
+    __half *d = NULL;
+    int ok = f && hh && dequantize_into(t->type, t->data, f, (int64_t)n) &&
+             cudaMalloc(&d, n * 2) == cudaSuccess;
+    if (ok) {
+        for (size_t i = 0; i < n; i++) hh[i] = __float2half(f[i]);
+        ok = cudaMemcpy(d, hh, n * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    free(f); free(hh);
+    return ok ? d : NULL;
+}
+static float *mtp_up_f(const float *src, size_t n) {
+    float *d = NULL;
+    if (cudaMalloc(&d, n * 4) != cudaSuccess) return NULL;
+    return cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) == cudaSuccess ? d : NULL;
+}
+
+static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
+    struct mtp_cuda *mc = (struct mtp_cuda *)calloc(1, sizeof *mc);
+    if (!mc) return NULL;
+    mc->l = (struct mtp_ld *)calloc((size_t)t->n_layer, sizeof *mc->l);
+    mc->pre  = mtp_up_h(t->pre);
+    mc->head = mtp_up_h(t->head);
+    mc->out_norm = mtp_up_f(t->out_norm, (size_t)t->n_inner);
+    int ok = mc->l && mc->pre && mc->head && mc->out_norm;
+    int q_max = 0;
+    for (int L = 0; ok && L < t->n_layer; L++) {
+        const struct mtp_layer *s = &t->l[L];
+        struct mtp_ld *d = &mc->l[L];
+        if (t->n_head * s->hd > q_max) q_max = t->n_head * s->hd;
+        d->out_scale = s->out_scale ? s->out_scale[0] : 1.0f;
+        ok = (d->attn_norm = mtp_up_f(s->attn_norm, t->n_inner)) &&
+             (d->q_norm = mtp_up_f(s->q_norm, s->hd)) &&
+             (d->post_attn = mtp_up_f(s->post_attn, t->n_inner)) &&
+             (d->ffn_norm = mtp_up_f(s->ffn_norm, t->n_inner)) &&
+             (d->post_ffw = mtp_up_f(s->post_ffw, t->n_inner)) &&
+             (d->q = mtp_up_h(s->q)) && (d->o = mtp_up_h(s->o)) &&
+             (d->gate = mtp_up_h(s->gate)) && (d->up = mtp_up_h(s->up)) &&
+             (d->down = mtp_up_h(s->down)) != NULL;
+    }
+    ok = ok && cudaMalloc(&mc->cat, (size_t)2 * t->n_bb * 4) == cudaSuccess
+            && cudaMalloc(&mc->x, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->h, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->q, (size_t)q_max * 4) == cudaSuccess
+            && cudaMalloc(&mc->xb, (size_t)q_max * 4) == cudaSuccess
+            && cudaMalloc(&mc->o, (size_t)t->n_inner * 4) == cudaSuccess
+            && cudaMalloc(&mc->g1, (size_t)t->n_ff * 4) == cudaSuccess
+            && cudaMalloc(&mc->g2, (size_t)t->n_ff * 4) == cudaSuccess
+            && cudaMalloc(&mc->logits, (size_t)t->n_vocab * 4) == cudaSuccess
+            && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess
+            && cudaMalloc(&mc->d_dpos, sizeof(int)) == cudaSuccess;
+    if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-cuda
+        fprintf(stderr, "mtp: device upload failed, drafting disabled\n");
+        free(mc->l); free(mc);
+        return NULL;
+    }
+    return mc;
+}
+
+// Every launch in the draft, position read from mc->d_dpos — capturable.
+static void mtp_draft_launches(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                               struct mtp_cuda *mc) {
+    const struct config *c = &m->cfg;
+    const int ni = t->n_inner, nb = t->n_bb, nff = t->n_ff;
+    const float eps = t->eps;
+
+    CUDA_CHECK(cudaMemcpyAsync(mc->cat + nb, g_hidden, (size_t)nb * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->x, mc->pre, mc->cat, 2 * nb, ni);
+
+    for (int L = 0; L < t->n_layer; L++) {
+        const struct mtp_layer *bl = &t->l[L];
+        const struct mtp_ld *dl = &mc->l[L];
+        const int hd = bl->hd, src = bl->src, q_dim = t->n_head * hd;
+        const int gqa = t->n_head / m->n_head_kv[src];
+
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->h, mc->x, dl->attn_norm, ni, eps, AQ0);
+        mtp_matvec_h<<<gridn(q_dim * 32), 256>>>(mc->q, dl->q, mc->h, ni, q_dim);
+        rmsnorm_kernel<<<t->n_head, 256>>>(mc->q, mc->q, dl->q_norm, hd, eps, AQ0);
+        mtp_rope<<<gridn(t->n_head * (hd / 2)), 256>>>(mc->q, hd / 2, hd, mc->d_dpos,
+                                                       bl->local ? t->base_swa : t->base_full,
+                                                       t->n_head * (hd / 2));
+        if (bl->local)
+            mtp_attn_swa<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
+                    (const float *)kv->k[src], (const float *)kv->v[src],
+                    hd, kv->kv_dim[src], gqa, mc->d_dpos,
+                    c->sliding_window > 0 ? c->sliding_window - 1 : 0, kv->seq[src], AQ0);
+        else
+            mtp_attn_h<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
+                    (const __half *)kv->k[src], (const __half *)kv->v[src],
+                    hd, kv->kv_dim[src], gqa, mc->d_dpos, AQ0);
+        mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->o, dl->o, mc->xb, q_dim, ni);
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->o, mc->o, dl->post_attn, ni, eps, AQ0);
+        mtp_add_scale<<<gridn(ni), 256>>>(mc->x, mc->o, ni, 1.0f);
+
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->h, mc->x, dl->ffn_norm, ni, eps, AQ0);
+        mtp_matvec_h<<<gridn(nff * 32), 256>>>(mc->g1, dl->gate, mc->h, ni, nff);
+        mtp_matvec_h<<<gridn(nff * 32), 256>>>(mc->g2, dl->up, mc->h, ni, nff);
+        geglu_kernel<<<gridn(nff), 256>>>(mc->g1, mc->g2, nff, AQ0);
+        mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->o, dl->down, mc->g1, nff, ni);
+        rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->o, mc->o, dl->post_ffw, ni, eps, AQ0);
+        mtp_add_scale<<<gridn(ni), 256>>>(mc->x, mc->o, ni, dl->out_scale);
+    }
+
+    rmsnorm_kernel<<<1, NORM_THREADS(ni)>>>(mc->x, mc->x, mc->out_norm, ni, eps, AQ0);
+    mtp_matvec_h<<<gridn(t->n_vocab * 32), 256>>>(mc->logits, mc->head, mc->x, ni, t->n_vocab);
+    if (t->softcap > 0.0f)
+        softcap_kernel<<<gridn(t->n_vocab), 256>>>(mc->logits, t->softcap, t->n_vocab);
+    argmax_kernel<<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
+}
+
+extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                                int token, int pos) {
+    if (t->cuda == (void *)-1) return -1;
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc) {
+        mc = mtp_cuda_init(t);
+        t->cuda = mc ? (void *)mc : (void *)-1;
+        if (!mc) return -1;
+    }
+    const int nb = t->n_bb;
+
+    // uploads stay outside the graph (fixed buffers, varying data)
+    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
+    if (!erow) return -1;
+    float sc = sqrtf((float)nb);
+    for (int i = 0; i < nb; i++) erow[i] *= sc;
+    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
+    free(erow);
+    CUDA_CHECK(cudaMemcpy(mc->d_dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+
+    if (mc->warmups < 2) {
+        mc->warmups++;
+        mtp_draft_launches(t, m, kv, mc);
+    } else {
+        if (!mc->graph) {
+            cudaGraph_t graph;
+            CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            mtp_draft_launches(t, m, kv, mc);
+            CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&mc->graph, graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        CUDA_CHECK(cudaGraphLaunch(mc->graph, cudaStreamPerThread));
+    }
+
+    int best = -1;
+    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
+    return best;
+}
+
+extern "C" void mtp_free_device(struct mtp *t) {
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc || t->cuda == (void *)-1) return;
+    for (int L = 0; L < t->n_layer; L++) {
+        struct mtp_ld *d = &mc->l[L];
+        cudaFree(d->attn_norm); cudaFree(d->q_norm); cudaFree(d->post_attn);
+        cudaFree(d->ffn_norm); cudaFree(d->post_ffw);
+        cudaFree(d->q); cudaFree(d->o); cudaFree(d->gate); cudaFree(d->up); cudaFree(d->down);
+    }
+    cudaFree(mc->pre); cudaFree(mc->head); cudaFree(mc->out_norm);
+    cudaFree(mc->cat); cudaFree(mc->x); cudaFree(mc->h); cudaFree(mc->q); cudaFree(mc->xb);
+    cudaFree(mc->o); cudaFree(mc->g1); cudaFree(mc->g2); cudaFree(mc->logits); cudaFree(mc->d_tok);
+    cudaFree(mc->d_dpos);
+    if (mc->graph) cudaGraphExecDestroy(mc->graph);
+    free(mc->l);
+    free(mc);
+    t->cuda = NULL;
 }
 
 #endif // MODEL_CUDA_CUH

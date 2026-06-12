@@ -346,8 +346,25 @@ static void client(const char *path) {
     sock_close(s);
 }
 
+// Print one generated token unless it is scaffolding; tracks the thought-
+// channel-name state (the name between <|channel> and <channel|> stays hidden).
+static void emit_token(struct tokenizer *tk, int tok, int *in_thought, int ch_open, int ch_close) {
+    if (tok == ch_open)  { *in_thought = 1; return; }
+    if (tok == ch_close) { *in_thought = 0; return; }
+    if (!*in_thought && !tokenizer_is_special(tk, tok)) {
+        print_piece(tokenizer_token_text(tk, tok));
+        fflush(stdout);
+    }
+}
+
 // Tokenize the prompt under the Gemma chat template, generate greedily, report tok/s.
-static void generate(const struct gguf_context *ctx, const char *prompt) {
+// `mtp_path` (optional) loads a gemma4-assistant draft head and decodes
+// SPECULATIVELY at block 2: draft the successor of each fresh token, then
+// verify [token, draft] as one batched target step — two tokens for one
+// pass's weight traffic when the draft holds. Greedy verification means the
+// output is byte-identical to plain greedy decoding, always; only tok/s and
+// the acceptance rate move.
+static void generate(const struct gguf_context *ctx, const char *prompt, const char *mtp_path) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
 
@@ -368,6 +385,8 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     if (kvcache_init(&kv, &m, n_prompt + N_GEN + 1) != 0) {
         model_free(&m); tokenizer_free(tk); return;
     }
+
+    struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
     int pos = 0;
     // Stop at end-of-turn. gemma4's turn end is <turn|>; the gguf eos_token_id is
     // <turn|> on E2B but <eos> on 12B, so stop on either.
@@ -390,18 +409,40 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = now_sec() - tp;
 
-    // greedy generation
+    // greedy generation — plain, or speculative at block 2 with -mtp.
+    // g counts EMITTED tokens, so the spec path stops at exactly the same
+    // N_GEN boundary as plain decoding (an accepted draft past the cap is
+    // simply never printed).
     double tg = now_sec();
-    int g = 0;
-    for (; g < N_GEN; g++) {
+    double t_draft = 0, t_verify = 0;
+    int g = 0, n_draft = 0, n_accept = 0;
+    while (g < N_GEN) {
         if (best == eot || best == eos) break;               // end of turn
-        if (best == ch_open)  in_thought = 1;                // channel name starts
-        else if (best == ch_close) in_thought = 0;           // channel name ends
-        else if (!in_thought && !tokenizer_is_special(tk, best)) {
-            print_piece(tokenizer_token_text(tk, best));
-            fflush(stdout);
+        emit_token(tk, best, &in_thought, ch_open, ch_close);
+        g++;
+        if (!t) {
+            best = model_forward_next(&m, &kv, best, pos++);
+            continue;
         }
-        best = model_forward_next(&m, &kv, best, pos++);
+        // draft the successor of `best`, then verify the pair in one step
+        double t0 = now_sec();
+        int draft = mtp_draft(t, &m, &kv, best, pos);
+        double t1 = now_sec();
+        int out2[2];
+        int adv = model_forward2(&m, &kv, best, draft, pos, out2);
+        t_draft += t1 - t0;
+        t_verify += now_sec() - t1;
+        n_draft++;
+        pos += adv;
+        if (adv == 2) {                                      // draft confirmed
+            n_accept++;
+            if (draft == eot || draft == eos || g >= N_GEN) { best = draft; continue; }
+            emit_token(tk, draft, &in_thought, ch_open, ch_close);
+            g++;
+            best = out2[1];
+        } else {
+            best = out2[0];
+        }
     }
     double t_gen = now_sec() - tg;
 
@@ -410,24 +451,30 @@ static void generate(const struct gguf_context *ctx, const char *prompt) {
             n_prompt, t_prompt, n_prompt / (t_prompt > 0 ? t_prompt : 1e-9));
     fprintf(stderr, "gen:    %d tokens in %.2fs (%.2f tok/s)\n",
             g, t_gen, g / (t_gen > 0 ? t_gen : 1e-9));
+    if (t && n_draft)
+        fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
+                n_accept, n_draft, 100.0 * n_accept / n_draft,
+                n_draft, t_draft, 1e3 * t_draft / n_draft, t_verify, 1e3 * t_verify / n_draft);
 
+    mtp_free(t);
     kvcache_free(&kv);
     model_free(&m);
     tokenizer_free(tk);
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL;
+    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
         else if (!strcmp(argv[i], "-s") && i + 1 < argc)  spath  = argv[++i];
         else if (!strcmp(argv[i], "-c") && i + 1 < argc)  cpath  = argv[++i];
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
+        else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
     }
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
-        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-p \"prompt\" | -s <socket>]\n"
+        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-p \"prompt\" | -s <socket>]\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
@@ -441,7 +488,7 @@ int main(int argc, char **argv) {
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
     if (spath)       serve(ctx, spath, mmproj);
-    else if (prompt) { printf("\n"); generate(ctx, prompt); }
+    else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);
     return 0;

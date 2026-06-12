@@ -16,24 +16,37 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
 ## Architecture
 
 ```
-                      ┌──────────────┐
-                      │    run.c     │   CLI: -m <model> [-p "prompt"]
-                      └──────┬───────┘
-         ╭───────────────────┼───────────────────────────────╮
-         ▼                   ▼                               ▼
- ┌───────────────┐   ┌────────────────┐   ┌──────────────────────────────────────┐
- │  tokenizer.c  │   │    model.c     │   │               gguf.c                 │
- │  BPE text↔ids │   │ config+forward │   │ parse → ctx (hdr, kv, tensors, data) │
- └───────────────┘   └───────┬────────┘   └──────────────────┬───────────────────┘
-                             │                               │  
-                             ▼                               │
-                ┌──────────────────────────┐                 │ borrows
-                │          quant.c         │◄────────────────╯ quantized
-                │ dequantize q3_K/q4_K/... │  weights
-                └──────────────────────────┘
+                     ┌─────────────────────────────────┐
+                     │              run.c              │  CLI · socket server · client
+                     │ greedy and speculative decoding │  -m -mm -mtp [-p | -s | -c]
+                     └────────────────┬────────────────┘
+        ╭───────────────┬─────────────┼────────────────┬───────────────╮
+        ▼               ▼             ▼                ▼               ▼
+ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+ │ tokenizer.c │ │   model.c   │ │   media.c   │ │    mtp.c    │ │   gguf.c    │
+ │ BPE text↔ids│ │ config and  │ │ image/audio │ │ the MTP     │ │ parse → ctx │
+ └─────────────┘ │ per-layer   │ │ → embedding │ │ draft head  │ │ (hdr, kv,   │
+                 │ geometry    │ │ rows        │ └─────────────┘ │ tensors,    │
+                 └─────────────┘ └─────────────┘                 │ data blob)  │
+                                                                 └─────────────┘
+     weights stay quantized in the gguf blob; everyone reads them through
+                    quant.c (dequantize q3_K/q4_K/q8_0/…)
 
-    graph.c — a minimal tensor/graph layer (matmul, rmsnorm, softmax, …)
-            kept as the "what a compute graph is" teaching reference.
+         model.h — one API, one forward, three interchangeable backends:
+
+ ┌───────────────┐  ┌──────────────────────────────────────────────────────┐
+ │  model-cpu.c  │  │              model-cuda.cuh (shared)                 │
+ │ scalar+OpenMP;│  │ forward, kv cache (rings, f16), CUDA graphs, chunked │
+ │ doubles as the│  │ prefill, B=2 verify, device MTP draft — plus the GPU │
+ │ reference spec│  │ vision encoder (media-cuda.cu)                       │
+ └───────────────┘  ├───────────────────────────┬──────────────────────────┤
+                    │     model-cuda-f32.cu     │    model-cuda-i8r.cu     │
+                    │   readable f32 matmul     │  int8 dp4a + wide loads  │
+                    └───────────────────────────┴──────────────────────────┘
+
+ tools/  — socket_cat (the raw wire) · media_cat (files → frames + question)
+ graph.c — a minimal tensor/graph layer (matmul, rmsnorm, softmax, …) kept as
+           the "what a compute graph is" teaching reference (graph_test only).
 ```
 
 **Layering:** GGUF/ggml jargon stays in the lower layers (`gguf.c`, `quant.c`);
@@ -86,7 +99,7 @@ Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
 ## Usage
 
 ```
-run -m <model.gguf> [-mm <mmproj.gguf>] [-p "prompt" | -s <socket>]
+run -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-p "prompt" | -s <socket>]
 run -c <socket>
 ```
 
@@ -95,6 +108,8 @@ run -c <socket>
   Text only — media arrives over the socket; see "Multimodal" below.
 - `-mm` → also load a multimodal projector, so `-s` sessions accept image and
   audio frames.
+- `-mtp` → also load a gemma4-assistant draft head and decode speculatively;
+  see "Speculative decoding" below. Output is identical, only speed changes.
 
 ```
 > run -m model.gguf -p "The capital of France is"
@@ -106,28 +121,38 @@ gen:    2 tokens in 1.48s (1.35 tok/s)
 ### Serving over a Unix-domain socket (`-s`)
 
 `-s` turns the runner into a tiny conversation server — no HTTP, no JSON, no web
-security surface; transport concerns (TCP exposure, TLS, auth) belong to `socat`
-and to whatever chat server or agent sits downstream:
+security surface; transport concerns (TCP exposure, TLS, auth) belong to `nc`,
+`socat`, and whatever chat server or agent sits downstream:
 
 ```
 run-cuda-i8r -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
-echo "What is the capital of France?" | socat - UNIX-CONNECT:/tmp/lg.sock
+echo "What is the capital of France?" | nc -N -U /tmp/lg.sock
 ```
+
+(The `-N` matters: it half-closes the socket when stdin ends, which is how the
+server learns the conversation is over. Without it, plain `nc` holds its write
+side open, the server politely waits for your next turn, and both sides sit
+there forever. Don't use `-q 0` instead — that one quits on a timer and can
+cut the answer off mid-stream.)
 
 The protocol is the simplest thing that works, designed so raw media frames can
 join it later without breaking anything:
 
 - **A connection is a conversation.** The kv cache lives for the connection, so
   multi-turn context is free; close the connection (or just stop typing into
-  socat) to end the session. One conversation is served at a time — decode is
-  batch-1, and the listen backlog is the queue.
+  the client) to end the session. One conversation is served at a time — decode
+  is batch-1, and the listen backlog is the queue.
 - **A line is a user turn.** Each newline-terminated line is wrapped in the
   Gemma chat template and prefilled.
 - **The reply is the raw token stream**, special tokens included — the thinking
   channel, the markers, and the closing `<turn|>` that downstream tools can
   split turns on. The server filters nothing; presentation is the client's job.
 - stdout/stderr are logging only; per-turn stats go to stderr.
-- A clean half-close (e.g. socat after stdin EOF) still receives the full turn
+- A turn is capped at 1,024 output tokens (`SERVE_GEN`): greedy decoding has
+  no sampler and no repetition penalty, so a degenerate loop would otherwise
+  spin until the context filled (observed: 8,098 tokens of the same sentence).
+  A capped turn ends with a visible `[SERVE_GEN cap]<turn|>`.
+- A clean half-close (e.g. `nc -N` after stdin EOF) still receives the full turn
   in flight; only a hard reset aborts generation early — checked between
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.
 
@@ -161,7 +186,7 @@ socket to stdout, no protocol — you see the raw token stream exactly as sent,
 `<turn|>` markers and all. `run -c` is the protocol-aware client: it pumps
 stdin lines as turns and knows where each streamed reply ends.
 
-## Multimodal (the 12B's encoder-free design)
+## Multimodal
 
 The gemma-4-12B takes images and audio with **no encoder at all** — its mmproj
 file is 11 tensors (167 MB): vision is one linear layer over 48×48-pixel
@@ -203,10 +228,57 @@ not a valid JPEG wrapped them, and decoding junk is the tool's job anyway.
 At ~2 MB per maximal image, a local socket moves a frame in about a
 millisecond; the prefill it triggers costs hundreds of times more.
 
-The E2B/E4B mmproj files instead carry a 16-block vision transformer and a
-12-block audio conformer — the **legacy path**, which `media_open` rejects;
-it may get implemented if those models stay relevant, or dropped entirely if
-encoder-free designs win (the bet here is on the 12B's design).
+Text is optional when media frames are sent: a spoken question, or a written
+note shown to the camera, is a complete turn by itself —
+
+```
+media_cat %TEMP%\lg.sock -a question.wav
+```
+
+— and the model answers the *voice*, because past the projection it cannot
+tell a sentence that arrived as sound from one that arrived as keystrokes.
+
+The E2B/E4B mmproj files instead carry conventional encoders — the **legacy
+path**. Their 16-block vision transformer (`gemma4v`) is implemented: on the
+CUDA backends it runs on the GPU (`media-cuda.cu`, ~0.8 s per image on a
+desktop card), with the host implementation kept in the binary as numeric
+oracle (`LG_MEDIA_VERIFY=1` runs both per image and prints the max
+difference) and as the only path on the CPU build. Their 12-block audio
+conformer was implemented, verified against the reference, and **dropped**:
+it underperforms in practice, and production pipelines pair these models
+with a dedicated STT (Whisper) anyway — audio frames at a legacy mmproj say
+so and point at the 12B, which hears. The conformer lives in git history.
+
+## Speculative decoding (MTP)
+
+Gemma 4 ships a **multi-token-prediction assistant**: a tiny transformer
+(E2B's is 4 blocks, 256 wide, 77M parameters) that predicts the token *after*
+next. Its design is almost parasitic — it owns no K or V projections at all;
+every block cross-attends directly into the **target model's KV cache**, and
+its inputs are the target's own embedding of the freshly chosen token plus
+the target's last hidden state. `mtp.c` implements it; `-mtp` turns it on:
+
+```
+run-cuda-i8r -m gemma-4-E4B-it-Q4_K_M.gguf -mtp gemma-e4b-assistant-mtp.gguf -p "..."
+```
+
+Each round drafts one token and verifies `[token, draft]` as a single
+two-position batch — the weights cross memory once for the pair, so an
+accepted draft is nearly a free token (spec blocks deeper than 2 measured as
+regressions, so one draft per round it is). Verification is greedy, which
+buys the strongest property speculative decoding can have: **the output is
+byte-identical to plain greedy decoding, always** — the only things that move
+are tokens/s and the acceptance rate the stats line reports. Acceptance is
+content-dependent: ~85% on short factual answers, ~70% on lists, ~45% on
+creative prose, where the future is genuinely harder to guess.
+
+Whether MTP *pays* is decided by the hardware, not the math. Each round
+needs two device-to-host syncs (the draft token feeds the verify's inputs);
+on Windows/WDDM those cost milliseconds and MTP loses outright, while on a
+Jetson Orin NX it wins ~6% on prose and ~15% on list-style answers — numbers
+and the full story, including the uncached-zero-copy bug the verify exposed
+in the chunk matmul, are in the
+[performance journal](docs/performance-journal.md).
 
 ## On SIMD (AVX2) — intentionally not implemented
 
@@ -218,6 +290,12 @@ kernels (replacing what SIMD would do). The weights are already stored quantized
 and unpacked inside the matmul — exactly the shape a GPU kernel wants — so the
 CPU kernels in `model-cpu.c` (`matmul_q`, `rmsnorm`, `rope_neox`, `softmax`, `gelu`)
 double as the reference spec for the CUDA versions in `model-cuda-f32.cu`.
+
+The one exception proves the rule: `media.c` (the host vision encoder) compiles
+with file-scoped fast-math so the *compiler* may vectorize its reductions —
+still no intrinsics, and the naive one-line dot loop turned out to be the
+fastest form (a hand-unrolled multi-accumulator version defeats MSVC's
+vectorizer pattern match). The LLM side keeps strict fp.
 
 ## On mmap — intentionally not used
 
@@ -242,26 +320,42 @@ Getting the speed was a journey of two dozen gated steps: two profiling-led
 rewrites that *failed* (and earned their write-ups), a CUDA graph against WDDM
 launch latency, wide weight loads, a long tail of wins mostly *outside* the
 matmul everyone stares at — E2B from 7.9 to 182.5 tok/s — then a long-context
-roadmap: online-softmax attention (the ~12k context cap gone), batched prefill
-(3.4× prompt speed), and a kv cache at ~5% of its old footprint. The full log,
-dead ends and bisections included, is
+roadmap (online-softmax attention, batched prefill, a kv cache at ~5% of its
+old footprint), GPU media encoders, and speculative decoding, which flushed
+out an uncached-zero-copy bug whose fix alone bought +49% prefill on desktop
+and ~2× on Jetson. The full log, dead ends and bisections included, is
 **[docs/performance-journal.md](docs/performance-journal.md)**.
-Where things stand, same machine, same day, both sides re-measured
-(little-gemma = `run-cuda-i8r`, ~166–187 generated tokens; llama.cpp =
-`llama-bench tg32`):
 
-| model | size | params | little-gemma | llama.cpp CUDA | ratio |
-|-------|-----:|-------:|-------------:|---------------:|------:|
-| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.5 | 145.0 ± 5.2 | **1.26×** |
-| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.4 | 112.9 ± 1.8 | **1.01×** |
-| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.4 |  63.5 ± 0.6 | 0.95× |
+Where things stand — both sides re-measured the same day on the same machine,
+same prompt (little-gemma = `run-cuda-i8r`, 256 generated tokens, warm;
+llama.cpp = `llama-bench tg32`; MTP acceptance in parentheses, on creative
+prose — its hardest content):
 
-The pattern is the project's thesis in one table. The smaller the model, the more
-decode speed is about everything *around* the matmul — launch overhead, sync
-round-trips, norms, the PLE path — which 2,000 readable lines can do leanly. The
-bigger the model, the more it reduces to one number: sustained DRAM bandwidth
-through the quantized matmul, where llama.cpp's arch-tuned kernels still hold a
-few percent. The crossover for this codebase currently sits right around E4B.
+**RTX A5000 (Windows):**
+
+| model | size | params | little-gemma | + MTP | llama.cpp CUDA | ratio |
+|-------|-----:|-------:|-------------:|------:|---------------:|------:|
+| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.3 | 141.9 (42%) | 148.4 ± 6.6 | **1.23×** |
+| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.7 | 101.9 (45%) | 116.3 ± 1.3 | 0.99× |
+| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.5 |  42.0 (58%) |  64.3 ± 0.3 | 0.94× |
+
+**Jetson Orin NX 16GB (Linux, integrated GPU, zero-copy weights):**
+
+| model | little-gemma | + MTP | llama.cpp CUDA | best ratio |
+|-------|-------------:|------:|---------------:|-----------:|
+| E4B Q4_K_M | 16.80 | **17.76** (49%) | 13.36 ± 0.04 | **1.33×** |
+| 12B Q4_K_M |  8.27 |   7.79 (51%) |  7.04 ± 0.04 | **1.17×** |
+
+The pattern is the project's thesis in two tables. The smaller the model, the
+more decode speed is about everything *around* the matmul — launch overhead,
+sync round-trips, norms, the PLE path — which a few thousand readable lines can
+do leanly. The bigger the model, the more it reduces to sustained DRAM
+bandwidth through the quantized matmul, where llama.cpp's arch-tuned kernels
+still hold a few percent on desktop. And whether a *feature* pays is decided
+per device: MTP loses on Windows (WDDM prices its two per-round syncs in
+milliseconds) and wins on the Jetson — same binary, byte-identical output on
+both, faster only where the hardware says so. On the edge device this project
+actually targets, every row is ahead.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -281,29 +375,31 @@ is for.
 
 ## Lines of Code
 
-| directory | files | code  | comment | blank | total |
-|-----------|-------|-------|---------|-------|-------|
-| src       | 11    | 3,201 | 465     | 375   | 4,041 |
-| include   | 6     | 234   | 150     | 69    | 453   |
+| directory | files | code  |
+|-----------|-------|------:|
+| src       | 15    | 4,658 |
+| include   | 6     |   242 |
 
-3,435 lines of code in the repository (the original 3,000 exploring ceiling was
+4,900 lines of code in the repository (the original 3,000 exploring ceiling was
 retired when the sandbox phase began; `tools/` and the vendored
 `vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
 backends are mutually exclusive, so no single program is anywhere near that.
 Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
-multimodal embedders, CLI + socket server — 1,786 lines) plus exactly one
-backend:
+multimodal embedders, the MTP draft head, CLI + socket server — 2,235 lines)
+plus exactly one backend:
 
-| binary        | backend on top of the shared 1,786        | code lines |
-|---------------|-------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                             |      2,094 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu`    |      2,596 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu`    |      2,800 |
+| binary        | backend on top of the shared 2,235                       | code lines |
+|---------------|----------------------------------------------------------|-----------:|
+| `run`         | `model-cpu.c`                                            |      2,559 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      3,658 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      3,981 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
-only.) So the program that decodes E2B 26% faster than llama.cpp CUDA — multi-turn
-socket serving, 3.4× batched prefill, a ring-buffered f16 KV cache, and image and
-audio understanding included — is **2,800 lines of C end to end**, tokenizer and all.
+only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every
+model it runs — multi-turn socket serving, batched prefill, a ring-buffered
+f16 KV cache, image and audio understanding, a GPU vision encoder, and
+byte-identical speculative decoding included — is **just under 4,000 lines of
+C end to end**, tokenizer and all.
 
 ## Validation
 
