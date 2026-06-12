@@ -708,7 +708,14 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B == 16 && !no_mma) {
         static int sms = 0;
-        if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
+        if (!sms) {
+            cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount;
+            // ask for the maximum shared-memory carveout: at ~27 KB per CTA the
+            // default (~100 KB) seats only 3 CTAs per SM — on the Orin (164 KB
+            // available) this is what lets the 4th one in (regs are capped to
+            // 64 by the launch bounds for the same reason)
+            cudaFuncSetAttribute(matmul_q4k_mma_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        }
         int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
         while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
         size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * 32;
