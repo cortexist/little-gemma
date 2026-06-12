@@ -100,8 +100,14 @@ int config_load(struct config *c, const struct gguf_context *ctx) {
     const struct gguf_kv *toks = gguf_find_kv(ctx, "tokenizer.ggml.tokens");
     if (toks && toks->type == GGUF_TYPE_ARRAY) c->n_vocab = (int)toks->value.arr.n;
 
-    if (c->n_layer == 0) {
-        fprintf(stderr, "config: %s.block_count is 0 or missing\n", arch);
+    // Bounded, not just nonzero: block_count comes off disk as a u32, and a
+    // garbage value cast to int could go NEGATIVE — which a later
+    // (size_t)n_layer would sign-extend into an absurd allocation request
+    // (GCC's -Walloc-size-larger-than spotted exactly that path). No real
+    // model is within two orders of magnitude of the bound.
+    if (c->n_layer <= 0 || c->n_layer > 4096) {
+        fprintf(stderr, "config: %s.block_count is %d - missing or not a plausible layer count\n",
+                arch, c->n_layer);
         return -1;
     }
     return 0;
