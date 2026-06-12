@@ -138,14 +138,18 @@ int model_init(struct model *m, const struct gguf_context *ctx) {
     memset(m, 0, sizeof(*m));
     if (config_load(&m->cfg, ctx) != 0) return -1;
     m->ctx = ctx;
+    // a LOCAL with a visible bound: config_load already validated the range,
+    // but GCC's allocation-size analysis cannot see that through the struct
+    // member, and warned that (size_t)<negative int> would be an absurd calloc
+    const size_t n_layer = (size_t)(unsigned)m->cfg.n_layer;
 
     // Per-layer feed-forward widths (elastic FFN).
-    m->ffn_len = calloc((size_t)m->cfg.n_layer, sizeof(int));
+    m->ffn_len = calloc(n_layer, sizeof(int));
     if (!m->ffn_len) return -1;
     load_ffn_lens(ctx, m->cfg.arch, m->ffn_len, m->cfg.n_layer, m->cfg.n_ff);
 
     // Which layers use sliding-window (local) attention.
-    m->is_local = calloc((size_t)m->cfg.n_layer, sizeof(int));
+    m->is_local = calloc(n_layer, sizeof(int));
     if (!m->is_local) return -1;
     char key[128];
     snprintf(key, sizeof key, "%s.attention.sliding_window_pattern", m->cfg.arch);
@@ -159,8 +163,8 @@ int model_init(struct model *m, const struct gguf_context *ctx) {
     // Per-layer head geometry, derived from the actual q/k tensor shapes — robust
     // across models where head_dim and head_count_kv vary by layer or are stored
     // as arrays (e.g. Gemma 12B has head_count_kv = [8, 8, ...]).
-    m->head_dim  = calloc((size_t)m->cfg.n_layer, sizeof(int));
-    m->n_head_kv = calloc((size_t)m->cfg.n_layer, sizeof(int));
+    m->head_dim  = calloc(n_layer, sizeof(int));
+    m->n_head_kv = calloc(n_layer, sizeof(int));
     if (!m->head_dim || !m->n_head_kv) return -1;
     for (int L = 0; L < m->cfg.n_layer; L++) {
         char name[96];
