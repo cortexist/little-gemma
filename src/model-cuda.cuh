@@ -1000,16 +1000,42 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
 // captures into a static CUDA graph exactly like decode does (the un-captured
 // form costs ~1030 raw launches per step, which is precisely where sync MTP
 // went to die on WDDM machines).
-static void verify_layers_and_head(struct model *m, struct kvcache *kv, int has_ple) {
+static void verify_head(struct model *m) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd;
-    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
     rmsnorm_kernel<<<2, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(2 * n_embd));
     matmul_q_2(d_logits2, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(2 * c->n_vocab), 256>>>(d_logits2, c->logit_softcap, 2 * c->n_vocab);
     argmax_kernel<<<1, 1024>>>(d_logits2, c->n_vocab, d_best2);
     argmax_kernel<<<1, 1024>>>(d_logits2 + c->n_vocab, c->n_vocab, d_best2 + 1);
+}
+static void verify_layers_and_head(struct model *m, struct kvcache *kv, int has_ple) {
+    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
+    verify_head(m);
+}
+
+static double now_sec_dev(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+// LG_MTP_PROFILE=1: run the verify un-captured with syncs around its two
+// halves and report — the tool that finds where a 2x-over-theory round goes.
+static void verify_profiled(struct model *m, struct kvcache *kv, int has_ple) {
+    static double tl = 0, th = 0;
+    static int n = 0;
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    double t0 = now_sec_dev();
+    chunk_layers(m, kv, has_ple, 2, matmul_q_2);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    double t1 = now_sec_dev();
+    verify_head(m);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    tl += t1 - t0; th += now_sec_dev() - t1;
+    if (++n % 50 == 0)
+        fprintf(stderr, "verify profile over %d: layers %.1fms ea, head %.1fms ea\n", n, 1e3 * tl / n, 1e3 * th / n);
 }
 
 static cudaGraphExec_t g_graph2_exec = NULL;
@@ -1050,7 +1076,10 @@ extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int
 
     int has_ple = model_has_ple(m);
     if (has_ple) build_per_layer_n(m, toks, 2, matmul_q_2);   // un-captured, like decode's PLE build
-    verify_graph(m, kv, has_ple);
+    static int prof = -1;
+    if (prof < 0) prof = getenv("LG_MTP_PROFILE") != NULL;
+    if (prof) verify_profiled(m, kv, has_ple);
+    else      verify_graph(m, kv, has_ple);
     CUDA_CHECK(cudaMemcpy(out, d_best2, 2 * sizeof(int), cudaMemcpyDeviceToHost));
 
     int adv = out[0] == tok1 ? 2 : 1;
