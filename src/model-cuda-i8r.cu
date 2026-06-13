@@ -384,29 +384,11 @@ static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
     }
     size_t i = (size_t)(t - g_ctx->tensors);
     if (g_rw[i]) return g_rw[i];
+    if (t->type != GGML_TYPE_Q3_K && t->type != GGML_TYPE_Q6_K)
+        return g_rw[i] = (unsigned char *)dev_weight(t);
+
     int64_t n = 1;
     for (uint32_t d = 0; d < t->n_dims; d++) n *= (int64_t)t->dims[d];
-    if (t->type != GGML_TYPE_Q3_K && t->type != GGML_TYPE_Q6_K) {
-        // On a zero-copy blob, GPU reads are uncached (the Tegra lesson). The
-        // float-typed matmul weights — the PLE projection and the f32 oddballs,
-        // tens of MB — stream raw through the fallback path and pay DRAM
-        // latency per load, so they get a cached device copy. The K-quants
-        // stay mapped: doubling gigabytes is what zero-copy exists to avoid,
-        // and the mma/dp4a kernels stage them anyway. The size cap keeps a
-        // hypothetical float token_embd from re-creating that OOM.
-        size_t bytes = (size_t)n / ggml_blck_size(t->type) * ggml_type_size(t->type);
-        if (g_blob_zerocopy && t->n_dims == 2 && bytes <= 64u << 20 &&
-            (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
-            unsigned char *dev;
-            if (cudaMalloc(&dev, bytes) == cudaSuccess) {
-                CUDA_CHECK(cudaMemcpy(dev, t->data, bytes, cudaMemcpyHostToDevice));
-                return g_rw[i] = dev;
-            }
-            cudaGetLastError();               // out of memory: the mapped blob still works
-        }
-        return g_rw[i] = (unsigned char *)dev_weight(t);
-    }
-
     size_t nb = (size_t)(n / QK_K), bytes = nb * (size_t)*ts;
     void *host = malloc(bytes);
     if (!host) { fprintf(stderr, "rweight: out of memory repacking %s\n", t->name); exit(1); }
@@ -450,9 +432,7 @@ static void rweight_init_all(void) {
     for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
         const struct gguf_tensor *t = &g_ctx->tensors[i];
         int ts;
-        if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0 ||
-            t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)
-            rweight(t, &ts);
+        if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0) rweight(t, &ts);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     done = 1;
