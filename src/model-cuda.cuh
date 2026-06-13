@@ -416,6 +416,7 @@ __global__ static void argmax_kernel(const float *x, int n, int *out) {
 
 static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
+static int g_blob_zerocopy = 0;               // weights mapped, not copied (Tegra)
 
 static void ensure_weights(struct model *m) {
     if (d_blob) return;
@@ -431,6 +432,7 @@ static void ensure_weights(struct model *m) {
     if (prop.integrated &&
         cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
         cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
+        g_blob_zerocopy = 1;                  // Tegra: GPU reads of this mapping are UNCACHED
         return;
     }
     cudaGetLastError();                       // clear any failed-register error; fall back
