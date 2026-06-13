@@ -376,9 +376,9 @@ Those tables are **decode** — the project's strong axis. **Prefill** (prompt
 processing) is the honest weak axis: it is weight-bandwidth-bound, and
 llama.cpp prefills at batch ~512 through arch-tuned tensor-core GEMMs that no
 few-thousand-line kernel matches. The push above closed most of the gap on the
-Jetson — E4B ~55 → **120.7** prompt tok/s, 12B ~21 → **49.7** (a 1,982-token
-prompt), ~2.15× and ~2.36× over the int8 baseline — moving the ratio to
-llama.cpp from ~10× behind to ~4×. It is still their axis; the wins are
+Jetson — E4B ~55 → **130.3** prompt tok/s, 12B ~21 → **53.6** (a 1,982-token
+prompt), ~2.33× and ~2.55× over the int8 baseline — moving the ratio to
+llama.cpp from ~10× behind to ~3.8×. It is still their axis; the wins are
 real and gated to the same output up to a late greedy tie. Where prefill is
 *felt* — image turns and document ingestion — this is what made the 1 FPS
 camera budget reachable.

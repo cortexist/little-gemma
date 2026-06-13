@@ -784,23 +784,35 @@ Pure storage relocation: values and mma order unchanged, so it is
 byte-identical in data, deterministic, equal to the dp4a path. **Orin E4B
 109.3 → 118.8 (+8.7%), 12B 43.6 → 48.6 (+11.4%), conflicts 2.87M → 1.43M.**
 The same idea on the weight tile (32 B = 8-word rows, also bank-aligned,
-2-way) padded to 48 B added a smaller **E4B → 120.7, 12B → 49.7** — the
-weight reads were a minor share, and the ~1.23M conflicts that remain trace
-to a source the static analysis doesn't pin down (a job for source-level ncu
-with clearly diminishing returns). The lesson is the cheap one worth
-re-banking: **measure the bank-conflict counter before designing a swizzle**
-— it both confirmed the win was there and pointed at a one-line stride pad
-rather than the elaborate restructure that failed last time.
+2-way) padded to 48 B added **E4B → 120.7, 12B → 49.7** (conflicts →1.23M)
+— but only a +1.6/2.2% nudge, which was itself the clue: the weight reads
+were a minor share, so the residual lived elsewhere. Rather than guess,
+source-level ncu (the "know reality" move): the `LDS.32` fragment reads
+were now clean, but every `LDS.64` ran 4-way — and `LDS.64` is the `float2`
+**per-column scale-pair (`sBxds`) read**, which the same 32-word column
+stride aliased across the four `tid`-groups. I'd dismissed those as
+broadcasts; they broadcast *within* a group but conflict *across* them. The
+third pad (scale stride 8 → 9 `float2`) finished it: **E4B 120.7 → 130.3
+(+7.9%), 12B 49.7 → 53.6 (+7.9%), conflicts 1.23M → 212** — the shared path
+is conflict-free, and SM throughput went 27% → 47.5%, nearly doubling
+tensor-core utilisation across the three pads. The lesson, twice over:
+**measure the bank-conflict counter — and when a fix underdelivers, measure
+*again* at instruction level rather than declaring diminishing returns.**
+The cheap one-line stride pad beat the elaborate restructure (round 2's
+frag-major) every time.
 
 **The prefill journey, end to end (Orin, 1,982-token prompt):** E4B
 55 → 78 (mma rounds) → 91.5 (q6_K + float4) → 106.8 (B=32) → 109.3 (K/V
-share) → **120.7** (swizzle); 12B 21 → 30 → 35 → 40 → 43.6 → **49.7**.
-Against the pre-tensor-core dp4a baseline that is ~2.15× (E4B) and ~2.36×
-(12B); the ratio to llama.cpp moved from ~0.10 at the start of the prefill
-work to ~0.24 on both. The honest position is unchanged in shape — prefill
-is still llama.cpp's axis, ours is decode — but the gap is a factor of ~4
-now, not ~10, and every step is gated: deterministic, output equal to the
-dp4a path up to a late greedy tie, decode and MTP untouched.
+share) → **130.3** (three bank-conflict pads); 12B 21 → 30 → 35 → 40 →
+43.6 → **53.6**. Against the pre-tensor-core dp4a baseline that is ~2.33×
+(E4B) and ~2.55× (12B); the ratio to llama.cpp moved from ~0.10 at the start
+of the prefill work to ~0.26 on both. The honest position is unchanged in
+shape — prefill is still llama.cpp's axis, ours is decode — but the gap is a
+factor of ~3.8 now, not ~10, every step gated (deterministic, output equal
+to the dp4a path up to a late greedy tie, decode and MTP untouched). With
+the conflicts gone, the remaining shared stall is *latency* — the kernel
+still issues many small `LDS` per fragment — which is the case for the next
+structural step: `ldmatrix`, one fragment load where there are now four.
 
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
