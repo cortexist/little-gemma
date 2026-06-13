@@ -61,6 +61,23 @@ static_assert(sizeof(block_q3_Kr) == 116 && offsetof(block_q3_Kr, qs) % 4 == 0
               && offsetof(block_q3_Kr, hmask) % 4 == 0, "block_q3_Kr layout");
 static_assert(sizeof(block_q6_Kr) == 212 && offsetof(block_q6_Kr, qh) % 4 == 0, "block_q6_Kr layout");
 
+// q4_K tile-coalesced repack for the mma prefill kernel (the "MMQ" rewrite).
+// In the mapped blob, the 32 rows a warp covers sit one 144-B block apart, so
+// the warp's A-staging load scatters across DRAM (~49% wasted sectors on the
+// Orin's uncached zero-copy reads). Here RPACK=16 rows share one tile-block and
+// their quant bytes are interleaved so consecutive lanes read contiguous bytes
+// (one 512-B coalesced group per warp). Scales are PRE-DECODED from the 12-byte
+// 6-bit twist to flat uint8 (sc[8] then m[8] per row, no -32 bias); (d,dmin)
+// stay fp16. Built as a SECOND device copy (~q4_K size) only when it fits VRAM
+// (E4B on a 16 GB Orin; 12B falls back to the in-place mma path). Validated
+// byte-lossless + byte-identical to the in-place kernel in .scratch/mmq_*_test.
+#define RPACK      16
+#define Q4KR_QUANT (RPACK * 128)                          // 2048: [j 0..7][row 0..15][16 B]
+#define Q4KR_SCALE (RPACK * 16)                            // 256:  per row, sc[8] then m[8]
+#define Q4KR_DM    (RPACK * 4)                             // 64:   per row, (d,dmin) fp16
+#define Q4KR_TBLK  (Q4KR_QUANT + Q4KR_SCALE + Q4KR_DM)     // 2368
+static_assert(Q4KR_TBLK % 16 == 0, "q4_Kr tile-block 16-aligned");
+
 __device__ static uint32_t ld32(const void *p) { return *(const uint32_t *)p; }
 
 // ---- one weight sub-block's contribution to the dot, in integer arithmetic ----
@@ -368,6 +385,40 @@ static void repack_q6_K(block_q6_Kr *dst, const block_q6_K *src, size_t nb) {
     }
 }
 
+// q4_K 6-bit twisted-scale decode on the host (the device twin is d_gsm32);
+// pre-decoded into block_q4_Kr so the mma kernel reads flat uint8 scales.
+static void d_gsm32_host(int j, const uint32_t *s, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = (s[0] >> (8 * j)) & 63; *m = (s[1] >> (8 * j)) & 63; }
+    else {
+        int b = 8 * (j - 4);
+        *d = ((s[2] >> b) & 0x0F) | (((s[0] >> (b + 6)) & 3) << 4);
+        *m = (((s[2] >> b) >> 4) & 0x0F) | (((s[1] >> (b + 6)) & 3) << 4);
+    }
+}
+// Repack m rows x nbk q4_K blocks into ntile tile-blocks (block_q4_Kr layout).
+// ntile is EVEN (= roundup(m,32)/16) so the kernel's two-tile-per-warp reads of
+// tile-block tbrow+1 never run past the end; padding rows clamp to row m-1,
+// matching the in-place kernel's rowL clamp, so every slot a warp can touch is
+// a real weight. Byte-lossless (gate #1) and value-exact in the kernel (gate #2).
+static void repack_q4_K_mmq(uint8_t *dst, const block_q4_K *src, int m, int nbk, int ntile) {
+    memset(dst, 0, (size_t)ntile * nbk * Q4KR_TBLK);
+    for (int tt = 0; tt < ntile; tt++)
+      for (int blk = 0; blk < nbk; blk++) {
+        uint8_t *tb = dst + ((size_t)tt * nbk + blk) * Q4KR_TBLK;
+        uint8_t *qd = tb, *sd = tb + Q4KR_QUANT;
+        uint16_t *dd = (uint16_t *)(tb + Q4KR_QUANT + Q4KR_SCALE);
+        for (int r = 0; r < RPACK; r++) {
+            int row = tt * RPACK + r; if (row >= m) row = m - 1;          // tail clamp
+            const block_q4_K *b = &src[(size_t)row * nbk + blk];
+            for (int j = 0; j < 8; j++) memcpy(qd + (j * RPACK + r) * 16, b->qs + j * 16, 16);
+            uint32_t s[3]; memcpy(s, b->scales, 12);
+            for (int sj = 0; sj < 8; sj++) { uint8_t sc, mm; d_gsm32_host(sj, s, &sc, &mm); sd[r * 16 + sj] = sc; sd[r * 16 + 8 + sj] = mm; }
+            uint16_t db, mb; memcpy(&db, &b->d, 2); memcpy(&mb, &b->dmin, 2);
+            dd[r * 2 + 0] = db; dd[r * 2 + 1] = mb;
+        }
+      }
+}
+
 // Per-tensor device weight table. q3_K/q6_K get a repacked copy; everything
 // else aliases the blob already uploaded by ensure_weights. Filled lazily on
 // first use — i.e. during the two un-captured warmup tokens, so the one-time
@@ -399,6 +450,64 @@ static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
     CUDA_CHECK(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice));
     free(host);
     return g_rw[i] = dev;
+}
+
+// Tile-coalesced q4_K twins for the mma prefill kernel (block_q4_Kr). A SECOND
+// device copy of every q4_K weight, indexed like g_rw. NULL entry => that
+// tensor uses the in-place mma path (REPACK=false, byte-identical). The whole
+// table stays NULL when the copy doesn't fit free VRAM (12B on a 16 GB Orin).
+static unsigned char **g_rw_mmq = NULL;
+
+static const unsigned char *rweight_mmq(const struct gguf_tensor *t) {
+    if (!g_rw_mmq) return NULL;
+    return g_rw_mmq[(size_t)(t - g_ctx->tensors)];
+}
+
+// Build the q4_K twins up front (like rweight_init_all, so no cudaMalloc lands
+// mid graph-capture). All-or-none on a free-VRAM gate with a 1 GB reserve for
+// context/scratch growth: E4B's ~4 GB second copy fits a 16 GB Orin, 12B's
+// ~5.5 GB does not (it keeps the in-place mma path). Discrete GPUs (lots of
+// VRAM) build it for every model. Logs the decision for the device run.
+static void mmq_build_all(void) {
+    if (getenv("LG_NO_MMQ")) {                            // force the in-place mma path (REPACK=false)
+        fprintf(stderr, "MMQ q4_K repack: disabled by LG_NO_MMQ (in-place mma)\n");
+        return;
+    }
+    size_t total = 0; int ntensor = 0;
+    for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
+        const struct gguf_tensor *t = &g_ctx->tensors[i];
+        if (t->type != GGML_TYPE_Q4_K || t->n_dims != 2) continue;
+        int k = (int)t->dims[0], m = (int)t->dims[1];
+        if (k % QK_K) continue;
+        int nbk = k / QK_K, ntile = ((m + 31) / 32) * 2;
+        total += (size_t)ntile * nbk * Q4KR_TBLK; ntensor++;
+    }
+    if (!ntensor) return;
+    size_t freeb = 0, totb = 0;
+    if (cudaMemGetInfo(&freeb, &totb) != cudaSuccess) { cudaGetLastError(); return; }
+    const size_t reserve = (size_t)1 << 30;
+    int fits = total + reserve <= freeb;
+    fprintf(stderr, "MMQ q4_K repack: %d tensors, %.2f GB; free %.2f GB, reserve 1.00 GB -> %s\n",
+            ntensor, total / 1e9, freeb / 1e9, fits ? "ENABLED" : "disabled (in-place mma)");
+    if (!fits) return;
+    g_rw_mmq = (unsigned char **)calloc(g_ctx->header.num_tensors, sizeof *g_rw_mmq);
+    if (!g_rw_mmq) return;
+    for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
+        const struct gguf_tensor *t = &g_ctx->tensors[i];
+        if (t->type != GGML_TYPE_Q4_K || t->n_dims != 2) continue;
+        int k = (int)t->dims[0], m = (int)t->dims[1];
+        if (k % QK_K) continue;
+        int nbk = k / QK_K, ntile = ((m + 31) / 32) * 2;
+        size_t bytes = (size_t)ntile * nbk * Q4KR_TBLK;
+        uint8_t *host = (uint8_t *)malloc(bytes);
+        if (!host) { fprintf(stderr, "MMQ: host OOM on %s; in-place for it\n", t->name); continue; }
+        repack_q4_K_mmq(host, (const block_q4_K *)t->data, m, nbk, ntile);
+        unsigned char *dev;
+        if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); free(host); fprintf(stderr, "MMQ: device OOM on %s; in-place for it\n", t->name); continue; }
+        cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice);
+        free(host);
+        g_rw_mmq[(size_t)i] = dev;
+    }
 }
 
 // Quantized activation scratch (grows as needed; reused across matmuls).
@@ -434,6 +543,7 @@ static void rweight_init_all(void) {
         int ts;
         if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0) rweight(t, &ts);
     }
+    mmq_build_all();
     CUDA_CHECK(cudaDeviceSynchronize());
     done = 1;
 }
@@ -634,7 +744,12 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 // scheduling and a smaller L1 cost more than the occupancy bought. 80 regs,
 // 3 CTAs, 43% occupancy is this shape's measured optimum; round 4's notes
 // have the numbers.
-template<int COLS>
+// REPACK=true reads the tile-coalesced block_q4_Kr twin (wbase = g_rw_mmq[t]);
+// REPACK=false reads the mapped q4_K blob in place (== the committed kernel,
+// byte-identical — gate #2). Only the two global reads (A-staging quant fetch +
+// per-row scale source) differ; the staging layout, mma, shuffle, and float
+// order are shared, so the two instantiations produce identical output.
+template<int COLS, bool REPACK>
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                       const int8_t *xq, const float2 *xds, int k, int m) {
@@ -656,9 +771,13 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     #pragma unroll
     for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
-    // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
+    // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's.
+    // in-place uses the clamped row directly; REPACK maps it to (tile-block,
+    // row-in-tile) — lanes 16-31 land on tile-block tbrow+1, kept in bounds by
+    // the even allocation (the repack already clamped padding rows to m-1).
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
+    const int tbrow = r0 / RPACK, htile = (r0 + lane) >> 4, hrr = (r0 + lane) & 15;
 
     mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
@@ -674,21 +793,40 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         const int8_t *sBb = sB + buf * COLS * SB_COL;
         const float2 *sBxd = sBxds + buf * COLS * SBX;
 
-        const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
-        uint32_t s0 = ((const uint32_t *)hp->scales)[0];
-        uint32_t s1 = ((const uint32_t *)hp->scales)[1];
-        uint32_t s2 = ((const uint32_t *)hp->scales)[2];
-        float dD, dM; d_dm(&hp->d, &dD, &dM);
+        // per-row scale header. in-place: read the q4_K block + decode on the
+        // fly. REPACK: read the pre-decoded sc/m (in the half loop) and the
+        // (d,dmin) here, from this lane's tile-block.
+        uint32_t s0 = 0, s1 = 0, s2 = 0; const uint8_t *sd = NULL;
+        float dD, dM;
+        if (REPACK) {
+            const unsigned char *sctb = wbase + ((size_t)htile * nbk + blk) * Q4KR_TBLK;
+            sd = sctb + Q4KR_QUANT;
+            const uint16_t *dd = (const uint16_t *)(sctb + Q4KR_QUANT + Q4KR_SCALE);
+            dD = d_fp16(dd[hrr * 2 + 0]); dM = d_fp16(dd[hrr * 2 + 1]);
+        } else {
+            const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
+            s0 = ((const uint32_t *)hp->scales)[0];
+            s1 = ((const uint32_t *)hp->scales)[1];
+            s2 = ((const uint32_t *)hp->scales)[2];
+            d_dm(&hp->d, &dD, &dM);
+        }
 
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS:
-            int qoff = sjp * 32;                                   // they share the same 32 qs
-            // bytes, so one load pass stages both unpacked halves, both tiles
+            // they share the same 32 qs bytes, so one load pass stages both
+            // unpacked halves, both tiles.
             #pragma unroll
             for (int t = 0; t < 2; t++) {
                 int ar = lane & 15, hi = lane >> 4;                // row-in-tile, which 16B half
-                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-                const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)row * nbk * ts) + blk;
-                uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
+                uint4 q4;
+                if (REPACK) {                                      // coalesced: consecutive lanes contiguous
+                    const uint4 *qd = (const uint4 *)(wbase + ((size_t)(tbrow + t) * nbk + blk) * Q4KR_TBLK);
+                    q4 = qd[(sjp * 2 + hi) * RPACK + ar];          // group sjp*2+hi, row-in-tile ar (repack tail-clamped)
+                } else {
+                    int qoff = sjp * 32;
+                    int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                    const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)row * nbk * ts) + blk;
+                    q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
+                }
                 int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
                 uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);
                 uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16);
@@ -701,7 +839,9 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
             #pragma unroll
             for (int half = 0; half < 2; half++) {
                 int sj = sjp * 2 + half;
-                uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
+                uint8_t sc, mm;
+                if (REPACK) { sc = sd[hrr * 16 + sj]; mm = sd[hrr * 16 + 8 + sj]; }
+                else        { d_gsm32r(sj, s0, s1, s2, &sc, &mm); }
                 float dscL = dD * sc, mnmL = dM * mm;              // my header ROW's pair
                 float dsc[2][2], mnm[2][2];                        // [tile][row-half]
                 #pragma unroll
@@ -916,7 +1056,9 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         int blocks = (m + 32 * wpc - 1) / (32 * wpc);
         if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
             size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
-            matmul_q4k_mma_kernel<PREFILL_B><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+            const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
+            if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m);
+            else    matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m);
         } else {                                                  // q6_K stays 16-wide (L2-cached copy); loop the chunk
             size_t shm = 2 * 16 * SB_COL + 2 * 16 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
             for (int c0 = 0; c0 < PREFILL_B; c0 += 16)
