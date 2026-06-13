@@ -53,24 +53,29 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 // The gemma4uv geometry this tool prepares data for. (If a future mmproj
 // changes these, make them flags; the runner derives its own from tensors.)
 #define PATCH    48
-#define MIN_TOK  252   // gemma4v (E2B/E4B) trains at 252..280 tokens; the 12B
-#define MAX_TOK  280   // accepts down to 40, so always-high-res suits both
-// -n overrides the token budget downward: a robot camera at 1 FPS cares about
-// prefill latency, not detail — 40-64 tokens is a ~300x300 view and prefills
-// in well under a second where 266 takes several. The runner only validates
-// geometry, so any 48-multiple is legal; the model trades acuity for speed.
-static int g_max_tok = MAX_TOK, g_min_tok = MIN_TOK;
+#define MAX_TOK  280   // default token budget = a rung of Gemma 4's official
+// ladder: 70, 140, 280, 560 or 1120 tokens (the doc at ai.google.dev/gemma,
+// "variable resolution token budget"). -n picks any other budget — the
+// runner only validates geometry, and the model degrades gracefully below
+// 70: a robot camera at 1 FPS reads a 24-token frame in half a second where
+// 266 takes ~2.5 s, trading acuity for latency. A budget is a MAXIMUM:
+// images already under it keep their native grid. (The reference
+// implementation this tool started from also UPSCALED small images to fill
+// the budget — qwen-style preprocessing it inherited, not anything Gemma's
+// own doc asks for — which silently doubled a small camera frame's prefill.
+// Dropped: Google's doc and the latency math agree it should be.)
+static int g_max_tok = MAX_TOK;
 #define RATE     16000
 #define FRAME    640
 
 // ---- image: decode -> resize to patch-multiple dims -> u8 RGB ---------------
 
-// Pick the resized (W, H): each side a multiple of the patch size, total pixels
-// in [MIN_TOK, MAX_TOK] patches' worth, aspect ratio preserved (the qwen-style
-// rounding the reference uses — round first, then sqrt-rescale if out of range).
+// Pick the resized (W, H): each side a multiple of the patch size, at most the
+// budget's worth of patches in total, aspect ratio preserved (round first,
+// then sqrt-rescale down if over — the reference's rounding, minus its
+// upscale branch).
 static void target_size(int w, int h, int *ow, int *oh) {
     const float fa = (float)PATCH;
-    const long long min_px = (long long)g_min_tok * PATCH * PATCH;
     const long long max_px = (long long)g_max_tok * PATCH * PATCH;
     int hb = (int)roundf((float)h / fa) * PATCH;
     int wb = (int)roundf((float)w / fa) * PATCH;
@@ -82,10 +87,6 @@ static void target_size(int w, int h, int *ow, int *oh) {
         wb = (int)floorf((float)w / beta / fa) * PATCH;
         if (hb < PATCH) hb = PATCH;
         if (wb < PATCH) wb = PATCH;
-    } else if ((long long)hb * wb < min_px) {
-        float beta = sqrtf((float)min_px / ((float)h * (float)w));
-        hb = (int)ceilf((float)h * beta / fa) * PATCH;
-        wb = (int)ceilf((float)w * beta / fa) * PATCH;
     }
     *ow = wb; *oh = hb;
 }
@@ -218,7 +219,9 @@ int main(int argc, char **argv) {
     const char *spath = argc > 1 ? argv[1] : NULL;
     const char *question = NULL;
     if (!spath || argc < 3) {
-        fprintf(stderr, "usage: %s <socket> [-i image]... [-a audio]... \"question\"\n", argv[0]);
+        fprintf(stderr, "usage: %s <socket> [-n budget] [-t text]... [-i image]... [-a audio]... [\"question\"]\n"
+                        "  -n: max image tokens (Gemma 4 budgets: 70/140/280/560/1120; default 280;\n"
+                        "      any value works, lower = faster prefill; place before -i)\n", argv[0]);
         return 1;
     }
 
@@ -261,7 +264,6 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
             g_max_tok = atoi(argv[++i]);
             if (g_max_tok < 1) g_max_tok = 1;
-            if (g_min_tok > g_max_tok) g_min_tok = g_max_tok;
         } else {
             question = argv[i];
         }
