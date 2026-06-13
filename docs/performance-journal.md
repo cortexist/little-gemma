@@ -767,17 +767,40 @@ still byte-equal, E4B relaxed at 98.9%, MTP byte-identical. A QT sweep
 confirmed 8 as the optimum (16 loses occupancy, 4 loses reuse; the output
 is bit-identical across QT, so it is a pure perf knob).
 
+## The matmul's own stall: bank conflicts, measured then padded away
+
+That 42% short-scoreboard stall was the documented-hard lever — round 2's
+frag-major attempt at it had regressed both devices. This time the rule was
+*measure first*: ncu on the dominant q4_K launch showed **3.69M shared-load
+wavefronts for 634K load instructions — 5.8 per load where conflict-free is
+~1, 78% pure bank-conflict overhead.** So the stall really was bank
+conflicts (not transaction volume), which is exactly what frag-around-two
+got wrong. The cause was layout arithmetic, not the tensor cores: the staged
+activation columns are 256 B = 64 words, a multiple of the 32 shared banks,
+so a warp's fragment read (one column per lane-group) serialised ~8 ways.
+The fix is the oldest trick there is — **pad the per-column stride to 272 B**
+(68 words; 68 mod 32 = 4, so `gid*4 + tid` spans all 32 banks bijectively).
+Pure storage relocation: values and mma order unchanged, so it is
+byte-identical in data, deterministic, equal to the dp4a path. **Orin E4B
+109.3 → 118.8 (+8.7%), 12B 43.6 → 48.6 (+11.4%), conflicts 2.87M → 1.43M.**
+The same idea on the weight tile (32 B = 8-word rows, also bank-aligned,
+2-way) padded to 48 B added a smaller **E4B → 120.7, 12B → 49.7** — the
+weight reads were a minor share, and the ~1.23M conflicts that remain trace
+to a source the static analysis doesn't pin down (a job for source-level ncu
+with clearly diminishing returns). The lesson is the cheap one worth
+re-banking: **measure the bank-conflict counter before designing a swizzle**
+— it both confirmed the win was there and pointed at a one-line stride pad
+rather than the elaborate restructure that failed last time.
+
 **The prefill journey, end to end (Orin, 1,982-token prompt):** E4B
-55 → 78 (mma rounds) → 91.5 (q6_K + float4) → 106.8 (B=32) → **109.3**;
-12B 21 → 30 → 35 → 40 → **43.6**. Against the pre-tensor-core dp4a baseline
-that is ~1.95× (E4B) and ~2.08× (12B); the ratio to llama.cpp moved from
-~0.10 at the start of the prefill work to ~0.22 / 0.21. The honest position
-is unchanged in shape — prefill is still llama.cpp's axis, ours is decode —
-but the gap is a factor of ~4.5 now, not ~10, and every step is gated, the
-output equal to the dp4a path up to a late greedy tie, decode and MTP
-untouched. The one substantial lever left is the matmul's own 42%
-shared-memory stall (a proper swizzle), and that is the documented-hard
-one — round 2's frag-major attempt at the same goal regressed both devices.
+55 → 78 (mma rounds) → 91.5 (q6_K + float4) → 106.8 (B=32) → 109.3 (K/V
+share) → **120.7** (swizzle); 12B 21 → 30 → 35 → 40 → 43.6 → **49.7**.
+Against the pre-tensor-core dp4a baseline that is ~2.15× (E4B) and ~2.36×
+(12B); the ratio to llama.cpp moved from ~0.10 at the start of the prefill
+work to ~0.24 on both. The honest position is unchanged in shape — prefill
+is still llama.cpp's axis, ours is decode — but the gap is a factor of ~4
+now, not ~10, and every step is gated: deterministic, output equal to the
+dp4a path up to a late greedy tie, decode and MTP untouched.
 
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;

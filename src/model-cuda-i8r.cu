@@ -599,6 +599,12 @@ __device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, ui
 // all 32 banks bijectively -> conflict-free. Pure storage relocation: values
 // and mma order are unchanged, so the output stays byte-identical.
 #define SB_COL 272
+// The A (weight nibble) tile rows are 32 B = 8 words, also a 32-bank multiple,
+// so the fragment read (one row per gid) aliases gid with gid+4 — a 2-way
+// conflict (the ~1.43M left after the B-side fix). Padding the A row stride to
+// 48 B (12 words; gid*12 mod 32 over gid 0..7 hits 8 distinct bank-quads) makes
+// gid*12 + tid span all 32 banks. q4_K only; q6_K's 16 B rows already spread.
+#define SA_ROW 48
 template<int COLS>
 __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
                                    const int8_t *xq, const float2 *xds, int k, int blk, int tix) {
@@ -639,7 +645,7 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
-    int8_t *sAw = sA + warp * 2 * 2 * 16 * 32;
+    int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
     float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
     for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
@@ -677,9 +683,9 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                 int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
                 const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)row * nbk * ts) + blk;
                 uint4 q4 = *(const uint4 *)(bp->qs + qoff + hi * 16);
-                int8_t *sAt = sAw + t * 2 * 16 * 32;
-                uint32_t *lo = (uint32_t *)(sAt + ar * 32 + hi * 16);
-                uint32_t *hh = (uint32_t *)(sAt + 16 * 32 + ar * 32 + hi * 16);
+                int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
+                uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);
+                uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16);
                 lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
                 lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
                 hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
@@ -708,11 +714,11 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                     float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * 8 + sj];
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {                  // both tiles ride one B load
-                        const int8_t *sAh = sAw + t * 2 * 16 * 32 + half * 16 * 32;
-                        uint32_t a0 = *(uint32_t *)(sAh + gid * 32 + tid * 4);
-                        uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4);
-                        uint32_t a2 = *(uint32_t *)(sAh + gid * 32 + tid * 4 + 16);
-                        uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * 32 + tid * 4 + 16);
+                        const int8_t *sAh = sAw + t * 2 * 16 * SA_ROW + half * 16 * SA_ROW;
+                        uint32_t a0 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4);
+                        uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4);
+                        uint32_t a2 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
+                        uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
                         int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                         asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -903,7 +909,7 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
         int blocks = (m + 32 * wpc - 1) / (32 * wpc);
         if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
-            size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * 32;
+            size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
             matmul_q4k_mma_kernel<PREFILL_B><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         } else {                                                  // q6_K stays 16-wide (L2-cached copy); loop the chunk
             size_t shm = 2 * 16 * SB_COL + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 2048;
