@@ -454,10 +454,13 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
 // (the per-column re-reads hit L1). Activations sit at column stride k (int8)
 // and k/32 (scales), exactly as the producers' epilogues laid them out. Each
 // column's accumulation order matches the one-column kernel, so the result is
-// bit-identical to NB separate matmul_q calls. NB is a template parameter so
-// the register accumulators stay compile-sized: <PREFILL_B> is the frozen
-// prefill instantiation (identical codegen to the former constant), <2> is
-// the MTP verify pair — separate instruction streams, like d_attn's RING.
+// bit-identical to NB separate matmul_q calls — an invariant the <2>
+// instantiation (the MTP verify pair) MUST keep: spec-vs-plain byte-identity
+// rests on the verify's argmax matching decode's exactly. The <PREFILL_B>
+// instantiation relaxes it in the float fallbacks only (wide loads
+// reassociate; same gate class as the mma kernels). NB is a template
+// parameter so the register accumulators stay compile-sized — separate
+// instruction streams, like d_attn's RING.
 template <int NB>
 __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
                                            const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
@@ -491,19 +494,54 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
             }
         }
     } else if (type == GGML_TYPE_F32) {
+        // These are the tiny-m float matmuls (laurel, altup): a handful of
+        // CTAs, long serial load chains — issue-bound, ~85 launches per chunk
+        // at 10% of prefill GPU time for 2% of its MACs. (A cached device
+        // copy of the weights was tried first and measured NOTHING: the x
+        // loads outnumber the weight load 16:1, so weight caching was never
+        // the constraint. Wider loads on both sides are.)
         const float *wr = (const float *)row;
-        for (int i = lane; i < k; i += 32) {
-            float w = wr[i];
-            for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
+        if (NB == 2 || (k & 3)) {                        // verify pair: decode's order, exactly
+            for (int i = lane; i < k; i += 32) {
+                float w = wr[i];
+                for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
+            }
+        } else {
+            for (int i = 4 * lane; i < k; i += 128) {
+                float4 w4 = *(const float4 *)(wr + i);
+                for (int j = 0; j < NB; j++) {
+                    float4 x4 = *(const float4 *)(x + (size_t)j * k + i);
+                    s[j] += w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w;
+                }
+            }
         }
-    } else {                                             // bf16 / f16: one uint32 = 2 elements
+    } else {                                             // bf16 / f16
         const uint16_t *wr = (const uint16_t *)row;
-        for (int i = 2 * lane; i < k; i += 64) {
-            uint32_t two = ld32(wr + i);
-            float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
-            float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
-            for (int j = 0; j < NB; j++)
-                s[j] += w0 * x[(size_t)j * k + i] + w1 * x[(size_t)j * k + i + 1];
+        if (NB == 2 || (k & 7)) {                        // one uint32 = 2 elements
+            for (int i = 2 * lane; i < k; i += 64) {
+                uint32_t two = ld32(wr + i);
+                float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
+                float w1 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(two >> 16)) : d_fp16((uint16_t)(two >> 16));
+                for (int j = 0; j < NB; j++)
+                    s[j] += w0 * x[(size_t)j * k + i] + w1 * x[(size_t)j * k + i + 1];
+            }
+        } else {                                         // prefill: one uint4 = 8 elements
+            for (int i = 8 * lane; i < k; i += 256) {
+                uint4 w8 = *(const uint4 *)(wr + i);
+                uint32_t ww[4] = { w8.x, w8.y, w8.z, w8.w };
+                float w[8];
+                #pragma unroll
+                for (int h = 0; h < 4; h++) {
+                    w[2 * h]     = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)ww[h]) : d_fp16((uint16_t)ww[h]);
+                    w[2 * h + 1] = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)(ww[h] >> 16)) : d_fp16((uint16_t)(ww[h] >> 16));
+                }
+                for (int j = 0; j < NB; j++) {
+                    const float *xj = x + (size_t)j * k + i;
+                    float4 xa = *(const float4 *)xj, xb = *(const float4 *)(xj + 4);
+                    s[j] += w[0] * xa.x + w[1] * xa.y + w[2] * xa.z + w[3] * xa.w
+                          + w[4] * xb.x + w[5] * xb.y + w[6] * xb.z + w[7] * xb.w;
+                }
+            }
         }
     }
     #pragma unroll
