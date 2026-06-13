@@ -616,6 +616,55 @@ carry token ids for PLE alongside embedding rows), the q6_K mma variant
 48 tokens. The 12B is parked for camera duty: 370 ms per chunk pass puts
 even a perfectly packed turn at ~1.1 s.
 
+**Round five: q6_K joins the tensor cores (same day — the user's steer:
+prefill is general-purpose, not a vision feature).** The fragment-mapping
+discipline paid again: a `m16n8k16` twin of the step-2 harness
+(.scratch/mma6_test.cu) pinned the layout against a double reference
+before any production code — A two regs (rows gid/gid+8), B one reg, C as
+k32's — and the kernel landed correct on the first full-model run. q6_K's
+shape is friendlier than q4_K's in one way (a per-16-element int8 scale
+means one mma per sub-block, exact integer dot, no min term) and nastier
+in two: the repacked block is 4- but not 16-aligned (staging stays `ld32`),
+and a naive `[row][128]` unpacked tile has a 32-word stride that would put
+a fragment read's eight `gid` lanes on ONE bank — staged sub-block-major
+instead, 32 addresses across 32 banks. **Orin E4B prefill 78.4 → 90.0
+tok/s (+15%; now +60% over dp4a), 12B 30.1 → 35.0 (+16%)**; deterministic,
+12B output equal to the dp4a path; E2B/E4B flip one greedy tie 98-99% of
+the way through a 69-80KB output — the relaxed-gate class, inspected
+coherent on both sides. MTP byte-identity untouched.
+
+**Round six, profile-led, half a theory each way.** With 98% of MACs on
+tensor cores, nsys re-ranked the field: q4_K mma 52% of prefill GPU time,
+q6_K 16%, and — the surprise — the dp4a *fallback* (`matmul_i8r_n`) at
+**10.8% for 2.1% of the MACs**: the tiny-m f32/bf16 matmuls (laurel,
+altup), ~85 launches per chunk. Theory one — they stream uncached
+zero-copy weights — earned a cached-device-copy fix that measured exactly
+NOTHING (falsified theory #5, reverted): the x loads outnumber the weight
+load 16:1, so weight caching was never the constraint. Theory two — wide
+loads, the house lesson — made both sides `float4` (the NB=2 verify
+instantiation keeps decode's float order bit-for-bit; the comment above
+the kernel now states that invariant, because MTP byte-identity rests on
+it): kernel −25-30%, **prefill 90.0 → 91.5** (+1.6% — the launches are
+latency-bound, so the instruction savings mostly hid in stalls). 12B
+unaffected at 35.0, correctly: it is dense, no altup/laurel. Honest
+residue: the fallback still costs ~4× its MAC share in launch overhead and
+stalls; folding those tiny matmuls into fewer launches is a possible
+future bite.
+
+Where prefill stands after the day (Orin, 1,982-token prompt): **E4B 55 →
+91.5 tok/s (1.63× over dp4a), 12B 21 → 35.0 (1.65×)**; the llama.cpp ratio
+moved 0.11 → 0.18. The camera turn at `-n 40`: **embed 0.2 s + prefill
+0.69 s** (was 1.1 + 0.97 yesterday); a 266-token image turn prefills in
+2.60 s (was 3.78). The 0.5 s turn target is one structural step away —
+packing the turn's three prefill calls into one stream (5 chunk passes →
+4, ~0.55 s) plus any further kernel round. Next kernel candidates, by
+profile: q4_K mma's 27% SM throughput (the swizzle/pipeline grind), the
+q6_K kernel's ~1.9× per-MAC gap to q4_K (k16 halves the work per
+instruction), chunk attention (12%, currently re-reads K/V per query where
+16 queries share almost all of it), and re-testing PREFILL_B=32 now that
+the kernel species changed (the old falsification was dp4a register
+spills; mma's cost is acc registers — uncertain both ways).
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):
