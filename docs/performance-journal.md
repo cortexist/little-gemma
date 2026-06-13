@@ -665,6 +665,29 @@ instruction), chunk attention (12%, currently re-reads K/V per query where
 the kernel species changed (the old falsification was dp4a register
 spills; mma's cost is acc registers — uncertain both ways).
 
+**The structural step, and the target falls.** `model_prefill_mixed` —
+one prefill stream for the whole turn, text token ids and media row
+references interleaved (`ids[i] >= 0` is a token, looked up and scaled
+with its own per-layer row; `ids[i] < 0` indexes the media rows, entered
+as given with the padding token's) — so chunk boundaries ignore the
+text/media seams that used to pad three separate calls to their own chunk
+edges. Every position's math is exactly its pure-form chunk's; an
+all-text turn compiles to the identical operation sequence, so the text
+serve path stays byte-identical by construction. The CPU backend's
+version is four lines of dispatch — it has no chunks, the entire win is a
+chunk-boundary story. Measured on the Orin, E4B warm: the `-n 40` turn
+**0.69 → 0.57 s** (5 weight passes → 4), `-n 64` 0.82 → 0.70, 266-token
+2.60 → 2.47. And with the seams gone, the token dial reaches the target:
+**`-n 32` plus a short question — 41 tokens, 3 passes — prefills in
+0.44 s** (quality spot-checked intact at 24 image tokens), and a `-n 40`
+media-only turn (the robot's silent-watching shape) is 0.44 s as well.
+Multi-frame turns assemble correctly through the one stream (two
+timestamped frames: "2 frames, nothing changed"). **Frame budget closed:
+embed 0.1-0.3 s + prefill 0.44 s on a 1 FPS camera, with headroom** —
+from 1.1 + 3.6 s when the week started. MTP byte-identity re-checked and
+green; the remaining kernel rounds above are now purely general-purpose
+prefill work.
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):
