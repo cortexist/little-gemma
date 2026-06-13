@@ -1054,27 +1054,9 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
         while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
         int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-        if (t->type == GGML_TYPE_Q4_K) {
-            const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
-            // Stage A (default): the whole chunk in ONE COLS=PREFILL_B launch —
-            // each weight tile crosses DRAM once. Stage B (LG_MMQ_B16, an Orin
-            // A/B knob): COLS=16 looped, ~half the C-register footprint -> more
-            // CTAs / higher occupancy, but the weights cross twice. Byte-
-            // identical either way (each out[col][row] is summed in ascending k
-            // by one lane, independent of the launch's column count).
-            static int b16 = -1;
-            if (b16 < 0) b16 = getenv("LG_MMQ_B16") != NULL;
-            if (b16) {
-                size_t shm = 2 * 16 * SB_COL + 2 * 16 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
-                for (int c0 = 0; c0 < PREFILL_B; c0 += 16) {
-                    float *o = d_out + (size_t)c0 * m; const int8_t *xq = g_xq + (size_t)c0 * k;
-                    const float2 *xd = g_xds + (size_t)c0 * (k / 32);
-                    if (rw) matmul_q4k_mma_kernel<16, true ><<<blocks, 32 * wpc, shm, g_launch>>>(o, rw, ts, xq, xd, k, m);
-                    else    matmul_q4k_mma_kernel<16, false><<<blocks, 32 * wpc, shm, g_launch>>>(o, w,  ts, xq, xd, k, m);
-                }
-                return;
-            }
+        if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
             size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
+            const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
             if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m);
             else    matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m);
         } else {                                                  // q6_K stays 16-wide (L2-cached copy); loop the chunk
