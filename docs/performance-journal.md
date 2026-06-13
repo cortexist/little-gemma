@@ -688,6 +688,97 @@ from 1.1 + 3.6 s when the week started. MTP byte-identity re-checked and
 green; the remaining kernel rounds above are now purely general-purpose
 prefill work.
 
+## Widening the chunk: the bandwidth lever, and a B=64 that wasn't worth it
+
+With the camera budget closed, prefill became a general-throughput problem
+again, and the diagnosis sharpened to a single number. Prefill processes
+the prompt in chunks of B tokens; each weight matrix crosses the bus once
+per chunk. E4B's weights are ~3.4 GB, the Orin's bus ~60 GB/s, so at B=16
+that is 3.4/60/16 ≈ **3.5 ms/token of pure weight streaming** — a hard
+ceiling of ~185 tok/s for *any* B=16 kernel, however perfect. We were at
+91.5 (≈0.49 of that floor). llama.cpp escapes the ceiling entirely by
+prefilling at batch ~512, where weight traffic is ~6.6 MB/token and the
+kernel runs compute-bound at ~1.5 ms/token (~500 tok/s). The lever is not a
+better B=16 kernel; it is a **bigger B**.
+
+The obvious target was B=64 (a 4× traffic cut), and the design that a
+multi-agent pass converged on was instructive precisely because it was
+*rejected*. The naive route — keep the 16-column kernel and loop it four
+times over a 64-wide chunk — delivers **zero** of the win: the kernel
+re-walks the whole weight matrix every block, so four launches read the
+weights four times. Feeding 64 columns from one weight read requires 64
+live accumulators in a single k-loop, which at `m16n8k32` is 32 C-registers
+per lane and forces *one* row-tile per warp — abandoning the round-3
+two-tile trick where each staged B fragment feeds two `mma`. And the shared
+budget lands at exactly 48 KB, the launch cap, with q6_K's variant over it
+(56 KB) — needing the L1-shrinking carveout already measured at −4%. The
+honest read: B=64 one-tile would trade the reuse that holds the dominant
+shared-memory stall in check for a second bandwidth halving whose marginal
+value is *half* the first's. Not worth it.
+
+So the shipped step was the de-risking way-station: **B=32, two-tile**,
+which keeps the proven round-3 structure and only widens the accumulator
+to `acc[2][4][4]` (32 C-registers, ptxas-confirmed 122 regs / 0 spill / 2
+CTAs). q4_K widens to 32 columns in one launch; q6_K — a `cudaMalloc`
+device copy, L2-cached, so re-reads are cheap — stays 16-wide and the
+dispatch loops it. **Orin E4B 90.0 → 106.8 tok/s (+18.6%), 12B 35.0 → 40.0
+(+14.4%)**, deterministic, 12B byte-equal to the dp4a path, E4B a late
+greedy-tie flip (relaxed class). The ncu profile then said *stop here*: SM
+throughput stayed flat at 27% and the short-scoreboard (shared-memory)
+stall stayed ~42% — the entire win was the halved weight bandwidth, exactly
+the diagnosis, and the structure that would chase more (B=64 one-tile)
+attacks the wrong axis. The camera turn rode along: `-n 40` prefill
+0.57 → 0.48 s.
+
+## Attention, profiled into the spotlight
+
+Cutting matmul reshuffled the profile, and the next target was not where a
+guess would put it. `LG_PREFILL_PROFILE` on the B=32 build: E4B matmul 56%,
+**attention 28%**, host tail only ~9%; 12B matmul 56%, **attention 43%**.
+Attention had barely moved when matmul shrank — because total attention
+work is query-count-bound, not chunk-bound — so it now dominated the
+remainder, especially on the 12B. The host-overlap lever the plan had
+penciled in was a non-issue (the tail is small); attention was the prize.
+
+The cost was redundancy: the per-query prefill kernel launches one block
+per (head, query), and each re-streams the whole K/V prefix, so a chunk's B
+queries read it B times. At a long context K/V exceeds L2, so that
+redundancy is DRAM traffic. The fix is **K/V sharing**: a block owns a tile
+of QT queries for one head, stages each K/V row into shared *once*, and
+reuses it across QT warps — one warp per query, online-softmax state in
+registers exactly as `d_attn` does it. Global K/V reads drop ~QT×; the math
+per query is unchanged (a standalone harness put it at 5.2e-6 vs a double
+reference, the same accuracy as the per-query kernel, before any production
+code). The B=2 MTP verify stays on the per-query path so its argmax keeps
+matching decode's — spec byte-identity safe by construction.
+
+The lesson came from the dispatch rule, not the kernel. Sharing on *every*
+layer **regressed E4B** (its sliding-window K/V fits L2, so the per-query
+re-reads were already cached and the sharing kernel's per-position barriers
+were pure overhead) while helping 12B. Restricting to global layers fixed
+E4B but lost 12B's gain — because 12B's *windows* are wide enough (large
+kv_dim) to spill L2 too. Neither local/global split is right; the criterion
+is the **L2 footprint** itself: `share when window==0 || 2·window·kv_dim·
+sizeof(KT) > l2CacheSize`. That single gate gives both models their best —
+full layers always share, SWA layers share only when their window can't
+stay cached. **Orin E4B 106.8 → 109.3 (+2.4%, attention 5.21 → 4.84 s),
+12B 40.0 → 43.6 (+9.1%, attention 20.27 → 16.28 s)**, deterministic, 12B
+still byte-equal, E4B relaxed at 98.9%, MTP byte-identical. A QT sweep
+confirmed 8 as the optimum (16 loses occupancy, 4 loses reuse; the output
+is bit-identical across QT, so it is a pure perf knob).
+
+**The prefill journey, end to end (Orin, 1,982-token prompt):** E4B
+55 → 78 (mma rounds) → 91.5 (q6_K + float4) → 106.8 (B=32) → **109.3**;
+12B 21 → 30 → 35 → 40 → **43.6**. Against the pre-tensor-core dp4a baseline
+that is ~1.95× (E4B) and ~2.08× (12B); the ratio to llama.cpp moved from
+~0.10 at the start of the prefill work to ~0.22 / 0.21. The honest position
+is unchanged in shape — prefill is still llama.cpp's axis, ours is decode —
+but the gap is a factor of ~4.5 now, not ~10, and every step is gated, the
+output equal to the dp4a path up to a late greedy tie, decode and MTP
+untouched. The one substantial lever left is the matmul's own 42%
+shared-memory stall (a proper swizzle), and that is the documented-hard
+one — round 2's frag-major attempt at the same goal regressed both devices.
+
 The MTP verdict is the device-scoped story this journal keeps re-learning,
 now in one table (story prompt, 256 generated tokens, warm, best of 2;
 acceptance in parentheses; `llama-bench tg32` same day, same machine):

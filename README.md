@@ -336,8 +336,10 @@ matmul everyone stares at — E2B from 7.9 to 182.5 tok/s — then a long-contex
 roadmap (online-softmax attention, batched prefill, a kv cache at ~5% of its
 old footprint), GPU media encoders, and speculative decoding, which flushed
 out an uncached-zero-copy bug whose fix alone bought +49% prefill on desktop
-and ~2× on Jetson. The full log, dead ends and bisections included, is
-**[docs/performance-journal.md](docs/performance-journal.md)**.
+and ~2× on Jetson. Then a tensor-core prefill push — an int8 `mma` chunk
+matmul (q4_K then q6_K), wider 32-token chunks, and an L2-aware K/V-sharing
+attention — roughly doubled Jetson prefill again. The full log, dead ends and
+bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
 
 Where things stand — both sides re-measured the same day on the same machine,
 same prompt (little-gemma = `run-cuda-i8r`, 256 generated tokens, warm;
@@ -369,6 +371,17 @@ per device: MTP loses on Windows (WDDM prices its two per-round syncs in
 milliseconds) and wins on the Jetson — same binary, byte-identical output on
 both, faster only where the hardware says so. On the edge device this project
 actually targets, every row is ahead.
+
+Those tables are **decode** — the project's strong axis. **Prefill** (prompt
+processing) is the honest weak axis: it is weight-bandwidth-bound, and
+llama.cpp prefills at batch ~512 through arch-tuned tensor-core GEMMs that no
+few-thousand-line kernel matches. The push above closed most of the gap on the
+Jetson — E4B ~55 → **109** prompt tok/s, 12B ~21 → **44** (a 1,982-token
+prompt), ~1.95× and ~2.08× over the int8 baseline — moving the ratio to
+llama.cpp from ~10× behind to ~4.5×. It is still their axis; the wins are
+real, gated to the same output up to a late greedy tie, and the matmul's own
+shared-memory stall is the next lever. Where prefill is *felt* — image turns
+and document ingestion — this is what made the 1 FPS camera budget reachable.
 
 For honesty's sake: those are *decode* tables, and decode is this project's
 strong axis. **Prefill is llama.cpp's** — its batch-512 tensor-core GEMMs
