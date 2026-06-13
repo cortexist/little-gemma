@@ -121,6 +121,16 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
 // matching the reference; the 12B has no PLE at all.
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0);
 
+// Prefill a whole MIXED span — text tokens and media rows interleaved — as
+// one stream, so chunk boundaries ignore the text/media seams. ids[i] >= 0 is
+// a text token (embedding looked up and sqrt(n_embd)-scaled, per-layer row
+// from the id); ids[i] < 0 is media row -ids[i]-1 of rows (entered as given,
+// per-layer row id 0). This exists because a turn prefilled as separate
+// text/media/text calls pays a full weight pass for each segment's padded
+// remainder — a short camera turn spent a third of its prefill on the seams.
+void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
+                         const int *ids, int n, int pos0);
+
 // ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
 // A tiny transformer that predicts the token AFTER next by cross-attending
 // straight into the target's KV cache (it has no K/V projections of its own).

@@ -958,6 +958,39 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
     chunk_layers(m, kv, has_ple, PREFILL_B, matmul_q_n);
 }
 
+// Mixed form: each chunk position is a text token (ids[j] >= 0: looked-up,
+// scaled embedding + its own per-layer row) or a media row (ids[j] < 0: row
+// -ids[j]-1 of mrows as given + the padding token's per-layer row). Every
+// position's math is exactly its pure-form chunk's — only the company a
+// position keeps in a chunk changes.
+static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float *mrows,
+                                const int *ids, int pos0) {
+    const struct config *c = &m->cfg;
+    const int B = PREFILL_B, n_embd = c->n_embd;
+
+    float *rows = (float *)malloc((size_t)B * n_embd * 4);
+    if (!rows) { fprintf(stderr, "forward_chunk_mixed: out of memory\n"); exit(1); }
+    float es = sqrtf((float)n_embd);
+    int toks[PREFILL_B];
+    for (int j = 0; j < B; j++) {
+        if (ids[j] >= 0) {
+            toks[j] = ids[j];
+            float *erow = dequantize_row(wq(m, "token_embd.weight"), ids[j], n_embd);
+            for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
+            free(erow);
+        } else {
+            toks[j] = 0;
+            memcpy(rows + (size_t)j * n_embd, mrows + (size_t)(-ids[j] - 1) * n_embd, (size_t)n_embd * 4);
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
+    free(rows);
+
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
+    build_per_layer_n(m, toks, PREFILL_B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), PREFILL_B, matmul_q_n);
+}
+
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
 // ~1000 per-token kernel launches collapse into one graph launch, erasing the WDDM
 // launch latency that leaves the GPU idle ~30% of each token. The graph is fully STATIC
@@ -1076,6 +1109,34 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
     }
     for (; i < n; i++) {                              // 0-1 rows (or no room): singles
         CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)i * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
+        int pos = pos0 + i;
+        CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+        if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row
+        forward_graph(m, kv, 0);
+    }
+}
+
+extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
+                                    const int *ids, int n, int pos0) {
+    ensure_weights(m);
+    ensure_scratch(m);
+    const int n_embd = m->cfg.n_embd;
+    int i = 0;
+    for (; n - i >= PREFILL_B; i += PREFILL_B)
+        forward_chunk_mixed(m, kv, rows, ids + i, pos0 + i);
+    if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
+    // padded remainder, exactly as the pure forms (repeating a media id
+    // repeats its row; the pad's kv is overwritten before it can be read)
+    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
+        int padded[PREFILL_B];
+        for (int j = 0; j < PREFILL_B; j++) padded[j] = ids[i + (j < n - i ? j : n - i - 1)];
+        forward_chunk_mixed(m, kv, rows, padded, pos0 + i);
+        if (g_graph_warmups < 2) g_graph_warmups = 2;
+        return;
+    }
+    for (; i < n; i++) {                              // 0-1 positions (or no room): singles
+        if (ids[i] >= 0) { forward_token(m, kv, ids[i], pos0 + i, 0); continue; }
+        CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)(-ids[i] - 1) * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
         int pos = pos0 + i;
         CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
         if (model_has_ple(m)) build_per_layer(m, 0);  // padding token's PLE row

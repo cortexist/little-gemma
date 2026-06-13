@@ -294,16 +294,29 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 break;
             }
             double t0 = now_sec();
-            // The turn is assembled as alternating text and embedding spans:
+            // The turn is assembled as alternating text and embedding spans —
             // text accumulates (turn opener, 'T' frames, media markers) and is
-            // encoded+prefilled in one go right before each media span, whose
-            // rows then prefill as embeddings; the question line closes the
-            // turn. Only the very first encode of the conversation keeps its
+            // encoded right before each media span — but the whole turn
+            // prefills as ONE mixed stream: ids >= 0 are text tokens, ids < 0
+            // index the media rows gathered alongside. Prefilled separately,
+            // every text/media seam padded its own chunk to a full weight
+            // pass; a short camera turn spent a third of its prefill on the
+            // seams. Only the very first encode of the conversation keeps its
             // BOS (when a -sys prefix exists, the BOS already lives there);
             // the first turn opens plainly, later turns first close the
             // previous model turn, whose <turn|> was never fed back.
             int skip = (pos == 0) ? 0 : 1;               // tokenizer_encode always prepends BOS
             int n = 0, total = 0, best;
+            int idcap = in_media + in_text + (int)strlen(line) + 16 * n_seg + 192;
+            int *ids = malloc((size_t)idcap * sizeof *ids);
+            float *mrows = in_media ? malloc((size_t)in_media * m.cfg.n_embd * 4) : NULL;
+            if (!ids || (in_media && !mrows)) {
+                free(ids); free(mrows);
+                for (int i = 0; i < n_seg; i++) { free(seg[i].rows); free(seg[i].text); }
+                fprintf(stderr, "turn buffer: out of memory\n");
+                break;
+            }
+            int nid = 0, nmr = 0;
             int tl = snprintf(chat, sizeof chat, pos == n_sys ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
             for (int i = 0; i < n_seg; i++) {
                 if (seg[i].kind == MEDIA_FRAME_TEXT) {
@@ -314,22 +327,22 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 tl += snprintf(chat + tl, sizeof chat - tl, "%s",
                                seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_BEG : MEDIA_AUD_BEG);
                 n = tokenizer_encode(tk, chat, promptv, 4096);
-                model_prefill(&m, &kv, promptv + skip, n - skip, pos);
-                pos += n - skip;
-                total += n - skip;
+                for (int j = skip; j < n; j++) ids[nid++] = promptv[j];
                 skip = 1;
-                model_prefill_embd(&m, &kv, seg[i].rows, seg[i].n, pos);
-                pos += seg[i].n;
-                total += seg[i].n;
+                memcpy(mrows + (size_t)nmr * m.cfg.n_embd, seg[i].rows, (size_t)seg[i].n * m.cfg.n_embd * 4);
+                for (int r = 0; r < seg[i].n; r++) ids[nid++] = -(nmr + r) - 1;
+                nmr += seg[i].n;
                 free(seg[i].rows);
                 tl = snprintf(chat, sizeof chat, "%s",
                               seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_END : MEDIA_AUD_END);
             }
             snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n", line);
             n = tokenizer_encode(tk, chat, promptv, 4096);
-            model_prefill(&m, &kv, promptv + skip, n - 1 - skip, pos);
-            pos += n - 1 - skip;
-            total += n - skip;
+            for (int j = skip; j < n - 1; j++) ids[nid++] = promptv[j];
+            model_prefill_mixed(&m, &kv, mrows, ids, nid, pos);
+            pos += nid;
+            total = nid + 1;                             // + the head forward below
+            free(ids); free(mrows);
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
             int g = 0, fail = 0;

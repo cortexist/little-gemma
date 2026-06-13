@@ -470,3 +470,13 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
     // amortize; the span form simply skips the head for every token.
     for (int i = 0; i < n; i++) model_forward(m, kv, tokens[i], pos0 + i, NULL);
 }
+
+void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
+                         const int *ids, int n, int pos0) {
+    // "Mixed" is just dispatch here: the packing this API exists for is a
+    // chunk-boundary story, and the CPU has no chunks.
+    for (int i = 0; i < n; i++) {
+        if (ids[i] >= 0) model_forward(m, kv, ids[i], pos0 + i, NULL);
+        else forward_core(m, kv, rows + (size_t)(-ids[i] - 1) * m->cfg.n_embd, 0, pos0 + i, NULL);
+    }
+}
