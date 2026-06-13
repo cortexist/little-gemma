@@ -591,20 +591,21 @@ __device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, ui
 
 // One thread's share of staging activation block `blk` into buffer `buf`,
 // issued as cp.async so it overlaps the previous block's mma work.
+template<int COLS>
 __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
                                    const int8_t *xq, const float2 *xds, int k, int blk, int tix) {
-    // 256 threads: all of them carry one 16 B cp.async of sB (16 cols x 16
-    // pieces = exactly 256), and the first 128 ALSO stage one float2 of sBxds
-    // with a plain store (1 KB - not worth an async path; same double-buffer
-    // safety, it lands in the buffer nobody reads until after the barrier).
-    for (int t = tix; t < 16 * 16; t += blockDim.x) {
+    // 256 threads stage COLS activation columns: each column is 256 B = 16
+    // pieces of 16 B (COLS*16 cp.async total), and COLS*8 sub-block (scale,sum)
+    // float2 land with plain stores (it's the buffer nobody reads until the
+    // barrier, so the double-buffer safety holds either way).
+    for (int t = tix; t < COLS * 16; t += blockDim.x) {
         int col = t >> 4, off = (t & 15) * 16;
-        unsigned dst = (unsigned)__cvta_generic_to_shared(sB + buf * 16 * 256 + col * 256 + off);
+        unsigned dst = (unsigned)__cvta_generic_to_shared(sB + buf * COLS * 256 + col * 256 + off);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(xq + (size_t)col * k + blk * 256 + off));
     }
-    for (int t = tix; t < 16 * 8; t += blockDim.x) {
+    for (int t = tix; t < COLS * 8; t += blockDim.x) {
         int xcol = t >> 3, g = t & 7;
-        sBxds[buf * 16 * 8 + xcol * 8 + g] = xds[(size_t)xcol * (k / 32) + blk * 8 + g];
+        sBxds[buf * COLS * 8 + xcol * 8 + g] = xds[(size_t)xcol * (k / 32) + blk * 8 + g];
     }
 }
 
@@ -613,13 +614,14 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 // scheduling and a smaller L1 cost more than the occupancy bought. 80 regs,
 // 3 CTAs, 43% occupancy is this shape's measured optimum; round 4's notes
 // have the numbers.
+template<int COLS>
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                       const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
-    float2 *sBxds = (float2 *)(sh + 2 * 16 * 256);                 // [2 bufs][16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 2 * 16 * 256 + 2 * 16 * 8 * 8); // [warps][2 tiles][2 halves][16][32]
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS cols][256]
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * 256);               // [2 bufs][COLS cols][8]
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * 256 + 2 * COLS * 8 * 8); // [warps][2 tiles][2 halves][16][32]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     // warps per CTA is a LAUNCH choice: small matmuls (k/v projections) need
     // small CTAs so the grid still covers the SMs. Each warp owns TWO 16-row
@@ -630,15 +632,15 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
     int8_t *sAw = sA + warp * 2 * 2 * 16 * 32;
-    float acc[2][2][4];                                            // [tile][h][slot]
+    float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
-    for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
+    for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
     // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
 
-    mma_stage_b(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);         // prologue: block 0 in flight
+    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
     for (int blk = 0; blk < nbk; blk++) {
@@ -646,11 +648,11 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();                                           // staged data visible CTA-wide
         if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
-            mma_stage_b(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
-        const int8_t *sBb = sB + buf * 16 * 256;
-        const float2 *sBxd = sBxds + buf * 16 * 8;
+        const int8_t *sBb = sB + buf * COLS * 256;
+        const float2 *sBxd = sBxds + buf * COLS * 8;
 
         const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
         uint32_t s0 = ((const uint32_t *)hp->scales)[0];
@@ -690,7 +692,7 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                     mnm[t][1] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid + 8);
                 }
                 #pragma unroll
-                for (int h = 0; h < 2; h++) {
+                for (int h = 0; h < COLS / 8; h++) {
                     int colb = h * 8 + gid;
                     uint32_t b0 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4);
                     uint32_t b1 = *(uint32_t *)(sBb + colb * 256 + sj * 32 + tid * 4 + 16);
@@ -721,7 +723,7 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
 
     #pragma unroll
     for (int t = 0; t < 2; t++)
-        for (int h = 0; h < 2; h++) {
+        for (int h = 0; h < COLS / 8; h++) {
             int col0 = h * 8 + tid * 2;
             int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
             if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
@@ -771,7 +773,7 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
 
-    mma_stage_b(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);         // prologue: block 0 in flight
+    mma_stage_b<16>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);     // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
     for (int blk = 0; blk < nbk; blk++) {
@@ -779,7 +781,7 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();                                           // staged data visible CTA-wide
         if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
-            mma_stage_b(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            mma_stage_b<16>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
         const int8_t *sBb = sB + buf * 16 * 256;
@@ -886,19 +888,20 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type < 40) g_cov[t->type] += (double)k * m;
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
-    if ((t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K) && PREFILL_B == 16 && !no_mma) {
+    if ((t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K) && PREFILL_B % 16 == 0 && !no_mma) {
         static int sms = 0;
         if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
         int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
         while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
         int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-        size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2);   // B staging, common
-        if (t->type == GGML_TYPE_Q4_K) {
-            shm += (size_t)wpc * 2 * 2 * 16 * 32;                  // A: [tile][half][16][32]
-            matmul_q4k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
-        } else {
-            shm += (size_t)wpc * 2 * 2048;                         // A: [tile][8 sjl][16][16]
-            matmul_q6k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
+            size_t shm = 2 * PREFILL_B * 256 + 2 * PREFILL_B * 8 * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * 32;
+            matmul_q4k_mma_kernel<PREFILL_B><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+        } else {                                                  // q6_K stays 16-wide (L2-cached copy); loop the chunk
+            size_t shm = 2 * 16 * 256 + 2 * 16 * 8 * sizeof(float2) + (size_t)wpc * 2 * 2048;
+            for (int c0 = 0; c0 < PREFILL_B; c0 += 16)
+                matmul_q6k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(
+                    d_out + (size_t)c0 * m, w, ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
         }
         return;
     }

@@ -469,7 +469,13 @@ static int kv_src_dev(const struct model *m, int L) {
 // and the chunk remainder simply use row 0. Swept 8/16/32 on a 2.4k-token
 // prompt (E2B): 327/369/373 tok/s â€” 16 takes ~99% of 32's rate at half the
 // matmul kernel's per-lane accumulators and half the scratch.
-#define PREFILL_B 16
+// EXPERIMENT (Step 0 of the prefill B-widening; revert to 16 if it loses):
+// a 32-wide chunk halves the weight-bus crossings — prefill is bandwidth-bound,
+// so chunk width is the dominant lever. The q4_K mma kernel widens to B columns
+// in one launch (acc[2][B/8][4]); q6_K stays 16-wide and the dispatch loops it
+// B/16 times. B must be a multiple of 16. (The 8/16/32 sweep noted above
+// predates the mma kernel and the Orin's zero-copy weights; being re-measured.)
+#define PREFILL_B 32
 
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
