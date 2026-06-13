@@ -323,6 +323,87 @@ __global__ static void attn_swa_n_kernel(float *xb, const float *q, const float 
                         (size_t)blockIdx.y * gridDim.x * hd, window, seq, aq);
 }
 
+// K/V-SHARING prefill attention. The per-query kernels above launch one block
+// per (head, query); each re-reads the whole K/V prefix, so a chunk's B queries
+// read it B times — and at a long context K/V exceeds L2, so that redundancy is
+// the dominant prefill-attention cost (the profile put it at 28% E4B / 43% 12B).
+// Here a block owns a tile of QT queries for one head: each K/V row is staged
+// into shared ONCE per block and reused by all QT warps (one warp per query,
+// online-softmax state in registers, exactly like d_attn). Global K/V reads
+// drop ~QT×; the math per query is unchanged (validated in .scratch/
+// attn_kvshare_test.cu vs a double reference). PREFILL ONLY — gated on B>2 so
+// the B=2 MTP verify keeps the per-query path and its decode-matching argmax.
+// The float combine order differs from the per-query kernel (one warp now sums
+// all timesteps of its query, vs warps splitting them), so this is the same
+// relaxed class as the online-softmax step; the quantize epilogue calls the
+// identical d_quant_group, so only attention's own reassociation differs.
+template <int QT, bool RING, typename KT>
+__global__ static void attn_kvshare_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
+                                             int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq,
+                                             int B, int n_head, struct actq aq) {
+    const int hh = blockIdx.x, kvh = hh / gqa;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int qbase = blockIdx.y * QT, b = qbase + warp;  // this warp's query (chunk row)
+    const int pos = *d_pos + b;                           // its absolute position (valid if b<B)
+    const int start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0;
+    const int nv = hd / 32;
+    extern __shared__ float katt[];                       // sK[hd], sV[hd], sO[QT*hd]
+    float *sK = katt, *sV = katt + hd, *sO = katt + 2 * hd;
+    const float *qh = q + (size_t)b * n_head * hd + (size_t)hh * hd;   // deref only when b<B
+    float acc[ATTN_HD_MAX / 32];
+    #pragma unroll
+    for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
+    float m = -INFINITY, s = 0.0f;
+
+    // positions this block streams: from the tile's earliest window-start to its
+    // latest query position. (For full layers window==0 -> from 0.)
+    int lastb = qbase + QT - 1; if (lastb > B - 1) lastb = B - 1;
+    int rhi = *d_pos + lastb;
+    int rlo = 0;
+    if (RING && window > 0) { rlo = *d_pos + qbase - window + 1; if (rlo < 0) rlo = 0; }
+    for (int r = rlo; r <= rhi; r++) {
+        int rr = RING ? r % seq : r;                      // ring row of absolute position r
+        if (sizeof(KT) == 2) {                            // f16: one 32-bit load = 2 elements
+            const __half2 *K2 = (const __half2 *)(const void *)(Kc + (size_t)rr * kv_dim + (size_t)kvh * hd);
+            const __half2 *V2 = (const __half2 *)(const void *)(Vc + (size_t)rr * kv_dim + (size_t)kvh * hd);
+            for (int i = threadIdx.x; i < hd / 2; i += blockDim.x) {
+                float2 kf = __half22float2(K2[i]); sK[2 * i] = kf.x; sK[2 * i + 1] = kf.y;
+                float2 vf = __half22float2(V2[i]); sV[2 * i] = vf.x; sV[2 * i + 1] = vf.y;
+            }
+        } else {
+            const KT *kt = Kc + (size_t)rr * kv_dim + (size_t)kvh * hd;
+            const KT *vt = Vc + (size_t)rr * kv_dim + (size_t)kvh * hd;
+            for (int i = threadIdx.x; i < hd; i += blockDim.x) { sK[i] = (float)kt[i]; sV[i] = (float)vt[i]; }
+        }
+        __syncthreads();
+        if (b < B && r >= start && r <= pos) {            // warp-uniform: causal + window mask
+            float sc = 0.0f;
+            for (int i = lane; i < hd; i += 32) sc += qh[i] * sK[i];
+            for (int o = 16; o > 0; o >>= 1) sc += __shfl_down_sync(0xffffffffu, sc, o);
+            sc = __shfl_sync(0xffffffffu, sc, 0);
+            float mn = fmaxf(m, sc), corr = expf(m - mn), e = expf(sc - mn);
+            s = s * corr + e;
+            #pragma unroll
+            for (int j = 0; j < ATTN_HD_MAX / 32; j++) if (j < nv) acc[j] = acc[j] * corr + e * sV[lane + j * 32];
+            m = mn;
+        }
+        __syncthreads();                                  // before next r overwrites sK/sV
+    }
+
+    if (b < B) {
+        float inv = 1.0f / s;
+        float *outh = xb + (size_t)b * n_head * hd + (size_t)hh * hd;
+        #pragma unroll
+        for (int j = 0; j < ATTN_HD_MAX / 32; j++)
+            if (j < nv) { float v = acc[j] * inv; outh[lane + j * 32] = v; sO[warp * hd + lane + j * 32] = v; }
+        __syncwarp();                                     // sO visible across the warp
+        if (aq.xq) {
+            int gbase = (int)(((size_t)b * n_head * hd + (size_t)hh * hd) / 32);
+            for (int g = lane; g < nv; g += 32) d_quant_group(sO + warp * hd + g * 32, gbase + g, aq);
+        }
+    }
+}
+
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
 // a pos-offset cudaMemcpy so the node is static (constant args) and graph-capturable.
 __global__ static void kv_write_kernel(float *dst, const float *src, const int *d_pos, int n) {
@@ -880,13 +961,41 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         pf_tick(&g_pf_elem);
         int gqa = n_head / n_head_kv;
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
-        size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
-        if (kv->f16[src])
-            attn_h_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
-        else if (kv->seq[src] < kv->max_seq)
-            attn_swa_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(B * q_dim));
-        else
-            attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
+        // K/V sharing pays only when the attended cache is too big to stay
+        // L2-resident — then the per-query kernel's B× re-reads hit DRAM and
+        // sharing them across the chunk's queries wins; when it fits L2 the
+        // re-reads are already cheap and the sharing kernel's per-position
+        // barriers only add overhead. The footprint is the K+V of the attended
+        // span: full layers (window 0) grow unbounded -> always share; SWA
+        // layers cap at `window` rows, so share only when window*kv_dim*KT is
+        // big (true on 12B's wide kv_dim, false on E4B's narrow window). This
+        // split is exactly what the Orin measured: sharing sped 12B's full AND
+        // window layers but slowed E4B's window layers. The B<=2 MTP verify
+        // always takes the per-query path (its argmax must match decode's).
+        static long g_l2 = -1;
+        if (g_l2 < 0) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); g_l2 = p.l2CacheSize; }
+        int ktsz = kv->f16[src] ? 2 : 4;
+        bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
+        if (share) {                                       // attended K/V exceeds L2: share across queries
+            const int QT = 8;                              // queries per block (one warp each)
+            size_t shm = (size_t)(2 + QT) * hd * sizeof(float);   // sK + sV + sO[QT][hd]
+            dim3 g(n_head, (B + QT - 1) / QT);
+            struct actq aq = actq_for(B * q_dim);
+            if (kv->f16[src])                              // full layer, f16 global cache
+                attn_kvshare_n_kernel<QT, false, __half><<<g, QT * 32, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
+            else if (kv->seq[src] < kv->max_seq)           // SWA layer, ring cache (e.g. 12B's wide windows)
+                attn_kvshare_n_kernel<QT, true, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, aq);
+            else                                           // full layer, full-length float cache
+                attn_kvshare_n_kernel<QT, false, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
+        } else {
+            size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
+            if (kv->f16[src])
+                attn_h_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
+            else if (kv->seq[src] < kv->max_seq)
+                attn_swa_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(B * q_dim));
+            else
+                attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
+        }
 
         pf_tick(&g_pf_attn);
         mm(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
