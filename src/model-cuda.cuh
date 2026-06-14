@@ -323,6 +323,110 @@ __global__ static void attn_swa_n_kernel(float *xb, const float *q, const float 
                         (size_t)blockIdx.y * gridDim.x * hd, window, seq, aq);
 }
 
+// ==== SPLIT-K (FlashDecoding) decode attention ==============================
+// Decode (B=1) attention at a long context is PARALLELISM-bound, not bandwidth-
+// bound: d_attn runs one block per head — only n_head blocks on the 8-SM Orin,
+// each serially reducing the whole KV (the profile put it ~14x over the KV-
+// bandwidth floor). Split the KV reduction across n_split blocks per head: each
+// computes a partial (max, sum, V-acc) over its sub-range, then a combine pass
+// merges them. n_head x n_split blocks feed the SMs. n_split is device-adaptive
+// (clamp(T/SPLIT_KEYS,1,MAXSPLIT)) so one graph-captured launch covers all
+// contexts; splits beyond n_split early-exit. Same online-softmax math as
+// d_attn, deterministic (fixed split order), relaxed class (reassociated). The
+// per-query d_attn stays for the B=2 MTP verify and LG_NO_SPLITK fallback.
+// Measured (.scratch/flash_decode_test.cu) ~3.3x decode-attn on the Orin @4k.
+#define MAXSPLIT 8
+#define SPLIT_KEYS 1024
+template <bool RING, typename KT>
+__global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *q, const KT *Kc, const KT *Vc,
+                                         int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq) {
+    int hh = blockIdx.x, split = blockIdx.y, kvh = hh / gqa;
+    int pos = *d_pos, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
+    int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
+    if (split >= n_split) { if (threadIdx.x == 0) pml[(size_t)hh * MAXSPLIT + split] = make_float2(-INFINITY, 0.0f); return; }
+    int per = (T + n_split - 1) / n_split, lo = start + split * per, hi = min(pos, lo + per - 1);
+    const float *qh = q + (size_t)hh * hd;
+    extern __shared__ float comb[];                       // [nwarp][hd]
+    __shared__ float wm[32], ws[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5, nv = hd / 32;
+    float acc[ATTN_HD_MAX / 32];
+    #pragma unroll
+    for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
+    float m = -INFINITY, s = 0.0f;
+    for (int t = lo + warp; t <= hi; t += nwarp) {
+        int r = RING ? (t >= seq ? t % seq : t) : t;
+        const KT *kt = Kc + (size_t)r * kv_dim + (size_t)kvh * hd;
+        float sc = 0.0f;
+        if (sizeof(KT) == 2) { const __half2 *k2 = (const __half2 *)(const void *)kt;
+            for (int i = lane; i < hd / 2; i += 32) { float2 kf = __half22float2(k2[i]); sc += qh[2 * i] * kf.x + qh[2 * i + 1] * kf.y; }
+        } else { for (int i = lane; i < hd; i += 32) sc += qh[i] * (float)kt[i]; }
+        for (int o = 16; o > 0; o >>= 1) sc += __shfl_down_sync(0xffffffffu, sc, o);
+        sc = __shfl_sync(0xffffffffu, sc, 0);
+        float mn = fmaxf(m, sc), corr = expf(m - mn), e = expf(sc - mn);
+        s = s * corr + e;
+        const KT *vt = Vc + (size_t)r * kv_dim + (size_t)kvh * hd;
+        if (sizeof(KT) == 2) { const __half2 *v2 = (const __half2 *)(const void *)vt;
+            #pragma unroll
+            for (int j = 0; j < ATTN_HD_MAX / 64; j++) if (j < nv / 2) { float2 vf = __half22float2(v2[lane + j * 32]);
+                acc[2 * j] = acc[2 * j] * corr + e * vf.x; acc[2 * j + 1] = acc[2 * j + 1] * corr + e * vf.y; }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < ATTN_HD_MAX / 32; j++) if (j < nv) acc[j] = acc[j] * corr + e * (float)vt[lane + j * 32];
+        }
+        m = mn;
+    }
+    if (lane == 0) { wm[warp] = m; ws[warp] = s; }
+    if (sizeof(KT) == 2) {
+        #pragma unroll
+        for (int j = 0; j < ATTN_HD_MAX / 64; j++) if (j < nv / 2) {
+            comb[warp * hd + 2 * (lane + j * 32)] = acc[2 * j]; comb[warp * hd + 2 * (lane + j * 32) + 1] = acc[2 * j + 1]; }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < ATTN_HD_MAX / 32; j++) if (j < nv) comb[warp * hd + lane + j * 32] = acc[j];
+    }
+    __syncthreads();
+    float gm = -INFINITY; for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
+    if (threadIdx.x == 0) { float gs = 0.0f; for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
+        pml[(size_t)hh * MAXSPLIT + split] = make_float2(gm, gs); }
+    float *po = pacc + ((size_t)hh * MAXSPLIT + split) * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float o = 0.0f; for (int w = 0; w < nwarp; w++) o += comb[w * hd + i] * expf(wm[w] - gm);
+        po[i] = o;
+    }
+}
+// merge the n_split partials per head -> attention output (+ actq epilogue).
+__global__ static void combine_attn_kernel(float *xb, const float *pacc, const float2 *pml,
+                                           int hd, const int *d_pos, int window, struct actq aq) {
+    int hh = blockIdx.x;
+    int pos = *d_pos, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
+    int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
+    __shared__ float M, L;
+    if (threadIdx.x == 0) { float mm = -INFINITY, ll = 0.0f;
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp]; if (ml.y > 0) mm = fmaxf(mm, ml.x); }
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp]; if (ml.y > 0) ll += ml.y * expf(ml.x - mm); }
+        M = mm; L = ll; }
+    __syncthreads();
+    float Mv = M, inv = 1.0f / L;
+    float *outh = xb + (size_t)hh * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float o = 0.0f;
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp];
+            if (ml.y > 0) o += pacc[((size_t)hh * MAXSPLIT + sp) * hd + i] * expf(ml.x - Mv); }
+        outh[i] = o * inv;
+    }
+    if (aq.xq) { __syncthreads();
+        for (int g = threadIdx.x; g < hd / 32; g += blockDim.x) d_quant_group(outh + g * 32, (hh * hd) / 32 + g, aq); }
+}
+// split-K scratch (partials), grown once during warmup (no mid-capture malloc).
+static float *g_pacc = NULL; static float2 *g_pml = NULL; static int g_split_cap = 0;
+static void ensure_split(int n_head) {
+    if (n_head <= g_split_cap) return;
+    cudaFree(g_pacc); cudaFree(g_pml);
+    CUDA_CHECK(cudaMalloc(&g_pacc, (size_t)n_head * MAXSPLIT * ATTN_HD_MAX * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_pml, (size_t)n_head * MAXSPLIT * sizeof(float2)));
+    g_split_cap = n_head;
+}
+
 // K/V-SHARING prefill attention. The per-query kernels above launch one block
 // per (head, query); each re-reads the whole K/V prefix, so a chunk's B queries
 // read it B times — and at a long context K/V exceeds L2, so that redundancy is
@@ -483,17 +587,26 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         #pragma unroll
         for(int m=0;m<2;m++){ float cA=sc[m*16+gid], cB=sc[m*16+gid+8];
             for(int n=0;n<FHDW/8;n++){ acc[m][n][0]*=cA; acc[m][n][1]*=cA; acc[m][n][2]*=cB; acc[m][n][3]*=cB; } }
+        // PV: V is query-INDEPENDENT, so read each V fragment ONCE and feed both
+        // query-tiles (m) — halves the (uncoalesced, column-strided) V global reads.
         #pragma unroll
-        for(int m=0;m<2;m++) for(int ks2=0;ks2<FKB;ks2+=16){
-            uint32_t pa0=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2],   pa1=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2];
-            uint32_t pa2=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2+8], pa3=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2+8];
+        for(int ks2=0;ks2<FKB;ks2+=16){
+            uint32_t pa[2][4];
+            #pragma unroll
+            for(int m=0;m<2;m++){
+                pa[m][0]=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2];   pa[m][1]=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2];
+                pa[m][2]=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2+8]; pa[m][3]=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2+8];
+            }
+            int k0=kb0+ks2+tid*2;
+            int r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
+            #pragma unroll
             for(int n=0;n<FHDW/8;n++){ int hdn=warp*FHDW+n*8+gid;
-                int k0=kb0+ks2+tid*2;
-                int r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
                 const KT *vb=Vc+(size_t)kvh*HD+hdn;
                 uint32_t b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
                 uint32_t b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim));
-                fa_mma(acc[m][n][0],acc[m][n][1],acc[m][n][2],acc[m][n][3],pa0,pa1,pa2,pa3,b0,b1);
+                #pragma unroll
+                for(int m=0;m<2;m++)
+                    fa_mma(acc[m][n][0],acc[m][n][1],acc[m][n][2],acc[m][n][3],pa[m][0],pa[m][1],pa[m][2],pa[m][3],b0,b1);
             }
         }
         __syncthreads();
@@ -612,6 +725,7 @@ static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
 
 static void ensure_weights(struct model *m) {
+    ensure_split(m->cfg.n_head);          // split-K scratch: alloc here (pre-capture) — decode has no warmup after a chunked prefill
     if (d_blob) return;
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
@@ -941,7 +1055,23 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
         int window = (local && c->sliding_window > 0) ? c->sliding_window : 0;
         // shmem holds each warp's partial output row: (256/32)*hd floats, ctx-independent
         size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
-        if (kv->f16[src])
+        // Split-K decode attention (parallelism, the high-ctx win); d_attn falls
+        // back via LG_NO_SPLITK and stays for the B=2 MTP verify. Static grids
+        // (graph-capturable); n_split adapts to context on-device.
+        static int no_splitk = -1;
+        if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
+        if (!no_splitk) {
+            ensure_split(n_head);
+            struct actq aq = actq_for(q_dim);
+            dim3 gs(n_head, MAXSPLIT);
+            if (kv->f16[src])
+                split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0);
+            else if (kv->seq[src] < kv->max_seq)
+                split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src]);
+            else
+                split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0);
+            combine_attn_kernel<<<n_head, 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq);
+        } else if (kv->f16[src])
             attn_h_kernel<<<n_head, 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
         else if (kv->seq[src] < kv->max_seq)
             attn_swa_kernel<<<n_head, 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(q_dim));
@@ -1094,7 +1224,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         // f32 xb -> act_quantize fills the int8 activation for attn_output.
         static int no_flash = -1;
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
-        bool flash = !no_flash && B > 2 && (hd == 256 || hd == 512);
+        bool flash = !no_flash && B > 2 && B <= 32 && (hd == 256 || hd == 512);
         bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
         if (flash) {
             bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
