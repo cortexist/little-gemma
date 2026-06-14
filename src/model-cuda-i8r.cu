@@ -510,68 +510,107 @@ static void mmq_build_all(void) {
     }
 }
 
-// q8_0 twins for the f32/bf16 prefill matmuls. On Gemma 4 the one such weight
-// is per_layer_model_proj (the PLE projection): it is bf16/f32 in the gguf, so
-// the chunk path ran it on the scalar warp-per-row fallback at ~10x the per-MAC
-// cost of the quantized kernels, for ~2% of prefill's MACs but ~12% of its time.
-// Quantizing the weight to q8_0 (int8 + per-32 f16 scale — the gentlest quant)
-// routes it through the dp4a integer path instead. PREFILL ONLY: matmul_q
-// (decode) and matmul_q_2 (verify) keep the original weight, so decode stays
-// byte-identical and -mtp == plain holds by construction; only the prefilled KV
-// shifts (relaxed class, exactly like flash). NULL entry => no twin (in-place).
-static unsigned char **g_rw_q8 = NULL;
-static const unsigned char *rweight_q8(const struct gguf_tensor *t) {
-    if (!g_rw_q8) return NULL;
-    return g_rw_q8[(size_t)(t - g_ctx->tensors)];
+// q6_K twins for the f32/bf16 PLE matmuls. On the Orin's E4B model the per-layer
+// proj [256->2560] and inp_gate [2560->256] (and per_layer_model_proj) are stored
+// F32 — the A5000's Q4_K_M conversion quantizes them to q4_K and runs them on the
+// mma path, but this model keeps them full precision, so they fall to the scalar
+// warp-per-row kernel: ~2% of prefill's MACs but ~11% of its time (84 tiny tensor-
+// core-less matmuls on 8 SMs). Quantize them to q6_K at upload and route through
+// the existing tensor-core q6_K mma path. PREFILL ONLY: matmul_q (decode) and
+// matmul_q_2 (verify) keep the F32 weight, so decode stays byte-identical and
+// -mtp == plain holds; only the prefilled KV shifts (relaxed class, like flash).
+static unsigned char **g_rw_q6 = NULL;
+static const unsigned char *rweight_q6(const struct gguf_tensor *t) {
+    if (!g_rw_q6) return NULL;
+    return g_rw_q6[(size_t)(t - g_ctx->tensors)];
 }
-// one row's k floats -> k/32 q8_0 blocks (ggml's scheme: d = amax/127).
-static void quantize_row_q8_0(block_q8_0 *dst, const float *x, int k) {
-    for (int b = 0; b < k / 32; b++) {
-        const float *xb = x + (size_t)b * 32;
-        float amax = 0.0f;
-        for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
-        float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+// f32 row (256-multiple k) -> block_q6_K, the exact inverse of dequant_q6_K: 16
+// sub-blocks of 16, a per-sub-block int8 scale over the superblock f16 d, values
+// 6-bit signed (q-32) split low4=ql / high2=qh. Simple amax/32 per-sub-block scale.
+static void quantize_q6_K(block_q6_K *y, const float *x, int64_t nb) {
+    for (int64_t bb = 0; bb < nb; bb++, x += QK_K) {
+        block_q6_K *blk = &y[bb];
+        float sub[16], dmax = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            float amax = 0.0f;
+            for (int i = 0; i < 16; i++) { float a = fabsf(x[j * 16 + i]); if (a > amax) amax = a; }
+            sub[j] = amax / 32.0f;
+            if (sub[j] > dmax) dmax = sub[j];
+        }
+        float d = dmax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
         __half hd = __float2half(d);
-        memcpy(&dst[b].d, &hd, sizeof(uint16_t));
-        for (int i = 0; i < 32; i++) {
-            int q = (int)lrintf(xb[i] * id);
-            dst[b].qs[i] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+        memcpy(&blk->d, &hd, sizeof(uint16_t));
+        uint8_t q[QK_K];
+        for (int j = 0; j < 16; j++) {
+            int s = (int)lrintf(sub[j] * id);
+            blk->scales[j] = (int8_t)(s < 0 ? 0 : s > 127 ? 127 : s);
+            float eff = d * blk->scales[j], ie = eff > 0.0f ? 1.0f / eff : 0.0f;
+            for (int i = 0; i < 16; i++) {
+                int v = (int)lrintf(x[j * 16 + i] * ie);
+                v = v < -32 ? -32 : v > 31 ? 31 : v;
+                q[j * 16 + i] = (uint8_t)(v + 32);
+            }
+        }
+        memset(blk->ql, 0, 128); memset(blk->qh, 0, 64);
+        for (int g = 0; g < 2; g++) {                     // two 128-value halves
+            uint8_t *ql = blk->ql + g * 64, *qh = blk->qh + g * 32;
+            const uint8_t *qg = q + g * 128;
+            for (int l = 0; l < 32; l++) {
+                uint8_t a = qg[l], b = qg[l + 32], c = qg[l + 64], e = qg[l + 96];
+                ql[l]      = (a & 0xF) | ((c & 0xF) << 4);
+                ql[l + 32] = (b & 0xF) | ((e & 0xF) << 4);
+                qh[l] = ((a >> 4) & 3) | (((b >> 4) & 3) << 2) | (((c >> 4) & 3) << 4) | (((e >> 4) & 3) << 6);
+            }
         }
     }
 }
-// Build the q8_0 twins up front (eager, like the others — no mid-capture malloc).
-// Selects f32/bf16/f16 2-D weights whose k is a q8_0-block multiple (Gemma 4:
-// just per_layer_model_proj). LG_NO_Q8PROJ forces the scalar fallback (A/B).
-static void q8_build_all(void) {
-    if (getenv("LG_NO_Q8PROJ")) { fprintf(stderr, "q8_0 proj repack: disabled by LG_NO_Q8PROJ (scalar fallback)\n"); return; }
+// Build the q6_K twins up front (eager — no mid-capture malloc). LG_NO_Q6PROJ
+// forces the scalar fallback (A/B); LG_Q6PROJ_VERIFY round-trips the quantizer.
+static void q6_build_all(void) {
+    if (getenv("LG_NO_Q6PROJ")) { fprintf(stderr, "q6_K proj repack: disabled by LG_NO_Q6PROJ (scalar fallback)\n"); return; }
     int ntensor = 0;
     for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
         const struct gguf_tensor *t = &g_ctx->tensors[i];
-        if (t->n_dims != 2 || t->dims[0] % 32) continue;
-        if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) ntensor++;
+        if (t->n_dims == 2 && t->dims[0] % QK_K == 0 &&
+            (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) ntensor++;
     }
     if (!ntensor) return;
-    g_rw_q8 = (unsigned char **)calloc(g_ctx->header.num_tensors, sizeof *g_rw_q8);
-    if (!g_rw_q8) return;
-    size_t made = 0; int n_made = 0;
+    g_rw_q6 = (unsigned char **)calloc(g_ctx->header.num_tensors, sizeof *g_rw_q6);
+    if (!g_rw_q6) return;
+    int verify = getenv("LG_Q6PROJ_VERIFY") != NULL;
+    size_t made = 0; int n_made = 0; double worst = 0.0;
     for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
         const struct gguf_tensor *t = &g_ctx->tensors[i];
-        if (t->n_dims != 2 || t->dims[0] % 32) continue;
+        if (t->n_dims != 2 || t->dims[0] % QK_K) continue;
         if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) continue;
-        int64_t k = (int64_t)t->dims[0], m = (int64_t)t->dims[1], n = k * m;
+        int64_t k = (int64_t)t->dims[0], m = (int64_t)t->dims[1], n = k * m, nb = n / QK_K;
         float *f = (float *)malloc((size_t)n * 4);
-        block_q8_0 *host = (block_q8_0 *)malloc((size_t)(n / 32) * sizeof(block_q8_0));
-        if (!f || !host || !dequantize_into(t->type, t->data, f, n)) { free(f); free(host); continue; }
-        for (int64_t r = 0; r < m; r++) quantize_row_q8_0(host + (size_t)r * (k / 32), f + (size_t)r * k, (int)k);
-        free(f);
-        size_t bytes = (size_t)(n / 32) * sizeof(block_q8_0);
+        block_q6_K *q6 = (block_q6_K *)malloc((size_t)nb * sizeof(block_q6_K));
+        block_q6_Kr *q6r = (block_q6_Kr *)malloc((size_t)nb * sizeof(block_q6_Kr));
+        if (!f || !q6 || !q6r || !dequantize_into(t->type, t->data, f, n)) { free(f); free(q6); free(q6r); continue; }
+        quantize_q6_K(q6, f, nb);
+        if (verify) {                                     // round-trip vs the original f32
+            float *chk = (float *)malloc((size_t)n * 4);
+            if (chk && dequantize_into(GGML_TYPE_Q6_K, q6, chk, n)) {
+                double num = 0, den = 0;
+                for (int64_t e = 0; e < n; e++) { double dd = (double)chk[e] - f[e]; num += dd * dd; den += (double)f[e] * f[e]; }
+                double rel = den > 0 ? sqrt(num / den) : 0;
+                if (rel > worst) worst = rel;
+            }
+            free(chk);
+        }
+        repack_q6_K(q6r, q6, nb);
+        free(f); free(q6);
+        size_t bytes = (size_t)nb * sizeof(block_q6_Kr);
         unsigned char *dev;
-        if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); free(host); continue; }
-        cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice);
-        free(host);
-        g_rw_q8[(size_t)i] = dev; made += bytes; n_made++;
+        if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); free(q6r); continue; }
+        cudaMemcpy(dev, q6r, bytes, cudaMemcpyHostToDevice);
+        free(q6r);
+        g_rw_q6[(size_t)i] = dev; made += bytes; n_made++;
     }
-    fprintf(stderr, "q8_0 proj repack: %d tensor(s), %.1f MB -> dp4a prefill path\n", n_made, made / 1e6);
+    fprintf(stderr, "q6_K proj repack: %d tensor(s), %.1f MB -> mma prefill path", n_made, made / 1e6);
+    if (verify) fprintf(stderr, " (worst round-trip rel-rmse %.2e)", worst);
+    fprintf(stderr, "\n");
 }
 
 // Quantized activation scratch (grows as needed; reused across matmuls).
@@ -608,7 +647,7 @@ static void rweight_init_all(void) {
         if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0) rweight(t, &ts);
     }
     mmq_build_all();
-    q8_build_all();
+    q6_build_all();
     CUDA_CHECK(cudaDeviceSynchronize());
     done = 1;
 }
@@ -1143,10 +1182,17 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         }
         return;
     }
-    const unsigned char *q8 = rweight_q8(t);              // f32/bf16 proj -> q8_0 dp4a (prefill only)
-    if (q8) {
-        int blocks = (m + 7) / 8;
-        matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, q8, GGML_TYPE_Q8_0, (int)sizeof(block_q8_0), 32, d_x, g_xq, g_xds, k, m);
+    // f32/bf16 PLE weight with a q6_K twin -> tensor-core mma (prefill only).
+    const unsigned char *q6 = no_mma ? NULL : rweight_q6(t);
+    if (q6 && PREFILL_B % 16 == 0) {
+        static int sms6 = 0;
+        if (!sms6) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms6 = p.multiProcessorCount; }
+        int wpc = 8;
+        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms6) wpc >>= 1;
+        while (wpc > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc * 2 * 2048 > 48 * 1024) wpc >>= 1;
+        size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
+        int blocks6 = (m + 32 * wpc - 1) / (32 * wpc);
+        matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc, shm, g_launch>>>(d_out, q6, (int)sizeof(block_q6_Kr), g_xq, g_xds, k, m);
         return;
     }
     int rows_per_block = 256 / 32;
