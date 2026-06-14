@@ -560,14 +560,15 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     __shared__ float  sm[32], sl[32], sc[32];
     const int head=blockIdx.x, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
     const int gid=lane>>2, tid=lane&3, kvh=head/gqa, pos0=*d_pos;
+    const int qbase=blockIdx.y*32, qn=(B-qbase<32)?(B-qbase):32;   // this CTA's 32-query tile (blockIdx.y); B>32 tiles over y
     float acc[2][FHDW/8][4];
     #pragma unroll
     for(int m=0;m<2;m++)for(int n=0;n<FHDW/8;n++)for(int c=0;c<4;c++)acc[m][n][c]=0.0f;
     for(int Q=tix;Q<32;Q+=256){ sm[Q]=-1e30f; sl[Q]=0.0f; }
     for(int t=tix;t<32*HD;t+=256){ int b=t/HD,i=t%HD;
-        sQ[t]=(b<B)?__float2half(q[(size_t)b*n_head*HD + (size_t)head*HD + i]):(__half)0; }
+        sQ[t]=(b<qn)?__float2half(q[(size_t)(qbase+b)*n_head*HD + (size_t)head*HD + i]):(__half)0; }
     __syncthreads();
-    int pmax=pos0+B-1, smin=(window>0 && pos0-window+1>0)?pos0-window+1:0;
+    int pmax=pos0+qbase+qn-1, smin=(window>0 && pos0+qbase-window+1>0)?pos0+qbase-window+1:0;
     for(int kb0=(smin/FKB)*FKB; kb0<=pmax; kb0+=FKB){
         int qt=warp>>2, kt=warp&3;
         float s0=0,s1=0,s2=0,s3=0;
@@ -584,8 +585,8 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         __syncthreads();
         #pragma unroll
         for(int r=0;r<4;r++){
-            int b=warp*4+r, pos=pos0+b, start=(window>0&&pos-window+1>0)?pos-window+1:0;
-            int kabs=kb0+lane; bool ok=(lane<FKB)&&(b<B)&&(kabs>=start)&&(kabs<=pos);
+            int b=warp*4+r, pos=pos0+qbase+b, start=(window>0&&pos-window+1>0)?pos-window+1:0;
+            int kabs=kb0+lane; bool ok=(lane<FKB)&&(b<qn)&&(kabs>=start)&&(kabs<=pos);
             float s=ok?sS[b*FKB+lane]:-1e30f, rmax=s;
             for(int o=16;o>0;o>>=1) rmax=fmaxf(rmax,__shfl_xor_sync(~0u,rmax,o));
             float mn=fmaxf(sm[b],rmax), corr=__expf(sm[b]-mn), p=ok?__expf(s-mn):0.0f, rsum=p;
@@ -624,8 +625,8 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     #pragma unroll
     for(int m=0;m<2;m++) for(int n=0;n<FHDW/8;n++){
         int qA=m*16+gid, qB=m*16+gid+8, hdc=warp*FHDW+n*8+tid*2;
-        if(qA<B){ xb[((size_t)qA*n_head+head)*HD+hdc]=acc[m][n][0]/sl[qA]; xb[((size_t)qA*n_head+head)*HD+hdc+1]=acc[m][n][1]/sl[qA]; }
-        if(qB<B){ xb[((size_t)qB*n_head+head)*HD+hdc]=acc[m][n][2]/sl[qB]; xb[((size_t)qB*n_head+head)*HD+hdc+1]=acc[m][n][3]/sl[qB]; }
+        if(qA<qn){ xb[((size_t)(qbase+qA)*n_head+head)*HD+hdc]=acc[m][n][0]/sl[qA]; xb[((size_t)(qbase+qA)*n_head+head)*HD+hdc+1]=acc[m][n][1]/sl[qA]; }
+        if(qB<qn){ xb[((size_t)(qbase+qB)*n_head+head)*HD+hdc]=acc[m][n][2]/sl[qB]; xb[((size_t)(qbase+qB)*n_head+head)*HD+hdc+1]=acc[m][n][3]/sl[qB]; }
     }
 }
 // hd is a compile-time template (256 SWA / 512 global); pick KT/RING like the
@@ -634,7 +635,7 @@ template<int HD>
 static void launch_flash(float *dxb, const float *dq, const void *Kc, const void *Vc,
                          int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
                          bool f16, bool ring) {
-    dim3 g(n_head);
+    dim3 g(n_head, (B + 31) / 32);                         // y = 32-query tiles (B>32 prefill chunks)
     if (f16)      flash_attn_n_kernel<HD,false,__half><<<g,256>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
     else if (ring) flash_attn_n_kernel<HD,true, float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
     else          flash_attn_n_kernel<HD,false,float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
@@ -793,7 +794,7 @@ static int kv_src_dev(const struct model *m, int L) {
 // in one launch (acc[2][B/8][4]); q6_K stays 16-wide and the dispatch loops it
 // B/16 times. B must be a multiple of 16. (The 8/16/32 sweep noted above
 // predates the mma kernel and the Orin's zero-copy weights; being re-measured.)
-#define PREFILL_B 32
+#define PREFILL_B 128
 
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
@@ -1236,7 +1237,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
         static int no_splitk = -1;
         if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
-        bool flash = !no_flash && B > 2 && B <= 32 && (hd == 256 || hd == 512);
+        bool flash = !no_flash && B > 2 && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
         bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
         // The B<=2 MTP verify runs the SAME split-K kernel as decode (one extra
         // grid axis for the 2 query rows): out[0]/out[1] then byte-match plain

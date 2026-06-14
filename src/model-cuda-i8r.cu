@@ -1262,60 +1262,59 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type < 40) g_cov[t->type] += (double)k * m;
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
-    if ((t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K) && PREFILL_B % 16 == 0 && !no_mma) {
-        static int sms = 0;
-        if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
-        int wpc = 8;                                     // warps (32-row stripes) per CTA: shrink
-        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // until the grid covers the SMs
-        int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-        if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
-            // S1 of the fat-tile MMQ rewrite: in-place (no twin), one 16-row
-            // tile per warp so the accumulator is acc[COLS/8][4] and COLS can
-            // widen to 128 without spilling the 2-tile reuse. At PREFILL_B=32
-            // this is byte-identical to matmul_q4k_mma_kernel (same sum order);
-            // the perf win arrives in S2 when PREFILL_B widens to 128.
-            static int fat = -1; if (fat < 0) fat = getenv("LG_MMQ_FAT") != NULL;
-            if (fat) {
-                size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 16 * SA_ROW;
-                static int carve = 0;
-                if (!carve) {                                     // one-time: opt into the big carveout if the widest CTA needs it
-                    size_t maxshm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)8 * 2 * 16 * SA_ROW;
-                    if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mmq_kernel<PREFILL_B>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
-                    carve = 1;
-                }
-                int blocksf = (m + 16 * wpc - 1) / (16 * wpc);
-                matmul_q4k_mmq_kernel<PREFILL_B><<<blocksf, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
-                return;
-            }
-            size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
-            const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
-            if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m);
-            else    matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m);
-        } else {                                                  // q6_K's A tile is bigger (4 KB/warp), so cap
-            int wpc6 = wpc;                                        // warps/CTA to keep shm < 48 KB (no carveout)
-            while (wpc6 > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc6 * 2 * 2048 > 48 * 1024) wpc6 >>= 1;
-            size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc6 * 2 * 2048;
-            int blocks6 = (m + 32 * wpc6 - 1) / (32 * wpc6);
-            matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc6, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
-        }
-        return;
-    }
-    // f32/bf16 PLE weight with a q6_K twin -> tensor-core mma (prefill only).
-    const unsigned char *q6 = no_mma ? NULL : rweight_q6(t);
-    if (q6 && PREFILL_B % 16 == 0) {
-        static int sms6 = 0;
-        if (!sms6) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms6 = p.multiProcessorCount; }
+    static int sms = 0;
+    if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
+
+    // q4_K: fat-tile MMQ — one wide launch over all PREFILL_B columns, in-place
+    // (no REPACK twin). One 16-row tile per warp -> acc[PREFILL_B/8][4]; eight
+    // warps tile 128 rows at ~1 CTA/SM, the carveout + launch_bounds(256,1)
+    // regime the Orin measurement showed beats llama.cpp's at half our occupancy
+    // (ILP over the wide accumulator hides the LDS latency). At PREFILL_B=32 this
+    // is byte-identical to the old 2-tile kernel; the win is PREFILL_B=128, where
+    // each staged weight feeds 128 mma-columns instead of 32. Sub-tiling below
+    // keeps PREFILL_B a multiple of 32.
+    if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0 && !no_mma) {
         int wpc = 8;
-        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms6) wpc >>= 1;
-        while (wpc > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc * 2 * 2048 > 48 * 1024) wpc >>= 1;
-        size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
-        int blocks6 = (m + 32 * wpc - 1) / (32 * wpc);
-        matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc, shm, g_launch>>>(d_out, q6, (int)sizeof(block_q6_Kr), g_xq, g_xds, k, m);
+        while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;   // cover the SMs (16 rows/warp)
+        size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 16 * SA_ROW;
+        static int carve = 0;
+        if (!carve) {                                             // one-time: opt into the big carveout for the widest CTA
+            size_t maxshm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)8 * 2 * 16 * SA_ROW;
+            if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mmq_kernel<PREFILL_B>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+            carve = 1;
+        }
+        int blocksf = (m + 16 * wpc - 1) / (16 * wpc);
+        matmul_q4k_mmq_kernel<PREFILL_B><<<blocksf, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         return;
     }
+    // q6_K (native) and the f32/bf16 PLE q6_K twin share the 2-tile mma kernel,
+    // whose acc[2][COLS/8][4] spills past COLS=32 — so loop the chunk in 32-col
+    // sub-tiles (offset out/xq/xds per slice). At PREFILL_B=32 that's a single
+    // iteration = the old single launch; same float order either way.
+    const unsigned char *q6src = NULL; int q6ts = 0;
+    if (!no_mma) {
+        if (t->type == GGML_TYPE_Q6_K) { q6src = w; q6ts = ts; }
+        else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
+    }
+    if (q6src && PREFILL_B % 32 == 0) {
+        int wpc = 8;
+        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;
+        while (wpc > 1 && 2 * 32 * SB_COL + 2 * 32 * SBX * (int)sizeof(float2) + wpc * 2 * 2048 > 48 * 1024) wpc >>= 1;
+        size_t shm = 2 * 32 * SB_COL + 2 * 32 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
+        int blocks6 = (m + 32 * wpc - 1) / (32 * wpc);
+        for (int c0 = 0; c0 < PREFILL_B; c0 += 32)
+            matmul_q6k_mma_kernel<32><<<blocks6, 32 * wpc, shm, g_launch>>>(
+                d_out + (size_t)c0 * m, q6src, q6ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
+        return;
+    }
+    // dp4a fallback (q3/q5/q8 and the residual f32/bf16): float s[NB] spills past
+    // ~32, so loop 32-col sub-tiles here too.
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    for (int c0 = 0; c0 < PREFILL_B; c0 += 32)
+        matmul_i8r_n_kernel<32><<<blocks, 256, 0, g_launch>>>(
+            d_out + (size_t)c0 * m, w, (int)t->type, ts, blck, d_x + (size_t)c0 * k,
+            g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
 }
 static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
