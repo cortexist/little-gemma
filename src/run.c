@@ -136,7 +136,7 @@ static int recv_n(sock_t s, void *buf, int n) {
 }
 
 static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
-                  const char *syspath) {
+                  const char *syspath, const char *mtp_path) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
     struct model m;
@@ -150,6 +150,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     }
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
+
+    // The draft head (-mtp): block-2 speculative decode, same as generate().
+    // A failed open falls back to plain greedy (NULL) — log either way so the
+    // benchmark trace shows whether the spec path is actually live.
+    struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
+    if (mtp_path)
+        fprintf(stderr, "mtp: %s%s\n", t ? "speculative decode armed - " : "disabled, plain decode - ", mtp_path);
 
     // The system prefix (-sys): the skills/guidelines turn is prefilled ONCE
     // here and its cache rows saved; every session then starts at position
@@ -345,21 +352,54 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             free(ids); free(mrows);
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
-            int g = 0, fail = 0;
-            for (;; g++) {                               // stream raw token text, turn end included
+            int g = 0, fail = 0;                          // g = tokens streamed this turn
+            double t_draft = 0, t_verify = 0;
+            int n_draft = 0, n_accept = 0;
+            for (;;) {                                   // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
+                g++;
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
-                if (g + 1 >= SERVE_GEN) {                // runaway turn: end it ourselves
+                if (g >= SERVE_GEN) {                    // runaway turn: end it ourselves
                     send_piece(c, " [SERVE_GEN cap]<turn|>");
                     fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
                     break;
                 }
-                best = model_forward_next(&m, &kv, best, pos++);
+                if (!t) {                                // plain greedy decode
+                    best = model_forward_next(&m, &kv, best, pos++);
+                    continue;
+                }
+                // block-2 speculative: draft the successor of `best`, verify the
+                // pair in one forward. Greedy verify keeps the streamed text
+                // byte-identical to plain decode — only the forward count moves.
+                double s0 = now_sec();
+                int draft = mtp_draft(t, &m, &kv, best, pos);
+                double s1 = now_sec();
+                int out2[2];
+                int adv = model_forward2(&m, &kv, best, draft, pos, out2);
+                t_draft += s1 - s0;
+                t_verify += now_sec() - s1;
+                n_draft++;
+                pos += adv;
+                if (adv != 2) { best = out2[0]; continue; }   // draft rejected
+                n_accept++;                                   // confirmed — stream it too
+                if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, draft)) != 0) { fail = 1; break; }
+                g++;
+                if (draft == eot || draft == eos || pos + 1 >= SERVE_SEQ) break;
+                if (g >= SERVE_GEN) {
+                    send_piece(c, " [SERVE_GEN cap]<turn|>");
+                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                    break;
+                }
+                best = out2[1];
             }
             double dt = now_sec() - t1, dp = t1 - t0;
             fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",
                     total, dp, total / (dp > 0 ? dp : 1e-9),
-                    g + 1, dt, (g + 1) / (dt > 0 ? dt : 1e-9));
+                    g, dt, g / (dt > 0 ? dt : 1e-9));
+            if (t && n_draft)
+                fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
+                        n_accept, n_draft, 100.0 * n_accept / n_draft,
+                        n_draft, t_draft, 1e3 * t_draft / n_draft, t_verify, 1e3 * t_verify / n_draft);
             if (fail || pos + 1 >= SERVE_SEQ) break;     // client gone or context full
         }
         sock_close(c);
@@ -549,7 +589,7 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
-    if (spath)       serve(ctx, spath, mmproj, syspath);
+    if (spath)       serve(ctx, spath, mmproj, syspath, mtp);
     else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);
