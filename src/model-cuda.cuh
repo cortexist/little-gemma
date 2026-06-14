@@ -404,6 +404,119 @@ __global__ static void attn_kvshare_n_kernel(float *xb, const float *q, const KT
     }
 }
 
+// ==== tensor-core FLASH ATTENTION (prefill, B>2) ============================
+// The attn_*_n kernels above are online-softmax with SCALAR dots — on the Orin
+// prefill profile, attention is ~40% of TTFT and those dots leave the tensor
+// cores idle. This is our specialized TC flash attention: per (query,head),
+// out = softmax(Q.K^T).V (scale 1.0, no softcap, causal/windowed), Q/K/V already
+// normed+roped. One CTA per head, 8 warps. KEY Orin choice: K/V are NOT staged
+// to shared (read from the L2-cached cache) so shared stays small (~38KB at
+// hd=512) and the 8-SM Orin seats ~4 CTAs — avoiding the 1-CTA/SM occupancy trap
+// that sank the tiled MMQ. 8-warp QK^T computes one S[16q x 8k] tile FULL-hd (no
+// cross-warp reduce) -> shared; online softmax (warp per 4 query rows); PV is
+// hd-SPLIT (warp w owns hd[w*HDW,+HDW)) with V transposed via scalar reads.
+// m16n8k16.f16.f16.f32: Q,P and the cache rows feed the mma as f16 (f32 SWA KV
+// is converted) — precision is the f16-flash/quality-equivalent class (same as
+// the shipped f16-KV step, ~2e-3 vs an f64 ref, validated in .scratch/flash_test
+// .cu), NOT bit-identical. Writes f32 xb; the dispatch quantizes via act_quantize
+// (the C-tile scatter doesn't give the contiguous 32-groups the epilogue needs).
+// PREFILL ONLY, B>2 — the B<=2 MTP verify keeps the per-query path (bit-exact
+// argmax). LG_NO_FLASH falls back to the attn_*_n kernels.
+template<typename KT> __device__ __forceinline__ uint32_t fa_ld2(const KT *p);
+template<> __device__ __forceinline__ uint32_t fa_ld2<__half>(const __half *p){ return *(const uint32_t *)p; }
+template<> __device__ __forceinline__ uint32_t fa_ld2<float>(const float *p){
+    return (uint32_t)__half_as_ushort(__float2half(p[0])) | ((uint32_t)__half_as_ushort(__float2half(p[1]))<<16); }
+template<typename KT> __device__ __forceinline__ __half fa_rd1(const KT *p);
+template<> __device__ __forceinline__ __half fa_rd1<__half>(const __half *p){ return *p; }
+template<> __device__ __forceinline__ __half fa_rd1<float>(const float *p){ return __float2half(*p); }
+__device__ __forceinline__ uint32_t fa_pk(__half a,__half b){ return (uint32_t)__half_as_ushort(a) | ((uint32_t)__half_as_ushort(b)<<16); }
+__device__ __forceinline__ void fa_mma(float &c0,float &c1,float &c2,float &c3,
+        uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t b0,uint32_t b1){
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1)); }
+
+template<int HD, bool RING, typename KT>
+__global__ static void __launch_bounds__(256)
+flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
+                    int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head){
+    const int FKB = 32, FHDW = HD/8;                       // keys/block; PV hd-slice per warp
+    __shared__ __half sQ[32*HD];
+    __shared__ float  sS[32*FKB];
+    __shared__ __half sP[32*FKB];
+    __shared__ float  sm[32], sl[32], sc[32];
+    const int head=blockIdx.x, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
+    const int gid=lane>>2, tid=lane&3, kvh=head/gqa, pos0=*d_pos;
+    float acc[2][FHDW/8][4];
+    #pragma unroll
+    for(int m=0;m<2;m++)for(int n=0;n<FHDW/8;n++)for(int c=0;c<4;c++)acc[m][n][c]=0.0f;
+    for(int Q=tix;Q<32;Q+=256){ sm[Q]=-1e30f; sl[Q]=0.0f; }
+    for(int t=tix;t<32*HD;t+=256){ int b=t/HD,i=t%HD;
+        sQ[t]=(b<B)?__float2half(q[(size_t)b*n_head*HD + (size_t)head*HD + i]):(__half)0; }
+    __syncthreads();
+    int pmax=pos0+B-1, smin=(window>0 && pos0-window+1>0)?pos0-window+1:0;
+    for(int kb0=(smin/FKB)*FKB; kb0<=pmax; kb0+=FKB){
+        int qt=warp>>2, kt=warp&3;
+        float s0=0,s1=0,s2=0,s3=0;
+        #pragma unroll
+        for(int ks=0;ks<HD;ks+=16){
+            uint32_t a0=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2];
+            uint32_t a2=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2+8];
+            int key=kb0+kt*8+gid, rr=RING?key%seq:key;
+            const KT *kp=Kc+(size_t)rr*kv_dim+(size_t)kvh*HD+ks;
+            fa_mma(s0,s1,s2,s3,a0,a1,a2,a3,fa_ld2<KT>(kp+tid*2),fa_ld2<KT>(kp+tid*2+8));
+        }
+        sS[(qt*16+gid)*FKB+kt*8+tid*2]=s0;     sS[(qt*16+gid)*FKB+kt*8+tid*2+1]=s1;
+        sS[(qt*16+gid+8)*FKB+kt*8+tid*2]=s2;   sS[(qt*16+gid+8)*FKB+kt*8+tid*2+1]=s3;
+        __syncthreads();
+        #pragma unroll
+        for(int r=0;r<4;r++){
+            int b=warp*4+r, pos=pos0+b, start=(window>0&&pos-window+1>0)?pos-window+1:0;
+            int kabs=kb0+lane; bool ok=(lane<FKB)&&(b<B)&&(kabs>=start)&&(kabs<=pos);
+            float s=ok?sS[b*FKB+lane]:-1e30f, rmax=s;
+            for(int o=16;o>0;o>>=1) rmax=fmaxf(rmax,__shfl_xor_sync(~0u,rmax,o));
+            float mn=fmaxf(sm[b],rmax), corr=__expf(sm[b]-mn), p=ok?__expf(s-mn):0.0f, rsum=p;
+            for(int o=16;o>0;o>>=1) rsum+=__shfl_xor_sync(~0u,rsum,o);
+            if(lane<FKB) sP[b*FKB+lane]=__float2half(p);
+            if(lane==0){ sl[b]=sl[b]*corr+rsum; sm[b]=mn; sc[b]=corr; }
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int m=0;m<2;m++){ float cA=sc[m*16+gid], cB=sc[m*16+gid+8];
+            for(int n=0;n<FHDW/8;n++){ acc[m][n][0]*=cA; acc[m][n][1]*=cA; acc[m][n][2]*=cB; acc[m][n][3]*=cB; } }
+        #pragma unroll
+        for(int m=0;m<2;m++) for(int ks2=0;ks2<FKB;ks2+=16){
+            uint32_t pa0=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2],   pa1=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2];
+            uint32_t pa2=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2+8], pa3=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2+8];
+            for(int n=0;n<FHDW/8;n++){ int hdn=warp*FHDW+n*8+gid;
+                int k0=kb0+ks2+tid*2;
+                int r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
+                const KT *vb=Vc+(size_t)kvh*HD+hdn;
+                uint32_t b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
+                uint32_t b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim));
+                fa_mma(acc[m][n][0],acc[m][n][1],acc[m][n][2],acc[m][n][3],pa0,pa1,pa2,pa3,b0,b1);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int m=0;m<2;m++) for(int n=0;n<FHDW/8;n++){
+        int qA=m*16+gid, qB=m*16+gid+8, hdc=warp*FHDW+n*8+tid*2;
+        if(qA<B){ xb[((size_t)qA*n_head+head)*HD+hdc]=acc[m][n][0]/sl[qA]; xb[((size_t)qA*n_head+head)*HD+hdc+1]=acc[m][n][1]/sl[qA]; }
+        if(qB<B){ xb[((size_t)qB*n_head+head)*HD+hdc]=acc[m][n][2]/sl[qB]; xb[((size_t)qB*n_head+head)*HD+hdc+1]=acc[m][n][3]/sl[qB]; }
+    }
+}
+// hd is a compile-time template (256 SWA / 512 global); pick KT/RING like the
+// per-query dispatch: f16 -> global (no ring), f32+seq<max -> SWA ring, else full f32.
+template<int HD>
+static void launch_flash(float *dxb, const float *dq, const void *Kc, const void *Vc,
+                         int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
+                         bool f16, bool ring) {
+    dim3 g(n_head);
+    if (f16)      flash_attn_n_kernel<HD,false,__half><<<g,256>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
+    else if (ring) flash_attn_n_kernel<HD,true, float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
+    else          flash_attn_n_kernel<HD,false,float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
+}
+
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
 // a pos-offset cudaMemcpy so the node is static (constant args) and graph-capturable.
 __global__ static void kv_write_kernel(float *dst, const float *src, const int *d_pos, int n) {
@@ -975,8 +1088,20 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         static long g_l2 = -1;
         if (g_l2 < 0) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); g_l2 = p.l2CacheSize; }
         int ktsz = kv->f16[src] ? 2 : 4;
+        // Tensor-core flash for the prefill chunk (B>2): ~40% of TTFT was scalar-
+        // dot attention. hd 256/512 only (Gemma-4 head dims); B<=2 MTP verify and
+        // other hd keep the per-query path. LG_NO_FLASH falls back. Flash writes
+        // f32 xb -> act_quantize fills the int8 activation for attn_output.
+        static int no_flash = -1;
+        if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
+        bool flash = !no_flash && B > 2 && (hd == 256 || hd == 512);
         bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
-        if (share) {                                       // attended K/V exceeds L2: share across queries
+        if (flash) {
+            bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
+            if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring);
+            else           launch_flash<256>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring);
+            act_quantize(dxb, B * q_dim);
+        } else if (share) {                                // attended K/V exceeds L2: share across queries
             const int QT = 8;                              // queries per block (one warp each)
             size_t shm = (size_t)(2 + QT) * hd * sizeof(float);   // sK + sV + sO[QT][hd]
             dim3 g(n_head, (B + QT - 1) / QT);
