@@ -913,27 +913,28 @@ __device__ static uint32_t q6w(uint32_t l, uint32_t h, int hin, int sh) {
     return __vsub4(lo | (((h >> sh) & 0x03030303u) << 4), 0x20202020u);
 }
 
+template<int COLS>
 __global__ static void __launch_bounds__(256)
 matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                       const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][16 cols][256]
-    float2 *sBxds = (float2 *)(sh + 2 * 16 * SB_COL);              // [2 bufs][16 cols][8]
-    int8_t *sA    = (int8_t *)(sh + 2 * 16 * SB_COL + 2 * 16 * SBX * 8); // [warps][2 tiles][8 sjl][16][16]
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS cols][256]
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS cols][8]
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][8 sjl][16][16]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
     int8_t *sAw = sA + warp * 2 * 2048;
-    float acc[2][2][4];                                            // [tile][h][slot]
+    float acc[2][COLS / 8][4];                                     // [tile][h][slot]
     #pragma unroll
-    for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
+    for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
     // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
 
-    mma_stage_b<16>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);     // prologue: block 0 in flight
+    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
     for (int blk = 0; blk < nbk; blk++) {
@@ -941,11 +942,11 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();                                           // staged data visible CTA-wide
         if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
-            mma_stage_b<16>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
-        const int8_t *sBb = sB + buf * 16 * SB_COL;
-        const float2 *sBxd = sBxds + buf * 16 * SBX;
+        const int8_t *sBb = sB + buf * COLS * SB_COL;
+        const float2 *sBxd = sBxds + buf * COLS * SBX;
 
         const block_q6_Kr *hp = (const block_q6_Kr *)(myrow + (size_t)blk * ts);
         uint32_t sw[4];                                            // my row's 16 int8 scales
@@ -992,7 +993,7 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                 }
                 int ga = ni * 4 + (sjl >> 1);                      // activation 32-group
                 #pragma unroll
-                for (int h = 0; h < 2; h++) {
+                for (int h = 0; h < COLS / 8; h++) {
                     int colb = h * 8 + gid;
                     uint32_t b0 = *(uint32_t *)(sBb + colb * SB_COL + ni * 128 + sjl * 16 + tid * 4);
                     float2 xd0 = sBxd[(h * 8 + tid * 2) * SBX + ga];
@@ -1020,7 +1021,7 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
 
     #pragma unroll
     for (int t = 0; t < 2; t++)
-        for (int h = 0; h < 2; h++) {
+        for (int h = 0; h < COLS / 8; h++) {
             int col0 = h * 8 + tid * 2;
             int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
             if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
@@ -1059,11 +1060,21 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
             if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m);
             else    matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m);
-        } else {                                                  // q6_K stays 16-wide (L2-cached copy); loop the chunk
-            size_t shm = 2 * 16 * SB_COL + 2 * 16 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
-            for (int c0 = 0; c0 < PREFILL_B; c0 += 16)
-                matmul_q6k_mma_kernel<<<blocks, 32 * wpc, shm, g_launch>>>(
-                    d_out + (size_t)c0 * m, w, ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
+        } else {                                                  // q6_K: widen to the whole chunk like q4_K.
+            static int q6b16 = -1;                                 // LG_Q6_B16 = the old 16-wide loop (A/B)
+            if (q6b16 < 0) q6b16 = getenv("LG_Q6_B16") != NULL;
+            if (q6b16) {
+                size_t shm = 2 * 16 * SB_COL + 2 * 16 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
+                for (int c0 = 0; c0 < PREFILL_B; c0 += 16)
+                    matmul_q6k_mma_kernel<16><<<blocks, 32 * wpc, shm, g_launch>>>(
+                        d_out + (size_t)c0 * m, w, ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
+            } else {                                               // q6_K's A tile is bigger (4 KB/warp), so cap
+                int wpc6 = wpc;                                    // warps/CTA to keep shm < 48 KB (no carveout)
+                while (wpc6 > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc6 * 2 * 2048 > 48 * 1024) wpc6 >>= 1;
+                size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc6 * 2 * 2048;
+                int blocks6 = (m + 32 * wpc6 - 1) / (32 * wpc6);
+                matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc6, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+            }
         }
         return;
     }
