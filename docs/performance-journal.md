@@ -893,3 +893,198 @@ all; on a bandwidth-starved edge device (an Orin NX has ~100 GB/s shared with
 the CPU) the same compute-for-bandwidth trades convert at much closer to their
 theoretical rates — and the dead ends ruled out above deserve a re-trial there
 before being believed.
+
+## `ldmatrix`: the load the profile said to make, that didn't
+
+The bank-conflict chapter ended pointing at `ldmatrix` — the warp-cooperative
+instruction that loads a whole `mma` fragment in one shared transaction where
+the kernel now issues four `LDS.32`. With conflicts gone, the residual 42%
+short-scoreboard stall *looked* like A-fragment load latency, and `ldmatrix`
+is its textbook cure. It was built in a standalone harness first
+(`.scratch/ldmatrix_test.cu`) — and two things there are worth keeping, because
+both are silent footguns: the `.shared` qualifier on
+`ldmatrix.sync.aligned.m8n8.x4.shared.b16` is mandatory (without it the cvta'd
+shared offset faults), and so is an `asm volatile` + `"memory"` clobber (without
+it the compiler hoists the load *above* the staging stores it depends on, and
+the output goes nondeterministic). Integrated into the q4_K kernel — A fragment
+via one `ldmatrix.x4` replacing four `LDS.32` — it was **perfectly neutral**:
+E4B 130.3 → 130.7, 12B 53.6 → 53.5, short-scoreboard 42 → 41%, duration
+unchanged. The hypothesis was wrong. ncu on the result: Memory 69% / SM 47% /
+short-scoreboard 41% / occupancy 30% (register-bound at 2 CTAs) — nothing
+saturated, a *balanced* latency-bound regime. The binding constraint is the
+inner-loop B/scale-read latency plus the low occupancy, not the A loads;
+collapsing four clean LDS into one fast LDS changes neither. Reverted (neutral,
++4 registers, and complexity for nothing) — the fourth falsified micro-theory of
+the campaign, and the cleanest statement of where the in-place chunk kernel
+ends: the incremental shared/compute levers are exhausted, and the only lever
+left that moves this kernel is a different *species* (full MMQ-style weight
+repack for the 49% uncoalesced global reads, bigger row-tiles for occupancy) — a
+project, not an afternoon. So prefill's next gain came from the *other* half of
+the profile.
+
+## Flash attention takes the prefill
+
+The bank-conflict pads bought tensor cores their utilisation, but they only
+touched the *matmul*. An nsys re-profile of a long-prompt prefill put the rest
+in stark relief: **matmul ~50%, attention ~40%** (`attn_swa_n` 22%,
+`attn_kvshare_n` 18% — the latter the global layers' unbounded O(N²)), other
+~10%. The attention kernels were the chapter above's online-softmax/per-query
+and K/V-sharing designs — correct and L2-aware, but *scalar dot products*, not
+the tiled tensor-core flash kernel llama.cpp runs. For a TTFT story that is the
+single biggest place this codebase trailed, and it lines up exactly with the
+production case: a 2–5k-word system prompt prefilled once, then audio/video
+turns that prefill long. Attention was the prize.
+
+The design had to dodge the trap the whole prefill push kept re-learning: on
+8 SMs, anything that drops to one CTA per SM loses (it cost the tiled-MMQ
+rewrite, and `PREFILL_B=48`, and would cost a shared-staged flash kernel). So
+this flash is **Orin-shaped**: K and V are *not* staged to shared (they are
+read straight from the L2-cached cache), which keeps shared down to ~38 KB and
+lets **4 CTAs** sit on each SM; eight warps compute the full-`hd` `Q·Kᵀ` for a
+query tile with no cross-warp reduction, write scores to shared, run an online
+softmax, then split the `P·V` by head-dimension (each warp owns `hd[w·64, +64)`)
+with V transposed through scalar `__half` reads. The Gemma-4 specifics that a
+generic flash kernel gets wrong: the attention scale is **exactly 1.0** (Q
+arrives pre-scaled), there is **no attention softcap** (the softcap=30 is
+vocab-only), Q/K/V are already q/k-normed and RoPE'd, and the global layers run
+f16 KV while the SWA layers run an f32 ring. `m16n8k16.f16.f16.f32` — f16
+inputs, f32 accumulate — so it sits in the same *f16-flash* precision class as
+the shipped f16-KV step (~2e-3 vs a double reference), validated in
+`.scratch/flash_test.cu` against a scalar baseline before any production code.
+It is gated for prefill only (`B > 2`, `hd ∈ {256, 512}`); the B≤2 verify and
+decode keep their own paths. `LG_NO_FLASH` reverts at runtime.
+
+**Result (Orin E4B, the deciding end-to-end test, not the microbenchmark):
+prefill 114.7 → 164.3 tok/s at 3970 tokens — +44%, and the win grows with
+length** (it was +29% at 2k), because attention's share grows with context. The
+attention slice fell ~13 s → ~2.4 s (~5.4×). Re-measured fresh this session in
+one sitting (Tegra clocks are not lockable — `nvidia-smi` reports them `N/A` —
+so absolute numbers swing ~10% with heat across a run and the same-thermal-state
+A/B *ratio* is the reliable currency): **flash is +33% at 1961 tokens (167 vs
+125) and +39% at 2606 (176 vs 127)** — the length trend, confirmed. Not
+bit-identical to the old scalar attention (the relaxed f16-flash class, late
+greedy-tie flips only); deterministic run-to-run; decode and MTP untouched
+(prefill-only gate). The two riders the same week:
+
+- **q6_K joins the wide chunk.** With flash landed, the profile was matmul ~73%
+  again, and the q6_K mma kernel was still looped two-at-a-time over 16-column
+  tiles. Templating it to a single 32-column launch (mirroring q4_K's B=32
+  widen) is **byte-identical** — integer dots, float order preserved exactly —
+  and worth **+11%** (164.3 → 182.8 at 3970; fresh A/B this session +10% at
+  1961, via the `LG_Q6_B16` knob that restores the old loop). The bigger q6_K A
+  tile caps warps-per-CTA so it still fits 48 KB without the L1 carveout.
+- **`PREFILL_B=48` — dead end, the occupancy trap a fourth time.** Widening the
+  chunk to 48 columns means `acc[2][6][4]` = 48 C-registers, which ptxas turns
+  into 130–144 registers and **one** CTA per SM (vs two at 32). Measured −29%
+  on the Orin (129.7 vs 183.2) — fewer weight passes exactly cancelled by halved
+  occupancy, and flash falls back above B=32 on top of that. B=32 is the
+  occupancy sweet spot; the accumulator register footprint is the gate. Reverted.
+- **Flash polish — neutral.** Hoisting the query-independent V read out of the
+  m-loop halves flash's V global reads, byte-identical — and changed Orin
+  prefill by nothing (the V reads were L2-cached, never the bottleneck). Every
+  other flash refinement that suggested itself — stage K/V to shared for
+  coalescing, `cp.async`, `ldmatrix` — runs straight back into the 1-CTA trap.
+  Flash is at its practical Orin optimum (attention back down to ~11% of
+  prefill). Kept the perf-neutral hoist.
+
+**Prefill, end to end (Orin E4B, this session's start to finish):
+114.7 → 164.3 (flash, +44%) → 182.8 (q6_K-32, +11%) = +59%.** The 12B gained
+even more from flash and the q6_K widen together — a fresh A/B put it at
+**52.9 → 98.0 tok/s (+85%)** at ~2k tokens, because its 48 dense layers make
+attention a larger share of prefill, so the flash kernel has more to remove.
+Against the dp4a baseline where the tensor-core push began (~55 / ~21), prefill
+is now ~3.3× / ~4.7×; the ratio to llama.cpp moved 0.25 → ~0.39 (E4B), the gap a
+factor of ~2.6 now. The honest shape is unchanged — prefill is still their axis
+— but it is a much smaller axis than the ~10× of a week ago.
+
+## The decode axis: split-K (FlashDecoding) attention
+
+Prefill processes B queries at once; decode is B=1, and at a long context that
+is the problem. The decode attention kernel runs **one block per head** — eight
+blocks on the Orin's eight SMs — and each serially reduces the entire KV prefix.
+A standalone profile put it ~14× over the KV-bandwidth floor: the SMs are *idle*
+waiting on eight serial reductions, not bandwidth-bound. This is parallelism
+starvation, and FlashDecoding's split-K is its answer: split each head's KV
+range across `n_split` blocks, each computing a partial (max, sum, V-accumulator)
+over its slice, then a combine pass merges them — `n_head × n_split` blocks now
+feed the SMs. The same online-softmax math as the per-query kernel, just
+reassociated across splits (deterministic, relaxed class). `n_split` is
+device-adaptive and read on-device (`clamp(T / 1024, 1, 8)`) so a single static
+grid covers every context and stays graph-capturable; splits past `n_split`
+early-exit. Validated in `.scratch/flash_decode_test.cu` (err ~8e-7) — Orin
+global hd512 @4096 went 1→4 splits = 5.21 → 1.60 ms (3.25×), plateauing past 4
+(eight heads × four splits = 32 blocks, four per SM).
+
+Integrated as a new kernel pair (`split_attn_kernel` + `combine_attn_kernel`)
+with the frozen `d_attn` kept as the `LG_NO_SPLITK` fallback. **Orin E4B decode
+@~4000 ctx: 11.59 → 13.39 tok/s (+15.5%)**, the win growing with context;
+re-measured fresh this session at ~2600 ctx, +9% (13.72 vs 12.58) — smaller
+because there is less KV to parallelize, exactly as expected. Negligible at low
+context. One graph-capture bug worth recording, because it is the batched-prefill
+warmup rule biting from a new angle: after a *chunked* prefill, `g_graph_warmups`
+is already 2, so the decode's very first token is captured immediately with no
+warmup — and the split-K scratch's lazy `cudaMalloc` then fired *mid-capture*
+("operation not permitted when stream is capturing"). The fix is to allocate the
+scratch eagerly in `ensure_weights`, before any capture can start.
+
+## MTP reaches the serving path
+
+A review caught a blind spot — a second perspective seeing what the author had
+stopped noticing. MTP had a per-turn stats line and byte-identical output, all
+proven in the `-p` one-shot path… and the socket server, the path production
+actually ships, was quietly running **plain** `model_forward_next`. The speculative loop
+lived only in `generate()`; `main()` passed `-mtp` to it but not to `serve()`.
+So every benchmark and every robot turn over `-s` had been leaving MTP on the
+floor. The fix is small — `serve()` takes the draft-head path, `mtp_open`s it,
+runs the same draft/`model_forward2` loop, streams accepted drafts, and prints
+the same `mtp: accepted N/M …` line per turn — but it is the difference between
+a feature that exists and a feature that runs.
+
+And it runs where the product lives. The mechanism, restated for serving: decode
+is weight-bandwidth-bound, so a **B=2 verify forward costs about the same as a
+B=1 decode forward** (the weights cross once either way) — at high acceptance
+that is two tokens for the price of one pass. Fresh on the Orin: a counting turn
+(99% acceptance) decodes at **23.0 tok/s vs 16.7 plain — +38%**; an open-prose
+turn (53%) at **18.1 vs 16.6 — +9%**; the token accounting checks exactly (a
+9-token turn is one prefill pick plus four accepted pairs; a 364-token turn is
+one pick plus 229 rounds plus 134 accepts). The product's outputs — TTS lines,
+JSON UI tags — are *short and structured*, which is precisely the
+high-acceptance regime, so the serve path roughly doubles decode on the workload
+that ships. (On the A5000 the same code loses — 53 vs 120 tok/s — because there
+decode is not bandwidth-starved and the verify is pure overhead; the device
+decides, as ever.)
+
+## Split-K verify: byte-identity by construction
+
+One seam remained. Decode now ran split-K attention; the MTP verify still ran
+the per-query kernel. The two reduce the softmax in different orders, so they can
+disagree on a numeric near-tie — which meant `-mtp == plain` held *empirically*
+(every test passed) but not *by construction* (a future near-tie could flip).
+For a feature whose entire correctness claim is byte-identity, "we tested it"
+is weaker than "it cannot differ."
+
+The fix turns the seam into a shared kernel. `split_attn`/`combine_attn` gained a
+third grid axis — `blockIdx.z` selects the query in a B-row chunk. Decode
+launches `z=1`, so `qi=0`, the position is `*d_pos`, and the `(query, head)`
+index collapses to exactly today's — **decode is bit-identical to before, by
+inspection**. The B=2 verify launches `z=2`: query 0 sits at `*d_pos+0` and
+runs the identical kernel, position, split count, and reduction order as a plain
+decode at `pos`, so `out[0]` byte-matches plain decode; query 1 sits at
+`*d_pos+1` and matches a plain decode at `pos+1`, so `out[1]` matches too.
+Decode and verify are now the *same kernel* — the invariant rests on code
+identity, not on a tie failing to flip. (The `LG_NO_SPLITK` fallback keeps both
+on the per-query path, so they still match there.) Gated on the A5000:
+`-mtp == plain` byte-identical on counting (98% acc) and reject-heavy prose
+(43%), deterministic, fallback equal — and the scratch was pre-sized to
+`2·n_head` slots in `ensure_weights` so nothing mallocs mid-capture.
+
+The honest perf footnote: the hoped-for high-context verify *speedup* is
+marginal, and measuring it said so. At ~2700 context the verify's `layers` time
+is 85.7 ms with split-K vs 86.4 ms per-query — under 1%. The reason is the same
+weight-bound truth that makes MTP pay at all: the B=2 verify is dominated by its
+matmuls (it grew only 77 → 86 ms from the low-context floor as attention came
+in), so parallelizing the attention slice shaves under a millisecond. Split-K
+verify is neutral-to-slightly-positive on speed and never worse — its real
+deliverable is the correctness guarantee at no cost. A good outcome to have
+*measured* rather than claimed; the speedup pitch was speculative, the
+byte-identity was the point.

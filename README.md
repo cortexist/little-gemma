@@ -288,9 +288,14 @@ creative prose, where the future is genuinely harder to guess.
 Whether MTP *pays* is decided by the hardware, not the math. Each round
 needs two device-to-host syncs (the draft token feeds the verify's inputs);
 on Windows/WDDM those cost milliseconds and MTP loses outright, while on a
-Jetson Orin NX it wins ~6% on prose and ~15% on list-style answers — numbers
-and the full story, including the uncached-zero-copy bug the verify exposed
-in the chunk matmul, are in the
+Jetson Orin NX it wins **+9% on prose and +38% on counting/structured output**
+— because a B=2 verify is nearly the cost of one decode pass on a
+bandwidth-bound device, so high acceptance buys close to two tokens per pass.
+The speculative loop runs in the **socket server**, not only the `-p` one-shot,
+so the short structured replies the edge target produces (TTS lines, JSON tags)
+get that near-doubling in production. The full story — including the
+uncached-zero-copy bug the verify exposed in the chunk matmul, and the split-K
+verify that makes `-mtp == plain` byte-identical *by construction* — is in the
 [performance journal](docs/performance-journal.md).
 
 ## On SIMD (AVX2) — intentionally not implemented
@@ -338,8 +343,13 @@ old footprint), GPU media encoders, and speculative decoding, which flushed
 out an uncached-zero-copy bug whose fix alone bought +49% prefill on desktop
 and ~2× on Jetson. Then a tensor-core prefill push — an int8 `mma` chunk
 matmul (q4_K then q6_K), wider 32-token chunks, and an L2-aware K/V-sharing
-attention — roughly doubled Jetson prefill again. The full log, dead ends and
-bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
+attention — roughly doubled Jetson prefill again, and a **tensor-core flash
+attention** for the prompt phase added +44% on top (E4B prefill ~183 tok/s,
+12B ~98). The decode side gained a **split-K (FlashDecoding)** attention for
+long context, and speculative decoding finally reached the **socket server**
+(it had been quietly running plain) — where, on the short structured outputs
+the edge target produces, it nearly doubles decode. The full log, dead ends
+and bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
 
 Where things stand — both sides re-measured the same day on the same machine,
 same prompt (little-gemma = `run-cuda-i8r`, 256 generated tokens, warm;
@@ -375,20 +385,15 @@ actually targets, every row is ahead.
 Those tables are **decode** — the project's strong axis. **Prefill** (prompt
 processing) is the honest weak axis: it is weight-bandwidth-bound, and
 llama.cpp prefills at batch ~512 through arch-tuned tensor-core GEMMs that no
-few-thousand-line kernel matches. The push above closed most of the gap on the
-Jetson — E4B ~55 → **130.3** prompt tok/s, 12B ~21 → **53.6** (a 1,982-token
-prompt), ~2.33× and ~2.55× over the int8 baseline — moving the ratio to
-llama.cpp from ~10× behind to ~3.8×. It is still their axis; the wins are
-real and gated to the same output up to a late greedy tie. Where prefill is
-*felt* — image turns and document ingestion — this is what made the 1 FPS
-camera budget reachable.
-
-For honesty's sake: those are *decode* tables, and decode is this project's
-strong axis. **Prefill is llama.cpp's** — its batch-512 tensor-core GEMMs
-prefill ~10× faster than the 16-token chunk path here, on both machines (the
-journal has the full measurement). It rarely shows in interactive serving —
-turns are short, `-sys` removed the skills re-prefill, the GPU encoder
-removed the image one — but on long documents llama.cpp wins the wait.
+few-thousand-line kernel matches. The push above — the int8 `mma` chunk matmul,
+wider chunks, K/V sharing, the bank-conflict pads, and then a tensor-core flash
+attention for the prompt phase — closed most of the gap on the Jetson: E4B
+~55 → **~183** prompt tok/s, 12B ~21 → **~98** (a ~2,000-token prompt), moving
+the ratio to llama.cpp from ~10× behind to **~2.6×**. It is still their axis,
+and the wins are gated to the same output up to a late greedy tie. It rarely
+shows in interactive serving — turns are short, `-sys` removes the skills
+re-prefill, the GPU encoder removed the image one — but on long documents
+llama.cpp still wins the wait.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -410,29 +415,29 @@ is for.
 
 | directory | files | code  |
 |-----------|-------|------:|
-| src       | 15    | 4,658 |
-| include   | 6     |   242 |
+| src       | 15    | 5,634 |
+| include   | 6     |   248 |
 
-4,900 lines of code in the repository (the original 3,000 exploring ceiling was
+~5,900 lines of code in the repository (the original 3,000 exploring ceiling was
 retired when the sandbox phase began; `tools/` and the vendored
 `vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
 backends are mutually exclusive, so no single program is anywhere near that.
 Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
-multimodal embedders, the MTP draft head, CLI + socket server — 2,235 lines)
+multimodal embedders, the MTP draft head, CLI + socket server — 2,589 lines)
 plus exactly one backend:
 
-| binary        | backend on top of the shared 2,235                       | code lines |
+| binary        | backend on top of the shared 2,589                       | code lines |
 |---------------|----------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                            |      2,559 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      3,658 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      3,981 |
+| `run`         | `model-cpu.c`                                            |      2,949 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,464 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,190 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every
 model it runs — multi-turn socket serving, batched prefill, a ring-buffered
-f16 KV cache, image and audio understanding, a GPU vision encoder, and
-byte-identical speculative decoding included — is **just under 4,000 lines of
-C end to end**, tokenizer and all.
+f16 KV cache, tensor-core flash-attention prefill, split-K decode, image and
+audio understanding, a GPU vision encoder, and byte-identical speculative
+decoding included — is **about 5,200 lines of C end to end**, tokenizer and all.
 
 ## Validation
 
