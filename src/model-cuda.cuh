@@ -796,6 +796,16 @@ static int kv_src_dev(const struct model *m, int L) {
 // predates the mma kernel and the Orin's zero-copy weights; being re-measured.)
 #define PREFILL_B 128
 
+// Adaptive prefill chunk width. Full chunks use PREFILL_B (128) so long prefills
+// (system prompt, media) keep the wide-tile win; the short TAIL of a turn rounds
+// up to a multiple of 32 instead of padding to 128 — a 16-token serve turn pays
+// a 32-wide chunk, not a 128-wide one (the fat q4_K kernel is templated on COLS,
+// and flash / the q6+dp4a sub-tile loops already take the width at runtime).
+// matmul_q_n reads this to pick the COLS instantiation; set per chunk by
+// forward_chunk*. Buffers stay allocated for the 128 max (see the pre-size in
+// model_prefill — g_xq must never realloc after the decode graph is captured).
+static int g_pf_cols = PREFILL_B;
+
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
 static float *g_hidden;                 // post-output-norm hidden of the last
@@ -1323,9 +1333,10 @@ static int model_has_ple(struct model *m) {
 
 // Token form: look up and scale the chunk's embedding rows, build the PLE
 // inputs, then run the layers.
-static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0) {
+static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0, int cols) {
     const struct config *c = &m->cfg;
-    const int B = PREFILL_B, n_embd = c->n_embd;
+    g_pf_cols = cols;
+    const int B = cols, n_embd = c->n_embd;
 
     float *rows = (float *)malloc((size_t)B * n_embd * 4);
     if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
@@ -1339,8 +1350,8 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
     free(rows);
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
-    build_per_layer_n(m, tokens, PREFILL_B, matmul_q_n);
-    chunk_layers(m, kv, model_has_ple(m), PREFILL_B, matmul_q_n);
+    build_per_layer_n(m, tokens, B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n);
 }
 
 // Embedding form (media tokens): the rows enter exactly as given â€” media
@@ -1348,16 +1359,17 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
 // PLE model a media position takes the PADDING token's (id 0) per-layer row
 // beside the usual projection of its embedding â€” the reference does exactly
 // this for embedding batches; the 12B has no PLE at all.
-static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float *rows, int pos0) {
+static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float *rows, int pos0, int cols) {
     const struct config *c = &m->cfg;
-    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)PREFILL_B * c->n_embd * 4, cudaMemcpyHostToDevice));
+    g_pf_cols = cols;
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)cols * c->n_embd * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
     int has_ple = model_has_ple(m);
     if (has_ple) {
         int pad[PREFILL_B] = { 0 };
-        build_per_layer_n(m, pad, PREFILL_B, matmul_q_n);
+        build_per_layer_n(m, pad, cols, matmul_q_n);
     }
-    chunk_layers(m, kv, has_ple, PREFILL_B, matmul_q_n);
+    chunk_layers(m, kv, has_ple, cols, matmul_q_n);
 }
 
 // Mixed form: each chunk position is a text token (ids[j] >= 0: looked-up,
@@ -1366,9 +1378,10 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
 // position's math is exactly its pure-form chunk's — only the company a
 // position keeps in a chunk changes.
 static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float *mrows,
-                                const int *ids, int pos0) {
+                                const int *ids, int pos0, int cols) {
     const struct config *c = &m->cfg;
-    const int B = PREFILL_B, n_embd = c->n_embd;
+    g_pf_cols = cols;
+    const int B = cols, n_embd = c->n_embd;
 
     float *rows = (float *)malloc((size_t)B * n_embd * 4);
     if (!rows) { fprintf(stderr, "forward_chunk_mixed: out of memory\n"); exit(1); }
@@ -1389,8 +1402,8 @@ static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float
     free(rows);
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
-    build_per_layer_n(m, toks, PREFILL_B, matmul_q_n);
-    chunk_layers(m, kv, model_has_ple(m), PREFILL_B, matmul_q_n);
+    build_per_layer_n(m, toks, B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n);
 }
 
 // Capture the device-only forward into a CUDA graph once, then replay it every token:
@@ -1452,12 +1465,25 @@ extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token
     return best;
 }
 
+// Pre-size the int8 activation scratch to the 128-wide max BEFORE any chunk or
+// the decode-graph capture. Adaptive chunks make a short first turn size g_xq
+// small; a later wider turn would then realloc it — and the captured decode
+// graph references g_xq, so a realloc would leave it dangling. One max-size call
+// up front (no-op on the f32 backend) keeps the pointer stable for the session.
+static void prefill_act_presize(struct model *m) {
+    static int done = 0;
+    if (done) return;
+    actq_for((int)((size_t)PREFILL_B * m->cfg.n_ff));   // n_ff is the widest activation (ffn_down input)
+    done = 1;
+}
+
 extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
     ensure_weights(m);
     ensure_scratch(m);
+    prefill_act_presize(m);
     int i = 0;
     for (; n - i >= PREFILL_B; i += PREFILL_B)        // full chunks: weights read once per chunk
-        forward_chunk(m, kv, tokens + i, pos0 + i);
+        forward_chunk(m, kv, tokens + i, pos0 + i, PREFILL_B);
     // The warmup tokens exist so ensure_act's one-time cudaMallocs precede graph
     // capture; one chunk does all of them (its activations are BÃ— decode's), so
     // skip straight to capture â€” otherwise a chunk-aligned prompt would push the
@@ -1476,10 +1502,12 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     // final forward) before anything can read them — every consumer writes
     // position p before its attention reads p, and reads stop at its own
     // position. Real rows' math is the chunk path's: byte-identical.
-    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
+    int rem = n - i, cols = ((rem + 31) / 32) * 32;   // adaptive: round the tail up to 32, not 128
+    if (cols > PREFILL_B) cols = PREFILL_B;
+    if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
         int padded[PREFILL_B];
-        for (int j = 0; j < PREFILL_B; j++) padded[j] = tokens[i + (j < n - i ? j : n - i - 1)];
-        forward_chunk(m, kv, padded, pos0 + i);
+        for (int j = 0; j < cols; j++) padded[j] = tokens[i + (j < rem ? j : rem - 1)];
+        forward_chunk(m, kv, padded, pos0 + i, cols);
         if (g_graph_warmups < 2) g_graph_warmups = 2;
         return;
     }
@@ -1490,20 +1518,23 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
 extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
     ensure_weights(m);
     ensure_scratch(m);
+    prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
     int i = 0;
     for (; n - i >= PREFILL_B; i += PREFILL_B)
-        forward_chunk_embd(m, kv, rows + (size_t)i * n_embd, pos0 + i);
+        forward_chunk_embd(m, kv, rows + (size_t)i * n_embd, pos0 + i, PREFILL_B);
     if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
-    // pad the remainder to a full chunk, exactly as model_prefill does (the
-    // last row repeats; the pad rows' kv is overwritten before it can be read)
-    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
-        float *padded = (float *)malloc((size_t)PREFILL_B * n_embd * 4);
+    // pad the remainder to an adaptive-width chunk (roundup to 32, not 128); the
+    // last row repeats; the pad rows' kv is overwritten before it can be read.
+    int rem = n - i, cols = ((rem + 31) / 32) * 32;
+    if (cols > PREFILL_B) cols = PREFILL_B;
+    if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
+        float *padded = (float *)malloc((size_t)cols * n_embd * 4);
         if (padded) {
-            for (int j = 0; j < PREFILL_B; j++)
+            for (int j = 0; j < cols; j++)
                 memcpy(padded + (size_t)j * n_embd,
-                       rows + (size_t)(i + (j < n - i ? j : n - i - 1)) * n_embd, (size_t)n_embd * 4);
-            forward_chunk_embd(m, kv, padded, pos0 + i);
+                       rows + (size_t)(i + (j < rem ? j : rem - 1)) * n_embd, (size_t)n_embd * 4);
+            forward_chunk_embd(m, kv, padded, pos0 + i, cols);
             free(padded);
             if (g_graph_warmups < 2) g_graph_warmups = 2;
             return;
@@ -1522,17 +1553,20 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
                                     const int *ids, int n, int pos0) {
     ensure_weights(m);
     ensure_scratch(m);
+    prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
     int i = 0;
     for (; n - i >= PREFILL_B; i += PREFILL_B)
-        forward_chunk_mixed(m, kv, rows, ids + i, pos0 + i);
+        forward_chunk_mixed(m, kv, rows, ids + i, pos0 + i, PREFILL_B);
     if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
-    // padded remainder, exactly as the pure forms (repeating a media id
-    // repeats its row; the pad's kv is overwritten before it can be read)
-    if (n - i >= 2 && pos0 + i + PREFILL_B <= kv->max_seq) {
+    // adaptive-width padded remainder (roundup to 32, not 128); repeating a media
+    // id repeats its row; the pad's kv is overwritten before it can be read.
+    int rem = n - i, cols = ((rem + 31) / 32) * 32;
+    if (cols > PREFILL_B) cols = PREFILL_B;
+    if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
         int padded[PREFILL_B];
-        for (int j = 0; j < PREFILL_B; j++) padded[j] = ids[i + (j < n - i ? j : n - i - 1)];
-        forward_chunk_mixed(m, kv, rows, padded, pos0 + i);
+        for (int j = 0; j < cols; j++) padded[j] = ids[i + (j < rem ? j : rem - 1)];
+        forward_chunk_mixed(m, kv, rows, padded, pos0 + i, cols);
         if (g_graph_warmups < 2) g_graph_warmups = 2;
         return;
     }
