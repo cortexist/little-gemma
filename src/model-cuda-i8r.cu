@@ -1014,6 +1014,26 @@ static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, int k, 
     matmul_q4k_mmq_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
 }
 
+// q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
+// (32 rows/warp), whose acc[2][COLS/8][4] fits up to COLS=64 (~121 regs); the big
+// 2*2048/warp A tile needs the carveout past COLS=32. Widening the q6_K sub-tile
+// 32->64 halves its weight passes (the wide-tile win, applied to the 9%-of-prefill
+// q6_K share without a 1-tile rewrite).
+template<int COLS>
+static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
+    int wpc = 8;
+    while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
+    static int carve = 0;
+    if (!carve) {
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 2048;
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q6k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        carve = 1;
+    }
+    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
+    matmul_q6k_mma_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+}
+
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
@@ -1050,14 +1070,14 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
     }
     if (q6src && PREFILL_B % 32 == 0) {
-        int wpc = 8;
-        while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;
-        while (wpc > 1 && 2 * 32 * SB_COL + 2 * 32 * SBX * (int)sizeof(float2) + wpc * 2 * 2048 > 48 * 1024) wpc >>= 1;
-        size_t shm = 2 * 32 * SB_COL + 2 * 32 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
-        int blocks6 = (m + 32 * wpc - 1) / (32 * wpc);
-        for (int c0 = 0; c0 < g_pf_cols; c0 += 32)               // chunk width (adaptive), 32-col sub-tiles
-            matmul_q6k_mma_kernel<32><<<blocks6, 32 * wpc, shm, g_launch>>>(
-                d_out + (size_t)c0 * m, q6src, q6ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
+        // 64-wide sub-tiles where the chunk allows (halves weight passes vs 32),
+        // a 32-wide tail for the leftover 32 cols (g_pf_cols in {32,64,96,128}).
+        for (int c0 = 0; c0 < g_pf_cols; ) {
+            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+            float *outc = d_out + (size_t)c0 * m;
+            if (g_pf_cols - c0 >= 64) { launch_q6k_mmq<64>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 64; }
+            else                     { launch_q6k_mmq<32>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 32; }
+        }
         return;
     }
     // dp4a fallback (q3/q5/q8 and the residual f32/bf16): float s[NB] spills past
