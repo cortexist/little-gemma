@@ -337,15 +337,23 @@ __global__ static void attn_swa_n_kernel(float *xb, const float *q, const float 
 // Measured (.scratch/flash_decode_test.cu) ~3.3x decode-attn on the Orin @4k.
 #define MAXSPLIT 8
 #define SPLIT_KEYS 1024
+// blockIdx.z selects the query within a B-row chunk. Decode launches z=1, so qi=0,
+// pos=*d_pos, and the (query,head) base collapses to hh*MAXSPLIT — byte-identical
+// to the single-query form. The B<=2 MTP verify launches z=B: query qi sits at
+// *d_pos+qi and reads its own q row, so verify shares THIS kernel (and reduction
+// order) with decode — out[0]/out[1] byte-match plain decode's forwards at
+// pos/pos+1 BY CONSTRUCTION (the -mtp==plain invariant no longer rests on a
+// numeric near-tie failing to flip between split-K decode and per-query verify).
 template <bool RING, typename KT>
 __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *q, const KT *Kc, const KT *Vc,
-                                         int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq) {
-    int hh = blockIdx.x, split = blockIdx.y, kvh = hh / gqa;
-    int pos = *d_pos, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
+                                         int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, int n_head) {
+    int hh = blockIdx.x, split = blockIdx.y, qi = blockIdx.z, kvh = hh / gqa;
+    int pos = *d_pos + qi, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
     int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
-    if (split >= n_split) { if (threadIdx.x == 0) pml[(size_t)hh * MAXSPLIT + split] = make_float2(-INFINITY, 0.0f); return; }
+    size_t hs = ((size_t)qi * n_head + hh) * MAXSPLIT;     // (query,head) base in pacc/pml
+    if (split >= n_split) { if (threadIdx.x == 0) pml[hs + split] = make_float2(-INFINITY, 0.0f); return; }
     int per = (T + n_split - 1) / n_split, lo = start + split * per, hi = min(pos, lo + per - 1);
-    const float *qh = q + (size_t)hh * hd;
+    const float *qh = q + (size_t)qi * n_head * hd + (size_t)hh * hd;
     extern __shared__ float comb[];                       // [nwarp][hd]
     __shared__ float wm[32], ws[32];
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5, nv = hd / 32;
@@ -387,8 +395,8 @@ __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *
     __syncthreads();
     float gm = -INFINITY; for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
     if (threadIdx.x == 0) { float gs = 0.0f; for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
-        pml[(size_t)hh * MAXSPLIT + split] = make_float2(gm, gs); }
-    float *po = pacc + ((size_t)hh * MAXSPLIT + split) * hd;
+        pml[hs + split] = make_float2(gm, gs); }
+    float *po = pacc + (hs + split) * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float o = 0.0f; for (int w = 0; w < nwarp; w++) o += comb[w * hd + i] * expf(wm[w] - gm);
         po[i] = o;
@@ -396,35 +404,37 @@ __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *
 }
 // merge the n_split partials per head -> attention output (+ actq epilogue).
 __global__ static void combine_attn_kernel(float *xb, const float *pacc, const float2 *pml,
-                                           int hd, const int *d_pos, int window, struct actq aq) {
-    int hh = blockIdx.x;
-    int pos = *d_pos, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
+                                           int hd, const int *d_pos, int window, struct actq aq, int n_head) {
+    int hh = blockIdx.x, qi = blockIdx.z;
+    int pos = *d_pos + qi, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
     int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
+    size_t hs = ((size_t)qi * n_head + hh) * MAXSPLIT, qoff = (size_t)qi * n_head * hd;
     __shared__ float M, L;
     if (threadIdx.x == 0) { float mm = -INFINITY, ll = 0.0f;
-        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp]; if (ml.y > 0) mm = fmaxf(mm, ml.x); }
-        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp]; if (ml.y > 0) ll += ml.y * expf(ml.x - mm); }
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[hs + sp]; if (ml.y > 0) mm = fmaxf(mm, ml.x); }
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[hs + sp]; if (ml.y > 0) ll += ml.y * expf(ml.x - mm); }
         M = mm; L = ll; }
     __syncthreads();
     float Mv = M, inv = 1.0f / L;
-    float *outh = xb + (size_t)hh * hd;
+    float *outh = xb + qoff + (size_t)hh * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float o = 0.0f;
-        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[(size_t)hh * MAXSPLIT + sp];
-            if (ml.y > 0) o += pacc[((size_t)hh * MAXSPLIT + sp) * hd + i] * expf(ml.x - Mv); }
+        for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[hs + sp];
+            if (ml.y > 0) o += pacc[(hs + sp) * hd + i] * expf(ml.x - Mv); }
         outh[i] = o * inv;
     }
     if (aq.xq) { __syncthreads();
-        for (int g = threadIdx.x; g < hd / 32; g += blockDim.x) d_quant_group(outh + g * 32, (hh * hd) / 32 + g, aq); }
+        for (int g = threadIdx.x; g < hd / 32; g += blockDim.x) d_quant_group(outh + g * 32, (int)(qoff / 32) + (hh * hd) / 32 + g, aq); }
 }
 // split-K scratch (partials), grown once during warmup (no mid-capture malloc).
+// Sized in (query,head) slots: decode needs n_head (B=1), the B=2 verify 2*n_head.
 static float *g_pacc = NULL; static float2 *g_pml = NULL; static int g_split_cap = 0;
-static void ensure_split(int n_head) {
-    if (n_head <= g_split_cap) return;
+static void ensure_split(int slots) {
+    if (slots <= g_split_cap) return;
     cudaFree(g_pacc); cudaFree(g_pml);
-    CUDA_CHECK(cudaMalloc(&g_pacc, (size_t)n_head * MAXSPLIT * ATTN_HD_MAX * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&g_pml, (size_t)n_head * MAXSPLIT * sizeof(float2)));
-    g_split_cap = n_head;
+    CUDA_CHECK(cudaMalloc(&g_pacc, (size_t)slots * MAXSPLIT * ATTN_HD_MAX * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_pml, (size_t)slots * MAXSPLIT * sizeof(float2)));
+    g_split_cap = slots;
 }
 
 // K/V-SHARING prefill attention. The per-query kernels above launch one block
@@ -725,7 +735,7 @@ static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
 
 static void ensure_weights(struct model *m) {
-    ensure_split(m->cfg.n_head);          // split-K scratch: alloc here (pre-capture) — decode has no warmup after a chunked prefill
+    ensure_split(2 * m->cfg.n_head);      // split-K scratch (2*n_head slots covers both decode B=1 and the B=2 verify); alloc here (pre-capture) — decode/verify have no warmup after a chunked prefill
     if (d_blob) return;
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
@@ -1063,14 +1073,14 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
         if (!no_splitk) {
             ensure_split(n_head);
             struct actq aq = actq_for(q_dim);
-            dim3 gs(n_head, MAXSPLIT);
+            dim3 gs(n_head, MAXSPLIT);                      // z=1: qi=0, single query
             if (kv->f16[src])
-                split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0);
+                split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
             else if (kv->seq[src] < kv->max_seq)
-                split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src]);
+                split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
             else
-                split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0);
-            combine_attn_kernel<<<n_head, 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq);
+                split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
+            combine_attn_kernel<<<n_head, 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq, n_head);
         } else if (kv->f16[src])
             attn_h_kernel<<<n_head, 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
         else if (kv->seq[src] < kv->max_seq)
@@ -1224,8 +1234,17 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         // f32 xb -> act_quantize fills the int8 activation for attn_output.
         static int no_flash = -1;
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
+        static int no_splitk = -1;
+        if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
         bool flash = !no_flash && B > 2 && B <= 32 && (hd == 256 || hd == 512);
         bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
+        // The B<=2 MTP verify runs the SAME split-K kernel as decode (one extra
+        // grid axis for the 2 query rows): out[0]/out[1] then byte-match plain
+        // decode's forwards at pos/pos+1 by construction, and verify's attention
+        // gets the split-K parallelism win at high context. Per-query stays as the
+        // LG_NO_SPLITK fallback (and there decode is per-query too, so they still
+        // match). Mirrors decode's gate (decode-side LG_NO_SPLITK is independent).
+        bool splitk = !no_splitk && B <= 2 && (hd == 256 || hd == 512);
         if (flash) {
             bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
             if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring);
@@ -1242,6 +1261,18 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
                 attn_kvshare_n_kernel<QT, true, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, aq);
             else                                           // full layer, full-length float cache
                 attn_kvshare_n_kernel<QT, false, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
+        } else if (splitk) {                               // B<=2 MTP verify: decode's split-K kernel, z=B queries
+            ensure_split(B * n_head);                       // no-op (ensure_weights pre-allocated 2*n_head pre-capture)
+            size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
+            dim3 gs(n_head, MAXSPLIT, B);
+            struct actq aq = actq_for(B * q_dim);
+            if (kv->f16[src])
+                split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
+            else if (kv->seq[src] < kv->max_seq)
+                split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
+            else
+                split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
+            combine_attn_kernel<<<dim3(n_head, 1, B), 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq, n_head);
         } else {
             size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
             if (kv->f16[src])
