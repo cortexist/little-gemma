@@ -510,6 +510,70 @@ static void mmq_build_all(void) {
     }
 }
 
+// q8_0 twins for the f32/bf16 prefill matmuls. On Gemma 4 the one such weight
+// is per_layer_model_proj (the PLE projection): it is bf16/f32 in the gguf, so
+// the chunk path ran it on the scalar warp-per-row fallback at ~10x the per-MAC
+// cost of the quantized kernels, for ~2% of prefill's MACs but ~12% of its time.
+// Quantizing the weight to q8_0 (int8 + per-32 f16 scale — the gentlest quant)
+// routes it through the dp4a integer path instead. PREFILL ONLY: matmul_q
+// (decode) and matmul_q_2 (verify) keep the original weight, so decode stays
+// byte-identical and -mtp == plain holds by construction; only the prefilled KV
+// shifts (relaxed class, exactly like flash). NULL entry => no twin (in-place).
+static unsigned char **g_rw_q8 = NULL;
+static const unsigned char *rweight_q8(const struct gguf_tensor *t) {
+    if (!g_rw_q8) return NULL;
+    return g_rw_q8[(size_t)(t - g_ctx->tensors)];
+}
+// one row's k floats -> k/32 q8_0 blocks (ggml's scheme: d = amax/127).
+static void quantize_row_q8_0(block_q8_0 *dst, const float *x, int k) {
+    for (int b = 0; b < k / 32; b++) {
+        const float *xb = x + (size_t)b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
+        float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        __half hd = __float2half(d);
+        memcpy(&dst[b].d, &hd, sizeof(uint16_t));
+        for (int i = 0; i < 32; i++) {
+            int q = (int)lrintf(xb[i] * id);
+            dst[b].qs[i] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+        }
+    }
+}
+// Build the q8_0 twins up front (eager, like the others — no mid-capture malloc).
+// Selects f32/bf16/f16 2-D weights whose k is a q8_0-block multiple (Gemma 4:
+// just per_layer_model_proj). LG_NO_Q8PROJ forces the scalar fallback (A/B).
+static void q8_build_all(void) {
+    if (getenv("LG_NO_Q8PROJ")) { fprintf(stderr, "q8_0 proj repack: disabled by LG_NO_Q8PROJ (scalar fallback)\n"); return; }
+    int ntensor = 0;
+    for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
+        const struct gguf_tensor *t = &g_ctx->tensors[i];
+        if (t->n_dims != 2 || t->dims[0] % 32) continue;
+        if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) ntensor++;
+    }
+    if (!ntensor) return;
+    g_rw_q8 = (unsigned char **)calloc(g_ctx->header.num_tensors, sizeof *g_rw_q8);
+    if (!g_rw_q8) return;
+    size_t made = 0; int n_made = 0;
+    for (uint64_t i = 0; i < g_ctx->header.num_tensors; i++) {
+        const struct gguf_tensor *t = &g_ctx->tensors[i];
+        if (t->n_dims != 2 || t->dims[0] % 32) continue;
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) continue;
+        int64_t k = (int64_t)t->dims[0], m = (int64_t)t->dims[1], n = k * m;
+        float *f = (float *)malloc((size_t)n * 4);
+        block_q8_0 *host = (block_q8_0 *)malloc((size_t)(n / 32) * sizeof(block_q8_0));
+        if (!f || !host || !dequantize_into(t->type, t->data, f, n)) { free(f); free(host); continue; }
+        for (int64_t r = 0; r < m; r++) quantize_row_q8_0(host + (size_t)r * (k / 32), f + (size_t)r * k, (int)k);
+        free(f);
+        size_t bytes = (size_t)(n / 32) * sizeof(block_q8_0);
+        unsigned char *dev;
+        if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); free(host); continue; }
+        cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice);
+        free(host);
+        g_rw_q8[(size_t)i] = dev; made += bytes; n_made++;
+    }
+    fprintf(stderr, "q8_0 proj repack: %d tensor(s), %.1f MB -> dp4a prefill path\n", n_made, made / 1e6);
+}
+
 // Quantized activation scratch (grows as needed; reused across matmuls).
 static int8_t *g_xq = NULL; static float2 *g_xds = NULL;
 static int g_act_cap = 0;
@@ -544,6 +608,7 @@ static void rweight_init_all(void) {
         if (ggml_blck_size(t->type) == QK_K || t->type == GGML_TYPE_Q8_0) rweight(t, &ts);
     }
     mmq_build_all();
+    q8_build_all();
     CUDA_CHECK(cudaDeviceSynchronize());
     done = 1;
 }
@@ -1076,6 +1141,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
                 matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc6, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
             }
         }
+        return;
+    }
+    const unsigned char *q8 = rweight_q8(t);              // f32/bf16 proj -> q8_0 dp4a (prefill only)
+    if (q8) {
+        int blocks = (m + 7) / 8;
+        matmul_i8r_n_kernel<PREFILL_B><<<blocks, 256, 0, g_launch>>>(d_out, q8, GGML_TYPE_Q8_0, (int)sizeof(block_q8_0), 32, d_x, g_xq, g_xds, k, m);
         return;
     }
     int rows_per_block = 256 / 32;
