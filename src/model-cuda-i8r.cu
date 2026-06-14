@@ -856,7 +856,7 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 template<int COLS, bool REPACK>
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
-                      const int8_t *xq, const float2 *xds, int k, int m, float *pacc) {
+                      const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS cols][SB_COL]
     float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS cols][8]
@@ -883,21 +883,14 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
     const int tbrow = r0 / RPACK, htile = (r0 + lane) >> 4, hrr = (r0 + lane) & 15;
 
-    // split-K: blockIdx.z selects a k-slice [kb0,kbe); gridDim.z==1 -> [0,nbk),
-    // the single-launch path that is byte-identical to before. Grid-starved
-    // small-m matmuls launch z=S extra row-tile CTAs so the 8 SMs fill, each
-    // writing a partial to pacc that a combine pass sums. The dispatch picks S
-    // so every slice is non-empty (kb0 < nbk always).
-    int per = (nbk + (int)gridDim.z - 1) / (int)gridDim.z;
-    int kb0 = (int)blockIdx.z * per, kbe = nbk < kb0 + per ? nbk : kb0 + per;
-    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, kb0, threadIdx.x);  // prologue: slice's first block
+    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
-    for (int blk = kb0; blk < kbe; blk++) {
-        int buf = (blk - kb0) & 1;
+    for (int blk = 0; blk < nbk; blk++) {
+        int buf = blk & 1;
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();                                           // staged data visible CTA-wide
-        if (blk + 1 < kbe) {                                       // next block overlaps this one's mma
+        if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
             mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
@@ -992,35 +985,14 @@ matmul_q4k_mma_kernel(float *out, const unsigned char *wbase, int ts,
         }
     }
 
-    // single launch -> out; split -> this slice's partial in pacc[blockIdx.z]
-    // (a combine pass sums the slices). [kslice][COLS][m], col-major like out.
-    float *o = pacc ? pacc + (size_t)blockIdx.z * COLS * m : out;
     #pragma unroll
     for (int t = 0; t < 2; t++)
         for (int h = 0; h < COLS / 8; h++) {
             int col0 = h * 8 + tid * 2;
             int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
-            if (rA < m) { o[(size_t)col0 * m + rA] = acc[t][h][0]; o[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
-            if (rB < m) { o[(size_t)col0 * m + rB] = acc[t][h][2]; o[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+            if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
+            if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
         }
-}
-
-// Sum the split-K partials [nsplit][n] -> out[n] (n = COLS*m). Ascending-slice
-// sum; combined with each slice's ascending-k accumulation this is the full
-// sum, reassociated (relaxed class, deterministic) — prefill only.
-__global__ static void combine_pf_kernel(float *out, const float *pacc, int nsplit, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float s = 0.0f;
-    for (int z = 0; z < nsplit; z++) s += pacc[(size_t)z * n + i];
-    out[i] = s;
-}
-// split-K partial scratch (grows; prefill is not graph-captured, so a mid-run
-// grow is safe — but keep-and-reuse to avoid per-matmul mallocs).
-static float *g_pacc_pf = NULL; static size_t g_pacc_pf_cap = 0;
-static float *ensure_pacc_pf(size_t n) {
-    if (n > g_pacc_pf_cap) { cudaFree(g_pacc_pf); CUDA_CHECK(cudaMalloc(&g_pacc_pf, n * sizeof(float))); g_pacc_pf_cap = n; }
-    return g_pacc_pf;
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -1190,43 +1162,14 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         if (t->type == GGML_TYPE_Q4_K) {                          // widen to the whole chunk: B columns, one launch
             size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
             const unsigned char *rw = rweight_mmq(t);             // tile-coalesced twin, or NULL (in-place)
-            // split-K: a small-m matmul has only m/32 row-tiles -> too few CTAs
-            // (warps/SM ~ m/256) to hide the shared-load latency on 8 SMs. Split
-            // the k-dim into S CTAs per tile so blocks*S reaches ~4*SMs; each
-            // writes a partial, a combine sums them. Big-m (ffn, blocks>=4*SMs)
-            // stays S=1 = the unchanged single launch. LG_NO_SPLITK_PF reverts.
-            static int no_spf = -1; if (no_spf < 0) no_spf = getenv("LG_NO_SPLITK_PF") != NULL;
-            int nbk = k / 256, S = 1;
-            if (!no_spf && nbk >= 2 && blocks < 4 * sms) {
-                S = (4 * sms + blocks - 1) / blocks;
-                if (S > 8) S = 8;
-                if (S > nbk) S = nbk;
-                int per = (nbk + S - 1) / S;
-                while (S > 1 && (S - 1) * per >= nbk) { S--; per = (nbk + S - 1) / S; }
-            }
-            if (S > 1) {
-                float *pacc = ensure_pacc_pf((size_t)S * PREFILL_B * m);
-                dim3 g(blocks, 1, S);
-                if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<g, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m, pacc);
-                else    matmul_q4k_mma_kernel<PREFILL_B, false><<<g, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m, pacc);
-                combine_pf_kernel<<<gridn(PREFILL_B * m), 256, 0, g_launch>>>(d_out, pacc, S, PREFILL_B * m);
-            } else if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m, NULL);
-            else            matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m, NULL);
-        } else {                                                  // q6_K: widen to the whole chunk like q4_K.
-            static int q6b16 = -1;                                 // LG_Q6_B16 = the old 16-wide loop (A/B)
-            if (q6b16 < 0) q6b16 = getenv("LG_Q6_B16") != NULL;
-            if (q6b16) {
-                size_t shm = 2 * 16 * SB_COL + 2 * 16 * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
-                for (int c0 = 0; c0 < PREFILL_B; c0 += 16)
-                    matmul_q6k_mma_kernel<16><<<blocks, 32 * wpc, shm, g_launch>>>(
-                        d_out + (size_t)c0 * m, w, ts, g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
-            } else {                                               // q6_K's A tile is bigger (4 KB/warp), so cap
-                int wpc6 = wpc;                                    // warps/CTA to keep shm < 48 KB (no carveout)
-                while (wpc6 > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc6 * 2 * 2048 > 48 * 1024) wpc6 >>= 1;
-                size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc6 * 2 * 2048;
-                int blocks6 = (m + 32 * wpc6 - 1) / (32 * wpc6);
-                matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc6, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
-            }
+            if (rw) matmul_q4k_mma_kernel<PREFILL_B, true ><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, rw, ts, g_xq, g_xds, k, m);
+            else    matmul_q4k_mma_kernel<PREFILL_B, false><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w,  ts, g_xq, g_xds, k, m);
+        } else {                                                  // q6_K's A tile is bigger (4 KB/warp), so cap
+            int wpc6 = wpc;                                        // warps/CTA to keep shm < 48 KB (no carveout)
+            while (wpc6 > 1 && 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * (int)sizeof(float2) + wpc6 * 2 * 2048 > 48 * 1024) wpc6 >>= 1;
+            size_t shm = 2 * PREFILL_B * SB_COL + 2 * PREFILL_B * SBX * sizeof(float2) + (size_t)wpc6 * 2 * 2048;
+            int blocks6 = (m + 32 * wpc6 - 1) / (32 * wpc6);
+            matmul_q6k_mma_kernel<PREFILL_B><<<blocks6, 32 * wpc6, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
         }
         return;
     }

@@ -1088,3 +1088,49 @@ verify is neutral-to-slightly-positive on speed and never worse — its real
 deliverable is the correctness guarantee at no cost. A good outcome to have
 *measured* rather than claimed; the speedup pitch was speculative, the
 byte-identity was the point.
+
+## The occupancy trap: chasing warps when the lever was ILP
+
+For weeks the prefill matmul sat at the same place no matter what I did to it.
+Pad the bank conflicts away and the SM throughput climbed to ~47%; then split-K
+to fill the eight SMs — flat; widen the batch tile to 128 columns — +12% and
+*still* ~47%; put the kernel on a register diet to seat a third CTA — it spilled
+and went nowhere. Four levers, one wall. I wrote it down as a register-capped
+occupancy ceiling: the kernel needs 128 registers, that seats exactly two CTAs
+per SM on the Orin's 65,536-register file, two CTAs is ~30% occupancy, and ~30%
+is too few warps to hide the shared-load latency. Every lever I tried was a
+different way to buy *more occupancy* — more CTAs, smaller registers, more blocks
+in the grid — and the hardware refused to hand any of it over. The honest
+conclusion at the time was that 1:1 with llama.cpp wasn't reachable with this
+kernel family on eight SMs.
+
+Then I did the thing I should have done first: I profiled llama.cpp's own
+`mul_mat_q` on the Orin, the same model, with ncu. The numbers were the opposite
+of everything I had assumed. Its q4_K kernel runs at **16.66% achieved
+occupancy** — *half* of ours — with **224–252 registers per thread** — *double*
+ours — one CTA per SM, one wave of eight persistent CTAs, a 57.86 KB shared
+carveout, and it sustains **56% SM throughput** while we sit at 47%. It prefills
+pp512 at 497 tok/s; we do 183. It wins by running at half our occupancy.
+
+So occupancy was never the lever. llama.cpp's CTA is a 128×128 output tile: 16,384
+outputs across 256 threads is **64 accumulators per thread**, which is 64
+*independent* mma chains in flight at once. That is where the latency goes to
+hide — into instruction-level parallelism inside one fat tile, not into a crowd
+of warps. Every move I made was attacking the wrong variable, and the register
+diet didn't just fail to help, it was actively backwards: cutting registers cuts
+the accumulator tile, and the accumulator tile *is* the ILP that does the hiding.
+I was shrinking the thing keeping the SM busy in order to fit more copies of a
+now-idler thread.
+
+There is a second lesson under the first, and it is about microbenchmarks. Twice
+this campaign a micro lied to me. A wide-batch harness showed 3× because its
+*narrow* baseline was crippled — no repack, no block-staged cp.async, no tuned
+pads — so the ratio was fiction and production only moved 12%. Earlier, a tiled
+fat-tile micro ran at 0.41× on the Orin and I used that to write off the
+fat-tile design as "a desktop thing," when in truth the micro was L2-cached and
+compute-bound and bore no resemblance to the real streaming kernel — which, when
+finally measured, is the *winning* design on the very same eight SMs. The only
+number that ever told the truth was the real kernel on the real workload. A
+micro's baseline has to be as optimized as production or its ratio is a story you
+tell yourself; and a falsifying micro can falsify the wrong thing. Measure the
+real kernel.
