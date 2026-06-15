@@ -800,6 +800,23 @@ static int kv_src_dev(const struct model *m, int L) {
 // B/16 times. B must be a multiple of 16. (The 8/16/32 sweep noted above
 // predates the mma kernel and the Orin's zero-copy weights; being re-measured.)
 #define PREFILL_B 128
+// A whole image span attends bidirectionally, so it must prefill as ONE chunk —
+// which can exceed PREFILL_B (up to Gemma's vision ceiling, the 1120-patch budget
+// ladder top). PREFILL_MAX_B is the absolute chunk-width cap (stack arrays, kernel
+// reach); g_prefill_max_b is the runtime buffer width — PREFILL_B by default, raised
+// to the ceiling when a media projector is loaded (model_prefill_reserve), so the
+// activation buffers are sized ONCE at scratch init and the decode graph captures
+// the final pointers (never realloc'd -> decode untouched). If a big image OOMs,
+// that is the deployment's signal to throttle media_cat's -n, not the engine's to cap.
+#define PREFILL_MAX_B 1120
+static int g_prefill_max_b = PREFILL_B;
+extern "C" void model_prefill_reserve(void) {
+    static int done = 0; if (done) return; done = 1;
+    int w = PREFILL_MAX_B;
+    const char *e = getenv("LG_PREFILL_MAX_B");
+    if (e) { w = atoi(e); if (w < PREFILL_B) w = PREFILL_B; if (w > PREFILL_MAX_B) w = PREFILL_MAX_B; }
+    g_prefill_max_b = w;
+}
 
 // Adaptive prefill chunk width. Full chunks use PREFILL_B (128) so long prefills
 // (system prompt, media) keep the wide-tile win; the short TAIL of a turn rounds
@@ -862,7 +879,7 @@ static void ensure_scratch(struct model *m) {
         int kvd = m->n_head_kv[L] * m->head_dim[L];
         if (kvd > maxkv) maxkv = kvd;
     }
-    size_t B = PREFILL_B;   // every activation buffer holds a whole prefill chunk
+    size_t B = g_prefill_max_b;   // every activation buffer holds a whole prefill chunk (widest = an image span)
     int q_max = c->n_head * maxhd, ne = c->n_embd, nff = c->n_ff, ple = c->n_embd_per_layer;
     CUDA_CHECK(cudaMalloc(&dx,  B * ne   * 4)); CUDA_CHECK(cudaMalloc(&dh,  B * ne   * 4));
     CUDA_CHECK(cudaMalloc(&dout,B * ne   * 4)); CUDA_CHECK(cudaMalloc(&dq,  B * q_max * 4));
@@ -1381,7 +1398,7 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
     int has_ple = model_has_ple(m);
     if (has_ple) {
-        int pad[PREFILL_B] = { 0 };
+        int pad[PREFILL_MAX_B] = { 0 };
         build_per_layer_n(m, pad, cols, matmul_q_n);
     }
     chunk_layers(m, kv, has_ple, cols, matmul_q_n);
@@ -1401,7 +1418,7 @@ static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float
     float *rows = (float *)malloc((size_t)B * n_embd * 4);
     if (!rows) { fprintf(stderr, "forward_chunk_mixed: out of memory\n"); exit(1); }
     float es = sqrtf((float)n_embd);
-    int toks[PREFILL_B];
+    int toks[PREFILL_MAX_B];
     for (int j = 0; j < B; j++) {
         if (ids[j] >= 0) {
             toks[j] = ids[j];
@@ -1488,7 +1505,7 @@ extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token
 static void prefill_act_presize(struct model *m) {
     static int done = 0;
     if (done) return;
-    actq_for((int)((size_t)PREFILL_B * m->cfg.n_ff));   // n_ff is the widest activation (ffn_down input)
+    actq_for((int)((size_t)g_prefill_max_b * m->cfg.n_ff));   // n_ff is the widest activation (ffn_down input)
     done = 1;
 }
 
@@ -1520,7 +1537,7 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     int rem = n - i, cols = ((rem + 31) / 32) * 32;   // adaptive: round the tail up to 32, not 128
     if (cols > PREFILL_B) cols = PREFILL_B;
     if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
-        int padded[PREFILL_B];
+        int padded[PREFILL_MAX_B];
         for (int j = 0; j < cols; j++) padded[j] = tokens[i + (j < rem ? j : rem - 1)];
         forward_chunk(m, kv, padded, pos0 + i, cols);
         if (g_graph_warmups < 2) g_graph_warmups = 2;
@@ -1599,23 +1616,32 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
     // seg=NULL -> byte-identical causal; chunking matches the old 128 path for text.
     int i = 0;
     while (n - i >= 2) {
-        int a = i, w = 0, media_hi = -1, toobig = 0;
-        while (a + w < n && w < PREFILL_B) {
+        int a = i, w = 0, media_hi = -1;
+        // A whole image span prefills as ONE chunk so its patches attend
+        // bidirectionally. If the span exceeds PREFILL_B it becomes its OWN wide
+        // chunk (up to g_prefill_max_b, the buffer width); otherwise pack text +
+        // small spans greedily to PREFILL_B (causal text, bidirectional frames).
+        if (ids[a] < 0) {
+            int e = a; while (e < n && ids[e] < 0) e++;
+            int span = e - a;
+            if (span > PREFILL_B) { w = (span <= g_prefill_max_b) ? span : g_prefill_max_b; media_hi = a + w - 1; }
+        }
+        if (w == 0) while (a + w < n && w < PREFILL_B) {
             if (ids[a + w] < 0) {                      // a media span: take it whole if it fits
                 int s = a + w, e = s; while (e < n && ids[e] < 0) e++;
                 int span = e - s;
-                if (span > PREFILL_B) { if (w == 0) { w = PREFILL_B; toobig = 1; } break; }
+                if (span > PREFILL_B) break;           // wide span -> close chunk, it starts the next (its own wide chunk)
                 if (w + span > PREFILL_B) break;       // doesn't fit the remaining budget -> close chunk
                 media_hi = e - 1; w += span;
             } else w++;                                // text
         }
         if (w < 1) w = 1;
-        int cols = ((w + 31) / 32) * 32; if (cols > PREFILL_B) cols = PREFILL_B;
+        int cols = ((w + 31) / 32) * 32; if (cols > g_prefill_max_b) cols = g_prefill_max_b;
         if (pos0 + a + cols > kv->max_seq) break;
-        int padded[PREFILL_B];
+        int padded[PREFILL_MAX_B];
         for (int j = 0; j < cols; j++) padded[j] = ids[a + (j < w ? j : w - 1)];
         static int no_bidir = -1; if (no_bidir < 0) no_bidir = getenv("LG_NO_IMG_BIDIR") != NULL;
-        int bidir = seg_ok && media_hi >= 0 && !toobig && !no_bidir;
+        int bidir = seg_ok && media_hi >= 0 && !no_bidir;
         g_pf_seg = bidir ? g_seg_dev : NULL;
         g_pf_bidir_hi = bidir ? (pos0 + media_hi) : 0;
         forward_chunk_mixed(m, kv, rows, padded, pos0 + a, cols);

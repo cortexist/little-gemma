@@ -148,6 +148,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     if (mmproj && !(md = media_open(mmproj, m.cfg.n_embd))) {
         model_free(&m); tokenizer_free(tk); return;
     }
+    if (md) model_prefill_reserve();   // size prefill buffers for a whole image span before any forward
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
 

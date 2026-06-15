@@ -131,6 +131,12 @@ void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, 
 void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
                          const int *ids, int n, int pos0);
 
+// Tell the engine a media projector is loaded, so it sizes the prefill activation
+// buffers for a whole image span (up to the model's patch budget) before the decode
+// graph captures their pointers. Call once at startup after media_open, before the
+// first forward. LG_PREFILL_MAX_B caps the width (a deployment's VRAM throttle).
+void model_prefill_reserve(void);
+
 // ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
 // A tiny transformer that predicts the token AFTER next by cross-attending
 // straight into the target's KV cache (it has no K/V projections of its own).

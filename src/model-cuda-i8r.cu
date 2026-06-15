@@ -1000,7 +1000,7 @@ static void matmul_coverage_print(void) {
 // width g_pf_cols). Each COLS instantiation opts into its own shared carveout
 // once (COLS>=64 needs >48KB). 16 rows/warp; wpc shrinks so the grid covers SMs.
 template<int COLS>
-static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, int k, int m, int sms) {
+static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
     int wpc = 8;
     while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 16 * SA_ROW;
@@ -1011,7 +1011,7 @@ static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, int k, 
         carve = 1;
     }
     int blocks = (m + 16 * wpc - 1) / (16 * wpc);
-    matmul_q4k_mmq_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, g_xq, g_xds, k, m);
+    matmul_q4k_mmq_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
@@ -1052,11 +1052,21 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     // g_pf_cols (32/64/96/128): full chunks 128 (4x the old 32-wide reuse), the
     // short tail of a turn smaller so it doesn't pay a 128-wide chunk.
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0 && !no_mma) {
-        switch (g_pf_cols) {
-            case 32:  launch_q4k_mmq<32 >(d_out, w, ts, k, m, sms); break;
-            case 64:  launch_q4k_mmq<64 >(d_out, w, ts, k, m, sms); break;
-            case 96:  launch_q4k_mmq<96 >(d_out, w, ts, k, m, sms); break;
-            default:  launch_q4k_mmq<128>(d_out, w, ts, k, m, sms); break;
+        // The fat kernel templates COLS<=128 (acc[COLS/8][4] regs). A whole-image
+        // chunk can be wider (bidirectional spans, stage 2), so tile the columns in
+        // <=128 passes over offset slices of g_xq/d_out. g_pf_cols is a multiple of
+        // 32, so each tile is too -> the {32,64,96,128} templates cover it exactly.
+        // At g_pf_cols<=128 this is a single pass = the old single launch.
+        for (int c0 = 0; c0 < g_pf_cols; c0 += 128) {
+            int ct = g_pf_cols - c0; if (ct > 128) ct = 128;
+            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+            float *outc = d_out + (size_t)c0 * m;
+            switch (ct) {
+                case 32:  launch_q4k_mmq<32 >(outc, w, ts, xqc, xdc, k, m, sms); break;
+                case 64:  launch_q4k_mmq<64 >(outc, w, ts, xqc, xdc, k, m, sms); break;
+                case 96:  launch_q4k_mmq<96 >(outc, w, ts, xqc, xdc, k, m, sms); break;
+                default:  launch_q4k_mmq<128>(outc, w, ts, xqc, xdc, k, m, sms); break;
+            }
         }
         return;
     }
