@@ -135,7 +135,8 @@ static int recv_n(sock_t s, void *buf, int n) {
     return 0;
 }
 
-static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj) {
+static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
+                  const char *syspath, const char *mtp_path) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
     struct model m;
@@ -147,8 +148,59 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     if (mmproj && !(md = media_open(mmproj, m.cfg.n_embd))) {
         model_free(&m); tokenizer_free(tk); return;
     }
+    if (md) model_prefill_reserve();   // size prefill buffers for a whole image span before any forward
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
+
+    // The draft head (-mtp): block-2 speculative decode, same as generate().
+    // A failed open falls back to plain greedy (NULL) — log either way so the
+    // benchmark trace shows whether the spec path is actually live.
+    struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
+    if (mtp_path)
+        fprintf(stderr, "mtp: %s%s\n", t ? "speculative decode armed - " : "disabled, plain decode - ", mtp_path);
+
+    // The system prefix (-sys): the skills/guidelines turn is prefilled ONCE
+    // here and its cache rows saved; every session then starts at position
+    // n_sys with the skills already in context, instead of paying their whole
+    // prefill again per connection — the difference between an instant first
+    // token and a many-second one when the skills run long (robotic chat
+    // reconnects per exchange). BOS lives in this prefix when it exists.
+    int n_sys = 0;
+    if (syspath) {
+        FILE *f = fopen(syspath, "rb");
+        char *text = NULL;
+        long fl = 0;
+        if (f) { fseek(f, 0, SEEK_END); fl = ftell(f); fseek(f, 0, SEEK_SET); }
+        if (!f || fl <= 0 || fl > 12000 || !(text = malloc((size_t)fl + 32)) ||
+            fread(text, 1, (size_t)fl, f) != (size_t)fl) {
+            fprintf(stderr, "-sys: cannot read %s (must be 1..12000 bytes)\n", syspath);
+            if (f) fclose(f);
+            free(text);
+            return;
+        }
+        fclose(f);
+        while (fl > 0 && (text[fl - 1] == '\n' || text[fl - 1] == '\r')) fl--;
+        text[fl] = 0;
+        size_t cap = (size_t)fl + 64;
+        char *chat = malloc(cap);
+        int *sysv = malloc(4096 * sizeof(int));
+        if (!chat || !sysv) { free(text); free(chat); free(sysv); return; }
+        snprintf(chat, cap, "<|turn>system\n%s<turn|>\n", text);
+        int n = tokenizer_encode(tk, chat, sysv, 4096);
+        free(text); free(chat);
+        if (n <= 0 || n >= 4096 || n + 256 >= SERVE_SEQ) {
+            fprintf(stderr, "-sys: prefix is %d tokens — too long for this server\n", n);
+            free(sysv);
+            return;
+        }
+        double t0 = now_sec();
+        model_prefill(&m, &kv, sysv, n, 0);
+        kvcache_save_prefix(&kv, n);
+        free(sysv);
+        n_sys = n;
+        fprintf(stderr, "system prefix: %d tokens prefilled once in %.2fs (%s)\n",
+                n_sys, now_sec() - t0, syspath);
+    }
 
     sock_t ls = INVALID_SOCKET;
     struct sockaddr_un sa;
@@ -186,13 +238,16 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         sock_t c = accept(ls, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
         fprintf(stderr, "session start\n");
-        int pos = 0;                                     // kv cache restarts with each session
+        int pos = n_sys;                                 // each session restarts right after the
+        kvcache_restore_prefix(&kv, n_sys);              // system prefix (at 0 when there is none);
+                                                         // restore repairs ring rows a long previous
+                                                         // session may have wrapped over
         char line[8192], chat[8704];
         int promptv[4096];
         for (;;) {
             // A turn: zero or more typed frames (see media.h) — media spans
-            // and 'T' text that lands between them (a video is "0:01" frame
-            // "0:02" frame ...) — then the text line. The first byte tells
+            // and 'T' text that lands between them (a video is "00:00 " frame
+            // " 00:01 " frame ...) — then the text line. The first byte tells
             // frame from line, so a text-only client speaks the same protocol
             // it always did.
             #define MAX_SEG 32
@@ -247,16 +302,30 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 break;
             }
             double t0 = now_sec();
-            // The turn is assembled as alternating text and embedding spans:
+            // The turn is assembled as alternating text and embedding spans —
             // text accumulates (turn opener, 'T' frames, media markers) and is
-            // encoded+prefilled in one go right before each media span, whose
-            // rows then prefill as embeddings; the question line closes the
-            // turn. Only the very first encode of the conversation keeps its
-            // BOS; the first turn opens it, later turns first close the
+            // encoded right before each media span — but the whole turn
+            // prefills as ONE mixed stream: ids >= 0 are text tokens, ids < 0
+            // index the media rows gathered alongside. Prefilled separately,
+            // every text/media seam padded its own chunk to a full weight
+            // pass; a short camera turn spent a third of its prefill on the
+            // seams. Only the very first encode of the conversation keeps its
+            // BOS (when a -sys prefix exists, the BOS already lives there);
+            // the first turn opens plainly, later turns first close the
             // previous model turn, whose <turn|> was never fed back.
-            int skip = pos == 0 ? 0 : 1;                 // tokenizer_encode always prepends BOS
+            int skip = (pos == 0) ? 0 : 1;               // tokenizer_encode always prepends BOS
             int n = 0, total = 0, best;
-            int tl = snprintf(chat, sizeof chat, pos == 0 ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
+            int idcap = in_media + in_text + (int)strlen(line) + 16 * n_seg + 192;
+            int *ids = malloc((size_t)idcap * sizeof *ids);
+            float *mrows = in_media ? malloc((size_t)in_media * m.cfg.n_embd * 4) : NULL;
+            if (!ids || (in_media && !mrows)) {
+                free(ids); free(mrows);
+                for (int i = 0; i < n_seg; i++) { free(seg[i].rows); free(seg[i].text); }
+                fprintf(stderr, "turn buffer: out of memory\n");
+                break;
+            }
+            int nid = 0, nmr = 0;
+            int tl = snprintf(chat, sizeof chat, pos == n_sys ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
             for (int i = 0; i < n_seg; i++) {
                 if (seg[i].kind == MEDIA_FRAME_TEXT) {
                     tl += snprintf(chat + tl, sizeof chat - tl, "%s", seg[i].text);
@@ -266,39 +335,72 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 tl += snprintf(chat + tl, sizeof chat - tl, "%s",
                                seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_BEG : MEDIA_AUD_BEG);
                 n = tokenizer_encode(tk, chat, promptv, 4096);
-                model_prefill(&m, &kv, promptv + skip, n - skip, pos);
-                pos += n - skip;
-                total += n - skip;
+                for (int j = skip; j < n; j++) ids[nid++] = promptv[j];
                 skip = 1;
-                model_prefill_embd(&m, &kv, seg[i].rows, seg[i].n, pos);
-                pos += seg[i].n;
-                total += seg[i].n;
+                memcpy(mrows + (size_t)nmr * m.cfg.n_embd, seg[i].rows, (size_t)seg[i].n * m.cfg.n_embd * 4);
+                for (int r = 0; r < seg[i].n; r++) ids[nid++] = -(nmr + r) - 1;
+                nmr += seg[i].n;
                 free(seg[i].rows);
                 tl = snprintf(chat, sizeof chat, "%s",
                               seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_END : MEDIA_AUD_END);
             }
             snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n", line);
             n = tokenizer_encode(tk, chat, promptv, 4096);
-            model_prefill(&m, &kv, promptv + skip, n - 1 - skip, pos);
-            pos += n - 1 - skip;
-            total += n - skip;
+            for (int j = skip; j < n - 1; j++) ids[nid++] = promptv[j];
+            model_prefill_mixed(&m, &kv, mrows, ids, nid, pos);
+            pos += nid;
+            total = nid + 1;                             // + the head forward below
+            free(ids); free(mrows);
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
-            int g = 0, fail = 0;
-            for (;; g++) {                               // stream raw token text, turn end included
+            int g = 0, fail = 0;                          // g = tokens streamed this turn
+            double t_draft = 0, t_verify = 0;
+            int n_draft = 0, n_accept = 0;
+            for (;;) {                                   // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
+                g++;
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
-                if (g + 1 >= SERVE_GEN) {                // runaway turn: end it ourselves
+                if (g >= SERVE_GEN) {                    // runaway turn: end it ourselves
                     send_piece(c, " [SERVE_GEN cap]<turn|>");
                     fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
                     break;
                 }
-                best = model_forward_next(&m, &kv, best, pos++);
+                if (!t) {                                // plain greedy decode
+                    best = model_forward_next(&m, &kv, best, pos++);
+                    continue;
+                }
+                // block-2 speculative: draft the successor of `best`, verify the
+                // pair in one forward. Greedy verify keeps the streamed text
+                // byte-identical to plain decode — only the forward count moves.
+                double s0 = now_sec();
+                int draft = mtp_draft(t, &m, &kv, best, pos);
+                double s1 = now_sec();
+                int out2[2];
+                int adv = model_forward2(&m, &kv, best, draft, pos, out2);
+                t_draft += s1 - s0;
+                t_verify += now_sec() - s1;
+                n_draft++;
+                pos += adv;
+                if (adv != 2) { best = out2[0]; continue; }   // draft rejected
+                n_accept++;                                   // confirmed — stream it too
+                if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, draft)) != 0) { fail = 1; break; }
+                g++;
+                if (draft == eot || draft == eos || pos + 1 >= SERVE_SEQ) break;
+                if (g >= SERVE_GEN) {
+                    send_piece(c, " [SERVE_GEN cap]<turn|>");
+                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                    break;
+                }
+                best = out2[1];
             }
             double dt = now_sec() - t1, dp = t1 - t0;
             fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",
                     total, dp, total / (dp > 0 ? dp : 1e-9),
-                    g + 1, dt, (g + 1) / (dt > 0 ? dt : 1e-9));
+                    g, dt, g / (dt > 0 ? dt : 1e-9));
+            if (t && n_draft)
+                fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
+                        n_accept, n_draft, 100.0 * n_accept / n_draft,
+                        n_draft, t_draft, 1e3 * t_draft / n_draft, t_verify, 1e3 * t_verify / n_draft);
             if (fail || pos + 1 >= SERVE_SEQ) break;     // client gone or context full
         }
         sock_close(c);
@@ -463,7 +565,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL;
+    const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL, *syspath = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
@@ -471,10 +573,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c") && i + 1 < argc)  cpath  = argv[++i];
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
         else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
+        else if (!strcmp(argv[i], "-sys") && i + 1 < argc) syspath = argv[++i];
     }
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
-        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-p \"prompt\" | -s <socket>]\n"
+        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-sys <skills.txt>] [-p \"prompt\" | -s <socket>]\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
@@ -487,7 +590,7 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
-    if (spath)       serve(ctx, spath, mmproj);
+    if (spath)       serve(ctx, spath, mmproj, syspath, mtp);
     else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);

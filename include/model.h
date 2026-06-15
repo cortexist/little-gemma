@@ -72,10 +72,24 @@ struct kvcache {
     int    *f16;       // per layer: 1 if rows are stored as f16 (global layers)
     void  **k;         // per layer: [seq * kv_dim] f32 or f16, NULL if reusing
     void  **v;
+    void  **px_k;      // saved system-prefix rows (see kvcache_save_prefix), or NULL
+    void  **px_v;
 };
 
 int  kvcache_init(struct kvcache *kv, const struct model *m, int max_seq);
 void kvcache_free(struct kvcache *kv);
+
+// The system-prefix trick that rescues TTFT for skills-in-context serving:
+// prefill the skills turn ONCE at server start, save its cache rows, and
+// restore them at each session start so every conversation begins at position
+// n already knowing the skills — instead of re-prefilling them per session.
+// Global layers' rows below n can never be overwritten (sessions only write
+// at their own positions), but the sliding-window RINGS wrap during a long
+// session and clobber prefix rows — restore repairs them. Per owning layer
+// the saved state is the first min(n, seq) rows, which is the exact ring
+// content at position n whether or not the prefix itself wrapped.
+void kvcache_save_prefix(struct kvcache *kv, int n);
+void kvcache_restore_prefix(struct kvcache *kv, int n);
 
 // Run one token at sequence position `pos` (0-based). Reads/writes the kv cache
 // and writes cfg.n_vocab logits into `logits` (caller-allocated). This is the
@@ -106,6 +120,22 @@ void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n
 // token's (id 0) per-layer row beside the usual projection of its embedding,
 // matching the reference; the 12B has no PLE at all.
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0);
+
+// Prefill a whole MIXED span — text tokens and media rows interleaved — as
+// one stream, so chunk boundaries ignore the text/media seams. ids[i] >= 0 is
+// a text token (embedding looked up and sqrt(n_embd)-scaled, per-layer row
+// from the id); ids[i] < 0 is media row -ids[i]-1 of rows (entered as given,
+// per-layer row id 0). This exists because a turn prefilled as separate
+// text/media/text calls pays a full weight pass for each segment's padded
+// remainder — a short camera turn spent a third of its prefill on the seams.
+void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
+                         const int *ids, int n, int pos0);
+
+// Tell the engine a media projector is loaded, so it sizes the prefill activation
+// buffers for a whole image span (up to the model's patch budget) before the decode
+// graph captures their pointers. Call once at startup after media_open, before the
+// first forward. LG_PREFILL_MAX_B caps the width (a deployment's VRAM throttle).
+void model_prefill_reserve(void);
 
 // ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
 // A tiny transformer that predicts the token AFTER next by cross-attending

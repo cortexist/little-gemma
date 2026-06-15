@@ -1,0 +1,5 @@
+# Normalize line endings to LF in both the repo and the working tree. The repo
+# builds with nvcc on Windows (A5000) and the Orin and has no CRLF-dependent
+# tooling, so LF everywhere avoids the spurious "modified" diffs that core.autocrlf
+# + cross-editor churn produce. Binaries are auto-detected and left untouched.
+* text=auto eol=lf
