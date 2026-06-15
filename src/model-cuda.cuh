@@ -549,10 +549,17 @@ __device__ __forceinline__ void fa_mma(float &c0,float &c1,float &c2,float &c3,
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
         :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1)); }
 
+// seg/bidir_hi carry Gemma's modality mask: seg[abs_pos] is a media-span id (0 for
+// text), and within a span attention is BIDIRECTIONAL (a patch sees its whole frame,
+// not just earlier patches). seg==NULL -> the kernel is byte-identical causal (text,
+// decode, verify). For a media chunk the key loop extends to bidir_hi (the span's
+// last position, which can sit past a query's own position) and same-span keys are
+// unmasked regardless of causal/window — that is the frame attending to itself.
 template<int HD, bool RING, typename KT>
 __global__ static void __launch_bounds__(256)
 flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
-                    int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head){
+                    int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
+                    const int *seg, int bidir_hi){
     const int FKB = 32, FHDW = HD/8;                       // keys/block; PV hd-slice per warp
     __shared__ __half sQ[32*HD];
     __shared__ float  sS[32*FKB];
@@ -569,7 +576,8 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         sQ[t]=(b<qn)?__float2half(q[(size_t)(qbase+b)*n_head*HD + (size_t)head*HD + i]):(__half)0; }
     __syncthreads();
     int pmax=pos0+qbase+qn-1, smin=(window>0 && pos0+qbase-window+1>0)?pos0+qbase-window+1:0;
-    for(int kb0=(smin/FKB)*FKB; kb0<=pmax; kb0+=FKB){
+    int khi = (seg && bidir_hi > pmax) ? bidir_hi : pmax;   // media chunk: reach past this tile to the span end
+    for(int kb0=(smin/FKB)*FKB; kb0<=khi; kb0+=FKB){
         int qt=warp>>2, kt=warp&3;
         float s0=0,s1=0,s2=0,s3=0;
         #pragma unroll
@@ -587,6 +595,8 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         for(int r=0;r<4;r++){
             int b=warp*4+r, pos=pos0+qbase+b, start=(window>0&&pos-window+1>0)?pos-window+1:0;
             int kabs=kb0+lane; bool ok=(lane<FKB)&&(b<qn)&&(kabs>=start)&&(kabs<=pos);
+            if(seg && !ok && lane<FKB && b<qn && kabs<=bidir_hi){   // same media span: bidirectional (bypasses causal+window)
+                int sq=seg[pos]; ok=(sq!=0)&&(sq==seg[kabs]); }
             float s=ok?sS[b*FKB+lane]:-1e30f, rmax=s;
             for(int o=16;o>0;o>>=1) rmax=fmaxf(rmax,__shfl_xor_sync(~0u,rmax,o));
             float mn=fmaxf(sm[b],rmax), corr=__expf(sm[b]-mn), p=ok?__expf(s-mn):0.0f, rsum=p;
@@ -634,11 +644,11 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
 template<int HD>
 static void launch_flash(float *dxb, const float *dq, const void *Kc, const void *Vc,
                          int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
-                         bool f16, bool ring) {
+                         bool f16, bool ring, const int *seg, int bidir_hi) {
     dim3 g(n_head, (B + 31) / 32);                         // y = 32-query tiles (B>32 prefill chunks)
-    if (f16)      flash_attn_n_kernel<HD,false,__half><<<g,256>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
-    else if (ring) flash_attn_n_kernel<HD,true, float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
-    else          flash_attn_n_kernel<HD,false,float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head);
+    if (f16)      flash_attn_n_kernel<HD,false,__half><<<g,256>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    else if (ring) flash_attn_n_kernel<HD,true, float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    else          flash_attn_n_kernel<HD,false,float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
 }
 
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
@@ -688,11 +698,6 @@ __device__ static void d_quant_block(const float *a, int n, struct actq aq) {
     int left = n - base, ng = (left < (int)blockDim.x ? left : (int)blockDim.x) / 32;
     for (int t = threadIdx.x; t < ng; t += blockDim.x)
         d_quant_group(a + base + t * 32, base / 32 + t, aq);
-}
-__global__ static void add_kernel(float *a, const float *b, int n, struct actq aq) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] += b[i];
-    d_quant_block(a, n, aq);
 }
 __global__ static void geglu_kernel(float *g, const float *u, int n, struct actq aq) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -805,6 +810,16 @@ static int kv_src_dev(const struct model *m, int L) {
 // forward_chunk*. Buffers stay allocated for the 128 max (see the pre-size in
 // model_prefill — g_xq must never realloc after the decode graph is captured).
 static int g_pf_cols = PREFILL_B;
+// Media-span attention context for the current chunk (set by forward_chunk_mixed,
+// read where chunk_layers launches flash). g_pf_seg = kv->seg when this chunk holds
+// a whole image span (bidirectional within it), NULL otherwise (causal — text,
+// decode, verify all leave it NULL). g_pf_bidir_hi = that span's last abs position.
+static const int *g_pf_seg = NULL;
+static int g_pf_bidir_hi = 0;
+// Per-position media-span ids (device), indexed by absolute position; grows to the
+// cache capacity. Only the prefill flash path reads it (decode/verify never do), so
+// it carries no captured-graph dependency and may realloc freely.
+static int *g_seg_dev = NULL; static int g_seg_cap = 0;
 
 // Resident device activation scratch (allocated once, reused across tokens).
 static float *dx, *dh, *dq, *dkb, *dvb, *dxb, *dout, *dg1, *dg2, *dpg, *dlogits;
@@ -1258,8 +1273,8 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         bool splitk = !no_splitk && B <= 2 && (hd == 256 || hd == 512);
         if (flash) {
             bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
-            if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring);
-            else           launch_flash<256>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring);
+            if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring, g_pf_seg, g_pf_bidir_hi);
+            else           launch_flash<256>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring, g_pf_seg, g_pf_bidir_hi);
             act_quantize(dxb, B * q_dim);
         } else if (share) {                                // attended K/V exceeds L2: share across queries
             const int QT = 8;                              // queries per block (one warp each)
@@ -1555,22 +1570,60 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
     ensure_scratch(m);
     prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
-    int i = 0;
-    for (; n - i >= PREFILL_B; i += PREFILL_B)
-        forward_chunk_mixed(m, kv, rows, ids + i, pos0 + i, PREFILL_B);
-    if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
-    // adaptive-width padded remainder (roundup to 32, not 128); repeating a media
-    // id repeats its row; the pad's kv is overwritten before it can be read.
-    int rem = n - i, cols = ((rem + 31) / 32) * 32;
-    if (cols > PREFILL_B) cols = PREFILL_B;
-    if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
-        int padded[PREFILL_B];
-        for (int j = 0; j < cols; j++) padded[j] = ids[i + (j < rem ? j : rem - 1)];
-        forward_chunk_mixed(m, kv, rows, padded, pos0 + i, cols);
-        if (g_graph_warmups < 2) g_graph_warmups = 2;
-        return;
+
+    // Per-position media-span ids: text -> 0, a media token -> its span's start abs
+    // position+1 (a unique nonzero). Uploaded once so the flash mask can attend
+    // bidirectionally within a frame (Gemma's image/video token-type behaviour).
+    if (kv->max_seq > g_seg_cap) {
+        if (g_seg_dev) cudaFree(g_seg_dev);
+        CUDA_CHECK(cudaMalloc(&g_seg_dev, (size_t)kv->max_seq * sizeof(int)));
+        CUDA_CHECK(cudaMemset(g_seg_dev, 0, (size_t)kv->max_seq * sizeof(int)));
+        g_seg_cap = kv->max_seq;
     }
-    for (; i < n; i++) {                              // 0-1 positions (or no room): singles
+    int seg_ok = (pos0 + n <= kv->max_seq);
+    if (seg_ok) {
+        int *hseg = (int *)malloc((size_t)n * sizeof(int));
+        int run0 = 0;
+        for (int j = 0; j < n; j++) {
+            if (ids[j] < 0) { if (j == 0 || ids[j - 1] >= 0) run0 = pos0 + j + 1; hseg[j] = run0; }
+            else hseg[j] = 0;
+        }
+        CUDA_CHECK(cudaMemcpy(g_seg_dev + pos0, hseg, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
+        free(hseg);
+    }
+
+    // Segment-aware chunking: pack greedily to PREFILL_B, but never split a media
+    // span across chunks (a frame's patches must coexist in one attention pass for
+    // bidirectional-within-frame). A span larger than a chunk falls back to causal
+    // sub-chunks (Stage 2 will widen the chunk for it). Text-only chunks pass
+    // seg=NULL -> byte-identical causal; chunking matches the old 128 path for text.
+    int i = 0;
+    while (n - i >= 2) {
+        int a = i, w = 0, media_hi = -1, toobig = 0;
+        while (a + w < n && w < PREFILL_B) {
+            if (ids[a + w] < 0) {                      // a media span: take it whole if it fits
+                int s = a + w, e = s; while (e < n && ids[e] < 0) e++;
+                int span = e - s;
+                if (span > PREFILL_B) { if (w == 0) { w = PREFILL_B; toobig = 1; } break; }
+                if (w + span > PREFILL_B) break;       // doesn't fit the remaining budget -> close chunk
+                media_hi = e - 1; w += span;
+            } else w++;                                // text
+        }
+        if (w < 1) w = 1;
+        int cols = ((w + 31) / 32) * 32; if (cols > PREFILL_B) cols = PREFILL_B;
+        if (pos0 + a + cols > kv->max_seq) break;
+        int padded[PREFILL_B];
+        for (int j = 0; j < cols; j++) padded[j] = ids[a + (j < w ? j : w - 1)];
+        static int no_bidir = -1; if (no_bidir < 0) no_bidir = getenv("LG_NO_IMG_BIDIR") != NULL;
+        int bidir = seg_ok && media_hi >= 0 && !toobig && !no_bidir;
+        g_pf_seg = bidir ? g_seg_dev : NULL;
+        g_pf_bidir_hi = bidir ? (pos0 + media_hi) : 0;
+        forward_chunk_mixed(m, kv, rows, padded, pos0 + a, cols);
+        if (g_graph_warmups < 2) g_graph_warmups = 2;
+        i = a + w;
+    }
+    g_pf_seg = NULL; g_pf_bidir_hi = 0;
+    for (; i < n; i++) {                              // 0-1 trailing positions: singles
         if (ids[i] >= 0) { forward_token(m, kv, ids[i], pos0 + i, 0); continue; }
         CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)(-ids[i] - 1) * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));
         int pos = pos0 + i;
