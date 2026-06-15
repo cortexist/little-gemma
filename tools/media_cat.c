@@ -8,7 +8,10 @@
 //     media_cat <socket> [-i photo.jpg | -a clip.wav | -t "text"]... "question"
 //
 // -t sends a text chunk that lands between media spans in the same turn —
-// the shape a video takes: -t "0:01" -i f1.jpg -t "0:02" -i f2.jpg ...
+// the shape a video takes: -t "00:00 " -i f1.jpg -t " 00:01 " -i f2.jpg ...
+// Gemma's video format is a zero-padded MM:SS timestamp, space-separated,
+// before each frame: "00:00 <|image>…<image|> 00:01 <|image>…" — the spaces
+// are part of it (they change SentencePiece tokenization).
 //
 // The split is deliberate: the model runner handles only what the model's own
 // tensors define; everything about FILE formats — JPEG entropy coding, WAV
@@ -219,9 +222,13 @@ int main(int argc, char **argv) {
     const char *spath = argc > 1 ? argv[1] : NULL;
     const char *question = NULL;
     if (!spath || argc < 3) {
-        fprintf(stderr, "usage: %s <socket> [-n budget] [-t text]... [-i image]... [-a audio]... [\"question\"]\n"
+        fprintf(stderr, "usage: %s <socket> [-n budget] [-t text]... [-i image]... [-f sec image]... [-a audio]... [\"question\"]\n"
                         "  -n: max image tokens (Gemma 4 budgets: 70/140/280/560/1120; default 280;\n"
-                        "      any value works, lower = faster prefill; place before -i)\n", argv[0]);
+                        "      any value works, lower = faster prefill; place before -i/-f)\n"
+                        "  -f: a video frame at <sec> seconds — emits Gemma's zero-padded MM:SS\n"
+                        "      timestamp before the frame. Frames come pre-decoded from upstream\n"
+                        "      (an ffmpeg sampler, or a robot's change-detector); sec is each\n"
+                        "      frame's real time, so irregular (event-driven) spacing is fine.\n", argv[0]);
         return 1;
     }
 
@@ -246,6 +253,25 @@ int main(int argc, char **argv) {
             uint8_t *rgb = prep_image(argv[++i], &w, &h);
             if (!rgb) return 1;
             fprintf(stderr, "media_cat: %s -> %dx%d (%d tokens)\n", argv[i], w, h, (w / PATCH) * (h / PATCH));
+            if (send_frame(s, MEDIA_FRAME_IMAGE, w, h, rgb, (uint32_t)(3 * w * h)) != 0) return 1;
+            free(rgb);
+            n_frames++;
+        } else if (!strcmp(argv[i], "-f") && i + 2 < argc) {
+            // a video frame at <sec>: emit Gemma's " MM:SS " (or " H:MM:SS " past an
+            // hour) timestamp text, then the frame. The upstream owns frame source
+            // and timing (YOLO event times, or ffmpeg's i/fps); media_cat owns only
+            // the format. Space-bracketed because that's the trained shape.
+            double tsec = atof(argv[++i]);
+            const char *fpath = argv[++i];
+            int w, h;
+            uint8_t *rgb = prep_image(fpath, &w, &h);
+            if (!rgb) return 1;
+            int sec = tsec > 0 ? (int)(tsec + 0.5) : 0;
+            char ts[32];
+            if (sec >= 3600) snprintf(ts, sizeof ts, " %d:%02d:%02d ", sec / 3600, (sec / 60) % 60, sec % 60);
+            else             snprintf(ts, sizeof ts, " %02d:%02d ", sec / 60, sec % 60);
+            if (send_frame(s, MEDIA_FRAME_TEXT, 0, 0, ts, (uint32_t)strlen(ts)) != 0) return 1;
+            fprintf(stderr, "media_cat: %s @%s-> %dx%d (%d tokens)\n", fpath, ts, w, h, (w / PATCH) * (h / PATCH));
             if (send_frame(s, MEDIA_FRAME_IMAGE, w, h, rgb, (uint32_t)(3 * w * h)) != 0) return 1;
             free(rgb);
             n_frames++;

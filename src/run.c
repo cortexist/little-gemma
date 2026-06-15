@@ -245,8 +245,8 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         int promptv[4096];
         for (;;) {
             // A turn: zero or more typed frames (see media.h) — media spans
-            // and 'T' text that lands between them (a video is "0:01" frame
-            // "0:02" frame ...) — then the text line. The first byte tells
+            // and 'T' text that lands between them (a video is "00:00 " frame
+            // " 00:01 " frame ...) — then the text line. The first byte tells
             // frame from line, so a text-only client speaks the same protocol
             // it always did.
             #define MAX_SEG 32
