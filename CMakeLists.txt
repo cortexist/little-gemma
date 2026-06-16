@@ -6,10 +6,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # MTP speculation block depth (verify width), the same constant the code reads via
-# include/model.h. 2 (default) = one draft + pair verify; 3 = a chained 2nd draft +
-# triple verify (1.1-1.3x over 2 on 12B). Compile-time so the verify kernel/loop stay
-# one tight parameterized path; configure -DLG_MTP_N=3 to build the deeper variant.
-set(LG_MTP_N 2 CACHE STRING "MTP speculation block depth (2 = pair verify; 3 = chained)")
+# include/model.h. DEFAULT 3 = a chained 2nd draft + triple verify (1.1-1.3x over 2 on
+# 12B, A5000 and Orin); -DLG_MTP_N=2 builds the conservative one-draft pair verify.
+# Compile-time so the verify kernel/loop stay one tight parameterized path.
+set(LG_MTP_N 3 CACHE STRING "MTP speculation block depth (3 = chained default; 2 = pair verify)")
 add_compile_definitions(LG_MTP_N=${LG_MTP_N})
 
 # Warning flags for C only (so they don't reach nvcc). The genex must be
