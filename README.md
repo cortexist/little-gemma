@@ -225,7 +225,6 @@ media_cat %TEMP%\lg.sock -i photo.jpg "What is in this image?"
 media_cat %TEMP%\lg.sock -a clip.wav  "Transcribe this."
 media_cat %TEMP%\lg.sock -t "Frame at 0:01: " -i f1.jpg -t " Frame at 0:02: " -i f2.jpg \
           "What changes between the frames?"
-media_cat %TEMP%\lg.sock -u -n 112 -i poster.jpg "Read the title text. Output only the title."
 ```
 
 A turn over the socket is zero or more typed frames — media spans, and `-t`
@@ -241,15 +240,6 @@ The runner validates geometry, not content — junk pixels are junk whether or
 not a valid JPEG wrapped them, and decoding junk is the tool's job anyway.
 At ~2 MB per maximal image, a local socket moves a frame in about a
 millisecond; the prefill it triggers costs hundreds of times more.
-
-`-n` sets the per-image token budget — a *maximum* number of 48px patches,
-from Gemma's ladder (70/140/280/560/1120; default 280). Lower trades acuity
-for a faster prefill, and a sub-budget image keeps its native grid. `-u`
-instead scales a small image *up* to fill the budget; it adds patches, not
-detail (it interpolates), so it cannot recover what the source never had —
-reach for it, and for a direct prompt like "read the title text", only when a
-small frame's text is the thing you're after. The budget is the caller's to
-size; the runner only validates geometry.
 
 Text is optional when media frames are sent: a spoken question, or a written
 note shown to the camera, is a complete turn by itself —

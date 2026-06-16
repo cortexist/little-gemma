@@ -62,35 +62,21 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 // runner only validates geometry, and the model degrades gracefully below
 // 70: a robot camera at 1 FPS reads a 24-token frame in half a second where
 // 266 takes ~2.5 s, trading acuity for latency. A budget is a MAXIMUM:
-// images already under it keep their native grid — UNLESS -u is given, which
-// scales a small image UP to fill the budget. (The reference implementation
-// this tool started from upscaled unconditionally — qwen-style preprocessing
-// it inherited, not anything Gemma's doc asks for — which silently doubled a
-// small camera frame's prefill, so the default is off. -u exists because
-// raising -n alone does NOTHING for a small source: a sub-budget image keeps
-// its native grid, so the only way to spend more patches on it is to upscale.
-// Be honest about what that buys: upscaling INTERPOLATES — it adds patches,
-// not detail. It can help a model that under-samples text its source actually
-// resolves, but it cannot recover detail the source never had, and more
-// patches is not reliably better OCR — prompt framing ("read the title text")
-// moves small-text reading more than patch count does. -u -n 112 turns a
-// 288x384 frame's 48 patches into 108; whether that helps is content- and
-// prompt-dependent, so it's the caller's call, not an automatic floor.)
+// images already under it keep their native grid. (The reference
+// implementation this tool started from also UPSCALED small images to fill
+// the budget — qwen-style preprocessing it inherited, not anything Gemma's
+// own doc asks for — which silently doubled a small camera frame's prefill.
+// Dropped: Google's doc and the latency math agree it should be.)
 static int g_max_tok = MAX_TOK;
-static int g_upscale = 0;   // -u: scale images UP to fill the budget (default: only down)
 #define RATE     16000
 #define FRAME    640
 
 // ---- image: decode -> resize to patch-multiple dims -> u8 RGB ---------------
 
-// Pick the resized (W, H): each side a multiple of the patch size, aspect ratio
-// preserved, sized to the budget. The scale factor is the same sqrt either way
-// (it reduces to sqrt(budget / native_patches) = 1/sqrt(native/budget), a
-// function of aspect ratio and budget alone), but the rounding differs by
-// direction: shrinking FLOORS (the budget is a hard ceiling — never exceed it),
-// while -u growing ROUNDS to the nearest grid (the budget is a TARGET — so a
-// 288x384 frame at -n 70 lands on 7x10=70, not floor's 7x9=63). Without -u a
-// sub-budget image keeps its native grid.
+// Pick the resized (W, H): each side a multiple of the patch size, at most the
+// budget's worth of patches in total, aspect ratio preserved (round first,
+// then sqrt-rescale down if over — the reference's rounding, minus its
+// upscale branch).
 static void target_size(int w, int h, int *ow, int *oh) {
     const float fa = (float)PATCH;
     const long long max_px = (long long)g_max_tok * PATCH * PATCH;
@@ -98,18 +84,13 @@ static void target_size(int w, int h, int *ow, int *oh) {
     int wb = (int)roundf((float)w / fa) * PATCH;
     if (hb < PATCH) hb = PATCH;
     if (wb < PATCH) wb = PATCH;
-    long long px = (long long)hb * wb;
-    if (px > max_px) {                       // over budget: shrink to fit (cap)
+    if ((long long)hb * wb > max_px) {
         float beta = sqrtf((float)h * (float)w / (float)max_px);
         hb = (int)floorf((float)h / beta / fa) * PATCH;
         wb = (int)floorf((float)w / beta / fa) * PATCH;
-    } else if (g_upscale && px < max_px) {   // -u: grow to hit the budget (target)
-        float beta = sqrtf((float)h * (float)w / (float)max_px);
-        hb = (int)roundf((float)h / beta / fa) * PATCH;
-        wb = (int)roundf((float)w / beta / fa) * PATCH;
+        if (hb < PATCH) hb = PATCH;
+        if (wb < PATCH) wb = PATCH;
     }
-    if (hb < PATCH) hb = PATCH;
-    if (wb < PATCH) wb = PATCH;
     *ow = wb; *oh = hb;
 }
 
@@ -241,12 +222,9 @@ int main(int argc, char **argv) {
     const char *spath = argc > 1 ? argv[1] : NULL;
     const char *question = NULL;
     if (!spath || argc < 3) {
-        fprintf(stderr, "usage: %s <socket> [-n budget] [-u] [-t text]... [-i image]... [-f sec image]... [-a audio]... [\"question\"]\n"
+        fprintf(stderr, "usage: %s <socket> [-n budget] [-t text]... [-i image]... [-f sec image]... [-a audio]... [\"question\"]\n"
                         "  -n: max image tokens (Gemma 4 budgets: 70/140/280/560/1120; default 280;\n"
                         "      any value works, lower = faster prefill; place before -i/-f)\n"
-                        "  -u: upscale small images to fill the budget (default: only downscale).\n"
-                        "      Use when fine text/detail in a small frame must survive — raising\n"
-                        "      -n alone won't help, the native grid is capped by source size.\n"
                         "  -f: a video frame at <sec> seconds — emits Gemma's zero-padded MM:SS\n"
                         "      timestamp before the frame. Frames come pre-decoded from upstream\n"
                         "      (an ffmpeg sampler, or a robot's change-detector); sec is each\n"
@@ -312,8 +290,6 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
             g_max_tok = atoi(argv[++i]);
             if (g_max_tok < 1) g_max_tok = 1;
-        } else if (!strcmp(argv[i], "-u")) {
-            g_upscale = 1;
         } else {
             question = argv[i];
         }
