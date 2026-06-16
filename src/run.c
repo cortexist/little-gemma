@@ -356,6 +356,9 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             int g = 0, fail = 0;                          // g = tokens streamed this turn
             double t_draft = 0, t_verify = 0;
             int n_draft = 0, n_accept = 0;
+            static int mtp_n = -1;                       // LG_MTP_N: spec depth (2 default; 3 = chained block-3)
+            if (mtp_n < 0) { const char *e = getenv("LG_MTP_N"); mtp_n = e ? atoi(e) : 2;
+                             if (mtp_n < 2) mtp_n = 2; if (mtp_n > 3) mtp_n = 3; }
             for (;;) {                                   // stream raw token text, turn end included
                 if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 g++;
@@ -369,29 +372,55 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     best = model_forward_next(&m, &kv, best, pos++);
                     continue;
                 }
-                // block-2 speculative: draft the successor of `best`, verify the
-                // pair in one forward. Greedy verify keeps the streamed text
-                // byte-identical to plain decode — only the forward count moves.
+                // speculative decode. block-2 (default): one draft, verify the pair.
+                // block-3 (LG_MTP_N=3): a chained 2nd draft, verify the triple — one
+                // weight pass for up to 3 tokens. Greedy verify keeps the streamed
+                // text byte-identical to plain decode either way.
                 double s0 = now_sec();
-                int draft = mtp_draft(t, &m, &kv, best, pos);
+                int draft1 = mtp_draft(t, &m, &kv, best, pos);
+                int draft2 = (mtp_n >= 3 && pos + 2 < SERVE_SEQ)
+                           ? mtp_draft_chain(t, &m, &kv, draft1, pos + 1) : -1;
                 double s1 = now_sec();
-                int out2[2];
-                int adv = model_forward2(&m, &kv, best, draft, pos, out2);
                 t_draft += s1 - s0;
-                t_verify += now_sec() - s1;
-                n_draft++;
-                pos += adv;
-                if (adv != 2) { best = out2[0]; continue; }   // draft rejected
-                n_accept++;                                   // confirmed — stream it too
-                if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, draft)) != 0) { fail = 1; break; }
-                g++;
-                if (draft == eot || draft == eos || pos + 1 >= SERVE_SEQ) break;
-                if (g >= SERVE_GEN) {
-                    send_piece(c, " [SERVE_GEN cap]<turn|>");
-                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
-                    break;
+                if (draft2 < 0) {                            // block-2 (or chain unavailable)
+                    int out2[2];
+                    int adv = model_forward2(&m, &kv, best, draft1, pos, out2);
+                    t_verify += now_sec() - s1;
+                    n_draft++;
+                    pos += adv;
+                    if (adv != 2) { best = out2[0]; continue; }
+                    n_accept++;
+                    if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, draft1)) != 0) { fail = 1; break; }
+                    g++;
+                    if (draft1 == eot || draft1 == eos || pos + 1 >= SERVE_SEQ) break;
+                    if (g >= SERVE_GEN) {
+                        send_piece(c, " [SERVE_GEN cap]<turn|>");
+                        fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                        break;
+                    }
+                    best = out2[1];
+                    continue;
                 }
-                best = out2[1];
+                // block-3: verify [best, draft1, draft2] as one B=3 chunk
+                int out3[3];
+                int adv = model_forward3(&m, &kv, best, draft1, draft2, pos, out3);
+                t_verify += now_sec() - s1;
+                n_draft += 2;
+                pos += adv;
+                n_accept += (adv >= 2) + (adv >= 3);
+                int brk = 0, d3[2] = { draft1, draft2 };
+                for (int e = 0; e + 1 < adv && !brk; e++) {  // stream the confirmed drafts
+                    if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, d3[e])) != 0) { fail = 1; brk = 1; break; }
+                    g++;
+                    if (d3[e] == eot || d3[e] == eos || pos + 1 >= SERVE_SEQ) { brk = 1; break; }
+                    if (g >= SERVE_GEN) {
+                        send_piece(c, " [SERVE_GEN cap]<turn|>");
+                        fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                        brk = 1; break;
+                    }
+                }
+                if (brk) break;
+                best = out3[adv - 1];
             }
             double dt = now_sec() - t1, dp = t1 - t0;
             fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",

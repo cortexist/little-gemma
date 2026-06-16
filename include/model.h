@@ -153,6 +153,14 @@ void        mtp_free(struct mtp *t);
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
               int token, int pos);
 
+// Block-3 speculation (LG_MTP_N=3): draft the token AFTER a draft, chaining on the
+// draft head's own hidden (the target never ran this position, so its hidden isn't
+// available — a chained draft is inherently weaker). Returns -1 where unsupported
+// (CPU backend, or no post-projection), so the caller falls back to a block-2 verify
+// that round.
+int mtp_draft_chain(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                    int token, int pos);
+
 // Verify a draft: feed tok0 at pos and tok1 (the draft) at pos+1 in one
 // batched step. out[0] = greedy successor of tok0 (always valid); out[1] =
 // successor of tok1 (valid only when out[0] == tok1, i.e. the draft held).
@@ -161,6 +169,11 @@ int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
 // greedy verification the emitted text is IDENTICAL to plain greedy decoding
 // — only the number of forwards per token changes.
 int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out);
+
+// The block-3 verify: tok0,tok1,tok2 at pos..pos+2 in one batched step. out[0] is
+// always valid; out[1] valid iff out[0]==tok1; out[2] iff also out[1]==tok2. Returns
+// tokens advanced (1/2/3). Output stays byte-identical to plain greedy decoding.
+int model_forward3(struct model *m, struct kvcache *kv, int tok0, int tok1, int tok2, int pos, int *out);
 
 // 1 if this backend's kvcache rows live in host memory (the CPU backend);
 // the CUDA backends keep them — and the draft head — on the device.

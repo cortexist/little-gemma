@@ -52,6 +52,16 @@ int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int 
     return 2;
 }
 
+// Block-3 verify, sequentially — same by-construction byte-identity as the pair.
+int model_forward3(struct model *m, struct kvcache *kv, int tok0, int tok1, int tok2, int pos, int *out) {
+    out[0] = model_forward_next(m, kv, tok0, pos);
+    if (out[0] != tok1) return 1;
+    out[1] = model_forward_next(m, kv, tok1, pos + 1);
+    if (out[1] != tok2) return 2;
+    out[2] = model_forward_next(m, kv, tok2, pos + 2);
+    return 3;
+}
+
 // The host draft path in mtp.c does all the work on this backend.
 #include "mtp-internal.h"
 int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
@@ -59,7 +69,16 @@ int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache
     (void)t; (void)m; (void)kv; (void)token; (void)pos;
     return -1;
 }
+int  mtp_draft_chain_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                            int token, int pos) {
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    return -1;
+}
 void mtp_free_device(struct mtp *t) { (void)t; }
+
+// CUDA-only: presizes the device prefill activation buffers before graph capture.
+// The host backend allocates per call, so there is nothing to reserve — no-op.
+void model_prefill_reserve(void) { }
 
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0.0f;

@@ -32,6 +32,8 @@ struct mtp {
 
 int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
                       int token, int pos);
+int  mtp_draft_chain_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                            int token, int pos);
 void mtp_free_device(struct mtp *t);
 
 #endif // MTP_INTERNAL_H

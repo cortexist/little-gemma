@@ -606,7 +606,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         // loads outnumber the weight load 16:1, so weight caching was never
         // the constraint. Wider loads on both sides are.)
         const float *wr = (const float *)row;
-        if (NB == 2 || (k & 3)) {                        // verify pair: decode's order, exactly
+        if (NB == 2 || NB == 3 || (k & 3)) {             // verify (B=2/3): decode's order, exactly
             for (int i = lane; i < k; i += 32) {
                 float w = wr[i];
                 for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
@@ -622,7 +622,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         }
     } else {                                             // bf16 / f16
         const uint16_t *wr = (const uint16_t *)row;
-        if (NB == 2 || (k & 7)) {                        // one uint32 = 2 elements
+        if (NB == 2 || NB == 3 || (k & 7)) {             // one uint32 = 2 elements (verify B=2/3: decode order)
             for (int i = 2 * lane; i < k; i += 64) {
                 uint32_t two = ld32(wr + i);
                 float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
@@ -1105,4 +1105,15 @@ static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d
     const unsigned char *w = rweight(t, &ts);
     int blocks = (m + 7) / 8;
     matmul_i8r_n_kernel<2><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+}
+// The B=3 verify (LG_MTP_N=3 block-3 spec): same kernel, three query columns.
+// The integer sub-block dots are order-independent, so each query is byte-identical
+// to decode just like the B=2 verify (the NB==3 guards above keep the float-aux
+// matmuls in decode order too).
+static void matmul_q_3(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
+    int blck = ggml_blck_size(t->type), ts;
+    const unsigned char *w = rweight(t, &ts);
+    int blocks = (m + 7) / 8;
+    matmul_i8r_n_kernel<3><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }

@@ -741,7 +741,7 @@ static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
 
 static void ensure_weights(struct model *m) {
-    ensure_split(2 * m->cfg.n_head);      // split-K scratch (2*n_head slots covers both decode B=1 and the B=2 verify); alloc here (pre-capture) — decode/verify have no warmup after a chunked prefill
+    ensure_split(3 * m->cfg.n_head);      // split-K scratch (3*n_head covers decode B=1, the B=2 verify, and the B=3 block-3 verify); alloc here (pre-capture) — decode/verify have no warmup after a chunked prefill
     if (d_blob) return;
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
@@ -827,6 +827,11 @@ extern "C" void model_prefill_reserve(void) {
 // forward_chunk*. Buffers stay allocated for the 128 max (see the pre-size in
 // model_prefill — g_xq must never realloc after the decode graph is captured).
 static int g_pf_cols = PREFILL_B;
+// 1 while a B=3 MTP verify chunk is being issued: forces decode's byte-identical
+// split-K attention instead of the prefill flash / K-sharing kernels that a B>2
+// chunk would otherwise pick (those relax float order and would diverge from plain
+// greedy). The B<=2 verify already dodges them via the B<=2 split-K gate.
+static int g_chunk_verify = 0;
 // Media-span attention context for the current chunk (set by forward_chunk_mixed,
 // read where chunk_layers launches flash). g_pf_seg = kv->seg when this chunk holds
 // a whole image span (bidirectional within it), NULL otherwise (causal — text,
@@ -845,6 +850,8 @@ static float *g_hidden;                 // post-output-norm hidden of the last
                                         // head's h_prev; 15 KB, copied per token)
 static float *d_logits2;                // MTP verify: logits at both pair rows
 static int *d_best2;                    // MTP verify: argmax of each row
+static float *d_logits3;                // block-3 verify (LG_MTP_N=3): logits at 3 rows
+static int *d_best3;                    // block-3 verify: argmax of each row
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
 static int *d_pos;                      // device-resident token position (for static graph)
 static int *d_best;                     // device-side argmax result
@@ -889,6 +896,8 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&g_hidden, (size_t)ne * 4));
     CUDA_CHECK(cudaMalloc(&d_logits2, (size_t)2 * c->n_vocab * 4));   // MTP verify pair
     CUDA_CHECK(cudaMalloc(&d_best2, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_logits3, (size_t)3 * c->n_vocab * 4));   // block-3 verify (LG_MTP_N=3)
+    CUDA_CHECK(cudaMalloc(&d_best3, 3 * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
@@ -917,6 +926,7 @@ static void ensure_scratch(struct model *m) {
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
+static void matmul_q_3(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m);
 static void matmul_coverage_print(void);
 static struct actq actq_for(int k);
 static void act_quantize(const float *d_x, int k);
@@ -1279,15 +1289,15 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
         static int no_splitk = -1;
         if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
-        bool flash = !no_flash && B > 2 && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
-        bool share = (B > 2) && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
+        bool flash = !no_flash && B > 2 && !g_chunk_verify && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
+        bool share = (B > 2) && !g_chunk_verify && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
         // The B<=2 MTP verify runs the SAME split-K kernel as decode (one extra
         // grid axis for the 2 query rows): out[0]/out[1] then byte-match plain
         // decode's forwards at pos/pos+1 by construction, and verify's attention
         // gets the split-K parallelism win at high context. Per-query stays as the
         // LG_NO_SPLITK fallback (and there decode is per-query too, so they still
         // match). Mirrors decode's gate (decode-side LG_NO_SPLITK is independent).
-        bool splitk = !no_splitk && B <= 2 && (hd == 256 || hd == 512);
+        bool splitk = !no_splitk && (B <= 2 || g_chunk_verify) && (hd == 256 || hd == 512);
         if (flash) {
             bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
             if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring, g_pf_seg, g_pf_bidir_hi);
@@ -1762,6 +1772,71 @@ extern "C" int model_forward2(struct model *m, struct kvcache *kv, int tok0, int
     return adv;
 }
 
+// ---- block-3 verify (LG_MTP_N=3): tok0,tok1,tok2 as one B=3 chunk + head at all
+// three rows. Same shape as the B=2 verify, just one more column; byte-identity is
+// preserved (matmul_q_3's integer dots are order-independent like matmul_q_2's).
+static void verify_head3(struct model *m) {
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+    rmsnorm_kernel<<<3, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(3 * n_embd));
+    matmul_q_3(d_logits3, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
+    if (c->logit_softcap > 0.0f)
+        softcap_kernel<<<gridn(3 * c->n_vocab), 256>>>(d_logits3, c->logit_softcap, 3 * c->n_vocab);
+    argmax_kernel<<<1, 1024>>>(d_logits3,                    c->n_vocab, d_best3);
+    argmax_kernel<<<1, 1024>>>(d_logits3 + c->n_vocab,       c->n_vocab, d_best3 + 1);
+    argmax_kernel<<<1, 1024>>>(d_logits3 + 2 * c->n_vocab,   c->n_vocab, d_best3 + 2);
+}
+static void verify_layers_and_head3(struct model *m, struct kvcache *kv, int has_ple) {
+    g_chunk_verify = 1;                        // B=3 verify uses decode's split-K attn, not flash/share
+    chunk_layers(m, kv, has_ple, 3, matmul_q_3);
+    g_chunk_verify = 0;
+    verify_head3(m);
+}
+static cudaGraphExec_t g_graph3_exec = NULL;
+static int g_graph3_warmups = 0;
+static void verify_graph3(struct model *m, struct kvcache *kv, int has_ple) {
+    if (g_graph3_warmups < 2) { g_graph3_warmups++; verify_layers_and_head3(m, kv, has_ple); return; }
+    if (!g_graph3_exec) {
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        verify_layers_and_head3(m, kv, has_ple);
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&g_graph3_exec, graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaGraphLaunch(g_graph3_exec, cudaStreamPerThread));
+}
+
+extern "C" int model_forward3(struct model *m, struct kvcache *kv, int tok0, int tok1, int tok2, int pos, int *out) {
+    const struct config *c = &m->cfg;
+    const int n_embd = c->n_embd;
+    int toks[3] = { tok0, tok1, tok2 };
+    float *rows = (float *)malloc((size_t)3 * n_embd * 4);
+    if (!rows) { fprintf(stderr, "model_forward3: out of memory\n"); exit(1); }
+    float es = sqrtf((float)n_embd);
+    for (int j = 0; j < 3; j++) {
+        float *erow = dequantize_row(wq(m, "token_embd.weight"), toks[j], n_embd);
+        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
+        free(erow);
+    }
+    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)3 * n_embd * 4, cudaMemcpyHostToDevice));
+    free(rows);
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+
+    int has_ple = model_has_ple(m);
+    if (has_ple) build_per_layer_n(m, toks, 3, matmul_q_3);
+    verify_graph3(m, kv, has_ple);
+    CUDA_CHECK(cudaMemcpy(out, d_best3, 3 * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // accept chain: out[0] = greedy successor of tok0 (always valid); out[1] valid
+    // iff out[0]==tok1; out[2] valid iff also out[1]==tok2.
+    int adv = 1;
+    if (out[0] == tok1) { adv = 2; if (out[1] == tok2) adv = 3; }
+    CUDA_CHECK(cudaMemcpyAsync(g_hidden, dx + (size_t)(adv - 1) * n_embd, (size_t)n_embd * 4,
+                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    return adv;
+}
+
 // ==== MTP: the draft head, on the device =====================================
 // The gemma4-assistant forward from src/mtp.c as ~30 kernel launches per
 // draft. Almost everything is REUSE: rmsnorm_kernel (pre/post norms and, with
@@ -1827,7 +1902,7 @@ struct mtp_ld {
 };
 struct mtp_cuda {
     struct mtp_ld *l;
-    __half *pre, *head;
+    __half *pre, *post, *head;
     float *out_norm;
     float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *logits;            // device scratch
     int *d_tok;
@@ -1864,6 +1939,12 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
     mc->pre  = mtp_up_h(t->pre);
     mc->head = mtp_up_h(t->head);
     mc->out_norm = mtp_up_f(t->out_norm, (size_t)t->n_inner);
+    // post-projection (next-token), ni->nb: lifts the head's own hidden back to
+    // model width to chain a 2nd draft (LG_MTP_N=3 block-3). Optional — left NULL
+    // (block-3 chaining disabled) if it's absent or not the expected ni->nb shape.
+    if (t->post && t->post->n_dims == 2 &&
+        (int)t->post->dims[0] == t->n_inner && (int)t->post->dims[1] == t->n_bb)
+        mc->post = mtp_up_h(t->post);
     int ok = mc->l && mc->pre && mc->head && mc->out_norm;
     int q_max = 0;
     for (int L = 0; ok && L < t->n_layer; L++) {
@@ -1906,7 +1987,9 @@ static void mtp_draft_launches(struct mtp *t, const struct model *m, const struc
     const int ni = t->n_inner, nb = t->n_bb, nff = t->n_ff;
     const float eps = t->eps;
 
-    CUDA_CHECK(cudaMemcpyAsync(mc->cat + nb, g_hidden, (size_t)nb * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    // cat (= [sqrt-scaled embed(token), h_prev]) is filled by the caller BEFORE
+    // this runs, so the captured graph is identical for draft 1 (h_prev=g_hidden)
+    // and the chained draft 2 (h_prev=post(head hidden)).
     mtp_matvec_h<<<gridn(ni * 32), 256>>>(mc->x, mc->pre, mc->cat, 2 * nb, ni);
 
     for (int L = 0; L < t->n_layer; L++) {
@@ -1969,6 +2052,9 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
     CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
     free(erow);
     CUDA_CHECK(cudaMemcpy(mc->d_dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+    // draft 1 chains on the TARGET's hidden (g_hidden); filled here, outside the
+    // captured head-pass graph, so the chained draft 2 can reuse the same graph.
+    CUDA_CHECK(cudaMemcpyAsync(mc->cat + nb, g_hidden, (size_t)nb * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
 
     if (mc->warmups < 2) {
         mc->warmups++;
@@ -1990,6 +2076,38 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
     return best;
 }
 
+// The chained draft for block-3 (LG_MTP_N=3): draft the token after `token` (itself
+// the previous draft, sitting at `pos`-1) using the head's OWN hidden from the prior
+// draft (mc->x, lifted ni->nb by the post-projection) as h_prev — the target never
+// ran this position, so its hidden isn't available, which is why a chained draft is
+// inherently weaker. Reuses draft 1's captured head-pass graph; cat is filled here
+// before the launch. Returns -1 if the post-projection is unavailable (no chaining).
+extern "C" int mtp_draft_chain_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                                      int token, int pos) {
+    if (t->cuda == (void *)-1) return -1;
+    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
+    if (!mc || !mc->post) return -1;
+    const int nb = t->n_bb, ni = t->n_inner;
+
+    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
+    if (!erow) return -1;
+    float sc = sqrtf((float)nb);
+    for (int i = 0; i < nb; i++) erow[i] *= sc;
+    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
+    free(erow);
+    // h_prev = post(previous draft's head hidden in mc->x); runs before the graph's
+    // pre-projection overwrites mc->x (same stream -> ordered).
+    mtp_matvec_h<<<gridn(nb * 32), 256>>>(mc->cat + nb, mc->post, mc->x, ni, nb);
+    CUDA_CHECK(cudaMemcpy(mc->d_dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+
+    if (mc->graph) CUDA_CHECK(cudaGraphLaunch(mc->graph, cudaStreamPerThread));
+    else           mtp_draft_launches(t, m, kv, mc);   // graph not captured yet (warmup rounds)
+
+    int best = -1;
+    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
+    return best;
+}
+
 extern "C" void mtp_free_device(struct mtp *t) {
     struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
     if (!mc || t->cuda == (void *)-1) return;
@@ -1999,7 +2117,7 @@ extern "C" void mtp_free_device(struct mtp *t) {
         cudaFree(d->ffn_norm); cudaFree(d->post_ffw);
         cudaFree(d->q); cudaFree(d->o); cudaFree(d->gate); cudaFree(d->up); cudaFree(d->down);
     }
-    cudaFree(mc->pre); cudaFree(mc->head); cudaFree(mc->out_norm);
+    cudaFree(mc->pre); cudaFree(mc->post); cudaFree(mc->head); cudaFree(mc->out_norm);
     cudaFree(mc->cat); cudaFree(mc->x); cudaFree(mc->h); cudaFree(mc->q); cudaFree(mc->xb);
     cudaFree(mc->o); cudaFree(mc->g1); cudaFree(mc->g2); cudaFree(mc->logits); cudaFree(mc->d_tok);
     cudaFree(mc->d_dpos);
