@@ -282,20 +282,31 @@ regressions, so one draft per round it is). Verification is greedy, which
 buys the strongest property speculative decoding can have: **the output is
 byte-identical to plain greedy decoding, always** — the only things that move
 are tokens/s and the acceptance rate the stats line reports. Acceptance is
-content-dependent: ~85% on short factual answers, ~70% on lists, ~45% on
-creative prose, where the future is genuinely harder to guess.
+content-driven: ~100% on counting, ~68–83% on code, ~55–74% on prose — the
+harder the next token is to guess, the lower it falls.
 
-Whether MTP *pays* is decided by the hardware, not the math. Each round
-needs two device-to-host syncs (the draft token feeds the verify's inputs);
-on Windows/WDDM those cost milliseconds and MTP loses outright, while on a
-Jetson Orin NX it wins **+9% on prose and +38% on counting/structured output**
-— because a B=2 verify is nearly the cost of one decode pass on a
-bandwidth-bound device, so high acceptance buys close to two tokens per pass.
-The speculative loop runs in the **socket server**, not only the `-p` one-shot,
-so the short structured replies the edge target produces (TTS lines, JSON tags)
-get that near-doubling in production. The full story — including the
-uncached-zero-copy bug the verify exposed in the chunk matmul, and the split-K
-verify that makes `-mtp == plain` byte-identical *by construction* — is in the
+Whether MTP *pays* comes down to acceptance × verify cost, and on every target
+measured it pays. A B=2 verify costs nearly one decode pass, so a held draft is
+almost a free token. Measured in the **socket server** — steady-state, the way
+it actually runs (a one-shot `-p` mismeasures it; see the trap below) — both
+models speed up on **both** the A5000 and the Jetson:
+
+| model | counting (~100%) | code (~68–83%) | prose (~55–74%) |
+|-------|-----------------:|---------------:|----------------:|
+| E4B (A5000 / Orin) | 1.58× / 1.50× | 1.39× / 1.26× | 1.23× / 1.16× |
+| 12B (A5000 / Orin) | 1.63× / 1.43× | 1.48× / 1.30× | 1.42× / 1.22× |
+
+The 12B's wider draft head (1024 vs E4B's 256) accepts more on hard content, so
+it gains the most. **A measurement trap worth recording:** the draft head pays
+a one-time **~3.6 s CUDA-graph warmup on its *first* call**, mid-generation — and
+a one-shot `run -p` charges all of it to that single short run, which makes MTP
+look like a regression. An earlier version of these tables did exactly that and
+wrongly concluded *"MTP loses on Windows."* In the server the warmup is paid
+once, at the first turn, and amortizes to nothing — so MTP must be benchmarked
+in serve mode with the first turn discarded. Greedy verification keeps the
+output **byte-identical to plain decoding**, and the split-K verify makes
+`-mtp == plain` byte-identical *by construction* — the full story, including the
+uncached-zero-copy bug the verify exposed in the chunk matmul, is in the
 [performance journal](docs/performance-journal.md).
 
 ## On SIMD (AVX2) — intentionally not implemented
@@ -348,39 +359,39 @@ attention** for the prompt phase added +44% on top (E4B prefill ~183 tok/s,
 12B ~98). The decode side gained a **split-K (FlashDecoding)** attention for
 long context, and speculative decoding finally reached the **socket server**
 (it had been quietly running plain) — where, on the short structured outputs
-the edge target produces, it nearly doubles decode. The full log, dead ends
+the edge target produces, it speeds decode up to ~1.6×. The full log, dead ends
 and bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
 
 Where things stand — both sides re-measured the same day on the same machine,
 same prompt (little-gemma = `run-cuda-i8r`, 256 generated tokens, warm;
-llama.cpp = `llama-bench tg32`; MTP acceptance in parentheses, on creative
-prose — its hardest content):
+llama.cpp = `llama-bench tg32`). These rows are **plain decode**; MTP is a
+further 1.2–1.6× on top of them (the table above):
 
 **RTX A5000 (Windows):**
 
-| model | size | params | little-gemma | + MTP | llama.cpp CUDA | ratio |
-|-------|-----:|-------:|-------------:|------:|---------------:|------:|
-| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.3 | 141.9 (42%) | 148.4 ± 6.6 | **1.23×** |
-| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.7 | 101.9 (45%) | 116.3 ± 1.3 | 0.99× |
-| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.5 |  42.0 (58%) |  64.3 ± 0.3 | 0.94× |
+| model | size | params | little-gemma | llama.cpp CUDA | ratio |
+|-------|-----:|-------:|-------------:|---------------:|------:|
+| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.3 | 148.4 ± 6.6 | **1.23×** |
+| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.7 | 116.3 ± 1.3 | 0.99× |
+| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.5 |  64.3 ± 0.3 | 0.94× |
 
 **Jetson Orin NX 16GB (Linux, integrated GPU, zero-copy weights):**
 
-| model | little-gemma | + MTP | llama.cpp CUDA | best ratio |
-|-------|-------------:|------:|---------------:|-----------:|
-| E4B Q4_K_M | 16.80 | **17.76** (49%) | 13.36 ± 0.04 | **1.33×** |
-| 12B Q4_K_M |  8.27 |   7.79 (51%) |  7.04 ± 0.04 | **1.17×** |
+| model | little-gemma | llama.cpp CUDA | ratio |
+|-------|-------------:|---------------:|------:|
+| E4B Q4_K_M | 16.80 | 13.36 ± 0.04 | **1.26×** |
+| 12B Q4_K_M |  8.27 |  7.04 ± 0.04 | **1.17×** |
 
 The pattern is the project's thesis in two tables. The smaller the model, the
 more decode speed is about everything *around* the matmul — launch overhead,
 sync round-trips, norms, the PLE path — which a few thousand readable lines can
 do leanly. The bigger the model, the more it reduces to sustained DRAM
 bandwidth through the quantized matmul, where llama.cpp's arch-tuned kernels
-still hold a few percent on desktop. And whether a *feature* pays is decided
-per device: MTP loses on Windows (WDDM prices its two per-round syncs in
-milliseconds) and wins on the Jetson — same binary, byte-identical output on
-both, faster only where the hardware says so. On the edge device this project
-actually targets, every row is ahead.
+still hold a few percent on desktop. On top of plain decode, MTP adds a further
+1.2–1.6× — serve-mode, byte-identical output — on **both** the desktop and the
+Jetson (the earlier "loses on Windows" reading was a one-shot-`-p` warmup
+artifact, corrected above). On the edge device this project actually targets,
+every row is ahead, and MTP widens the lead.
 
 Those tables are **decode** — the project's strong axis. **Prefill** (prompt
 processing) is the honest weak axis: it is weight-bandwidth-bound, and
@@ -415,29 +426,29 @@ is for.
 
 | directory | files | code  |
 |-----------|-------|------:|
-| src       | 15    | 5,634 |
-| include   | 6     |   248 |
+| src       | 15    | 5,713 |
+| include   | 6     |   249 |
 
-~5,900 lines of code in the repository (the original 3,000 exploring ceiling was
+~5,950 lines of code in the repository (the original 3,000 exploring ceiling was
 retired when the sandbox phase began; `tools/` and the vendored
 `vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
 backends are mutually exclusive, so no single program is anywhere near that.
 Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
-multimodal embedders, the MTP draft head, CLI + socket server — 2,589 lines)
+multimodal embedders, the MTP draft head, CLI + socket server — 2,591 lines)
 plus exactly one backend:
 
-| binary        | backend on top of the shared 2,589                       | code lines |
+| binary        | backend on top of the shared 2,591                       | code lines |
 |---------------|----------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                            |      2,949 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,464 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,190 |
+| `run`         | `model-cpu.c`                                            |      2,951 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,532 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,270 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every
 model it runs — multi-turn socket serving, batched prefill, a ring-buffered
 f16 KV cache, tensor-core flash-attention prefill, split-K decode, image and
 audio understanding, a GPU vision encoder, and byte-identical speculative
-decoding included — is **about 5,200 lines of C end to end**, tokenizer and all.
+decoding included — is **about 5,300 lines of C end to end**, tokenizer and all.
 
 ## Validation
 
