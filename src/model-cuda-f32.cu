@@ -115,12 +115,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     for (int j = 0; j < g_pf_cols; j++)
         matmul_q(d_out + (size_t)j * m, t, d_x + (size_t)j * k, k, m);
 }
-static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    for (int j = 0; j < 2; j++)
-        matmul_q(d_out + (size_t)j * m, t, d_x + (size_t)j * k, k, m);
-}
-static void matmul_q_3(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    for (int j = 0; j < 3; j++)
+static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    for (int j = 0; j < LG_MTP_N; j++)
         matmul_q(d_out + (size_t)j * m, t, d_x + (size_t)j * k, k, m);
 }
 static void matmul_coverage_print(void) {}   // the readable backend keeps no books

@@ -45,21 +45,16 @@ void kvcache_restore_prefix(struct kvcache *kv, int n) {
 // The verify pair, sequentially: byte-identical to plain decoding by
 // construction (they ARE the same forwards), and last_hidden lands on the
 // last valid position automatically — the second forward only runs on accept.
-int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
-    out[0] = model_forward_next(m, kv, tok0, pos);
-    if (out[0] != tok1) return 1;
-    out[1] = model_forward_next(m, kv, tok1, pos + 1);
-    return 2;
-}
-
-// Block-3 verify, sequentially — same by-construction byte-identity as the pair.
-int model_forward3(struct model *m, struct kvcache *kv, int tok0, int tok1, int tok2, int pos, int *out) {
-    out[0] = model_forward_next(m, kv, tok0, pos);
-    if (out[0] != tok1) return 1;
-    out[1] = model_forward_next(m, kv, tok1, pos + 1);
-    if (out[1] != tok2) return 2;
-    out[2] = model_forward_next(m, kv, tok2, pos + 2);
-    return 3;
+// The MTP verify, sequentially — LG_MTP_N forwards, byte-identical to plain decode by
+// construction (they ARE the same forwards). The next forward only runs while the
+// previous draft held, so last_hidden lands on the last valid position automatically.
+int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out) {
+    int j = 0;
+    do {
+        out[j] = model_forward_next(m, kv, toks[j], pos + j);
+        j++;
+    } while (j < LG_MTP_N && out[j - 1] == toks[j]);
+    return j;
 }
 
 // The host draft path in mtp.c does all the work on this backend.
