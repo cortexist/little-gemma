@@ -426,29 +426,29 @@ is for.
 
 | directory | files | code  |
 |-----------|-------|------:|
-| src       | 15    | 5,634 |
-| include   | 6     |   248 |
+| src       | 15    | 5,713 |
+| include   | 6     |   249 |
 
-~5,900 lines of code in the repository (the original 3,000 exploring ceiling was
+~5,950 lines of code in the repository (the original 3,000 exploring ceiling was
 retired when the sandbox phase began; `tools/` and the vendored
 `vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
 backends are mutually exclusive, so no single program is anywhere near that.
 Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
-multimodal embedders, the MTP draft head, CLI + socket server — 2,589 lines)
+multimodal embedders, the MTP draft head, CLI + socket server — 2,591 lines)
 plus exactly one backend:
 
-| binary        | backend on top of the shared 2,589                       | code lines |
+| binary        | backend on top of the shared 2,591                       | code lines |
 |---------------|----------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                            |      2,949 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,464 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,190 |
+| `run`         | `model-cpu.c`                                            |      2,951 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,532 |
+| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,270 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every
 model it runs — multi-turn socket serving, batched prefill, a ring-buffered
 f16 KV cache, tensor-core flash-attention prefill, split-K decode, image and
 audio understanding, a GPU vision encoder, and byte-identical speculative
-decoding included — is **about 5,200 lines of C end to end**, tokenizer and all.
+decoding included — is **about 5,300 lines of C end to end**, tokenizer and all.
 
 ## Validation
 
