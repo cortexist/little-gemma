@@ -250,6 +250,17 @@ void mtp_free(struct mtp *t) {
 // chose it — comes from the backend: model.last_hidden here, a device buffer
 // on CUDA. The target cache holds positions < pos only — exactly the
 // cross-attention this head was trained on.
+// Block-3 chained draft: device-only — the CUDA backend chains on the head's own
+// hidden via the post-projection. The CPU host draft does not chain (block-3 is a
+// CUDA experiment), so it returns -1 and the caller falls back to a block-2 verify.
+int mtp_draft_chain(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                    int token, int pos) {
+    if (!model_kv_host)
+        return mtp_draft_chain_device(t, m, kv, token, pos);
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    return -1;
+}
+
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
               int token, int pos) {
     if (!model_kv_host)

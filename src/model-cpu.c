@@ -45,11 +45,16 @@ void kvcache_restore_prefix(struct kvcache *kv, int n) {
 // The verify pair, sequentially: byte-identical to plain decoding by
 // construction (they ARE the same forwards), and last_hidden lands on the
 // last valid position automatically — the second forward only runs on accept.
-int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out) {
-    out[0] = model_forward_next(m, kv, tok0, pos);
-    if (out[0] != tok1) return 1;
-    out[1] = model_forward_next(m, kv, tok1, pos + 1);
-    return 2;
+// The MTP verify, sequentially — LG_MTP_N forwards, byte-identical to plain decode by
+// construction (they ARE the same forwards). The next forward only runs while the
+// previous draft held, so last_hidden lands on the last valid position automatically.
+int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out) {
+    int j = 0;
+    do {
+        out[j] = model_forward_next(m, kv, toks[j], pos + j);
+        j++;
+    } while (j < LG_MTP_N && out[j - 1] == toks[j]);
+    return j;
 }
 
 // The host draft path in mtp.c does all the work on this backend.
@@ -59,7 +64,16 @@ int  mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache
     (void)t; (void)m; (void)kv; (void)token; (void)pos;
     return -1;
 }
+int  mtp_draft_chain_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                            int token, int pos) {
+    (void)t; (void)m; (void)kv; (void)token; (void)pos;
+    return -1;
+}
 void mtp_free_device(struct mtp *t) { (void)t; }
+
+// CUDA-only: presizes the device prefill activation buffers before graph capture.
+// The host backend allocates per call, so there is nothing to reserve — no-op.
+void model_prefill_reserve(void) { }
 
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0.0f;

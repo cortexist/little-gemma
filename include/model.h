@@ -137,6 +137,14 @@ void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
 // first forward. LG_PREFILL_MAX_B caps the width (a deployment's VRAM throttle).
 void model_prefill_reserve(void);
 
+// MTP speculation block depth (verify width), a COMPILE-TIME constant. DEFAULT 3: a
+// chained 2nd draft + triple verify, 1.1-1.3x over block-2 on 12B (A5000 and Orin),
+// output byte-identical. Build -DLG_MTP_N=2 for the conservative one-draft pair verify;
+// N generalizes. Recompile to change.
+#ifndef LG_MTP_N
+#define LG_MTP_N 3
+#endif
+
 // ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------
 // A tiny transformer that predicts the token AFTER next by cross-attending
 // straight into the target's KV cache (it has no K/V projections of its own).
@@ -153,14 +161,21 @@ void        mtp_free(struct mtp *t);
 int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
               int token, int pos);
 
-// Verify a draft: feed tok0 at pos and tok1 (the draft) at pos+1 in one
-// batched step. out[0] = greedy successor of tok0 (always valid); out[1] =
-// successor of tok1 (valid only when out[0] == tok1, i.e. the draft held).
-// Returns tokens advanced: 2 on accept, 1 on reject. The backend leaves its
-// h_prev at the last valid position either way, so drafting chains. With
-// greedy verification the emitted text is IDENTICAL to plain greedy decoding
-// — only the number of forwards per token changes.
-int model_forward2(struct model *m, struct kvcache *kv, int tok0, int tok1, int pos, int *out);
+// Chained draft for LG_MTP_N>2: draft the token AFTER a draft, on the draft head's
+// own hidden (the target never ran this position, so its hidden isn't available — a
+// chained draft is inherently weaker). Returns -1 where unsupported (CPU backend, or
+// no post-projection); the caller then pads that slot so the verify just rejects it.
+int mtp_draft_chain(struct mtp *t, const struct model *m, const struct kvcache *kv,
+                    int token, int pos);
+
+// Verify a block of LG_MTP_N tokens in one batched step: toks[0] is the freshly
+// chosen token (at pos), toks[1..] the drafts (at pos+1..pos+LG_MTP_N-1). out[j] =
+// greedy successor of toks[j]; out[0] is always valid, out[j] valid only when every
+// earlier draft held. Returns tokens advanced (1..LG_MTP_N: the run of drafts that
+// held, +1). The backend leaves h_prev at the last valid position so drafting chains.
+// Greedy verification keeps the emitted text IDENTICAL to plain greedy decoding —
+// only the number of target forwards per token changes.
+int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out);
 
 // 1 if this backend's kvcache rows live in host memory (the CPU backend);
 // the CUDA backends keep them — and the draft head — on the device.

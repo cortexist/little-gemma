@@ -606,7 +606,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         // loads outnumber the weight load 16:1, so weight caching was never
         // the constraint. Wider loads on both sides are.)
         const float *wr = (const float *)row;
-        if (NB == 2 || (k & 3)) {                        // verify pair: decode's order, exactly
+        if (NB == LG_MTP_N || (k & 3)) {                 // verify (B=LG_MTP_N): decode's order, exactly
             for (int i = lane; i < k; i += 32) {
                 float w = wr[i];
                 for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
@@ -622,7 +622,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         }
     } else {                                             // bf16 / f16
         const uint16_t *wr = (const uint16_t *)row;
-        if (NB == 2 || (k & 7)) {                        // one uint32 = 2 elements
+        if (NB == LG_MTP_N || (k & 7)) {                 // one uint32 = 2 elements (verify B=LG_MTP_N: decode order)
             for (int i = 2 * lane; i < k; i += 64) {
                 uint32_t two = ld32(wr + i);
                 float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
@@ -1099,10 +1099,13 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             d_out + (size_t)c0 * m, w, (int)t->type, ts, blck, d_x + (size_t)c0 * k,
             g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
 }
-static void matmul_q_2(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+// The MTP verify matmul: LG_MTP_N query columns in one launch. Byte-identical to
+// decode per query — the integer sub-block dots are order-independent for any NB,
+// and the NB==LG_MTP_N float-aux guards above keep the float matmuls in decode order.
+static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     int blocks = (m + 7) / 8;
-    matmul_i8r_n_kernel<2><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }

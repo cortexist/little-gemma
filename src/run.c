@@ -42,6 +42,31 @@ static double now_sec(void) {
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+// One block-LG_MTP_N speculative step (shared by serve and -p): draft LG_MTP_N-1
+// tokens (chained for the 2nd+), then verify the LG_MTP_N batch in one weight pass.
+// Fills toks[LG_MTP_N] (toks[0]=best) and out[LG_MTP_N]; returns adv (1..LG_MTP_N) =
+// the run of drafts that held, +1. Accumulates draft/verify time and draft/accept
+// counts. An unavailable draft (no head / no chaining) is padded so the verify just
+// rejects it. Greedy verify keeps the emitted text byte-identical to plain decode.
+static int mtp_step(struct mtp *t, struct model *m, struct kvcache *kv, int best, int pos,
+                    int *toks, int *out, double *t_draft, double *t_verify, int *n_draft, int *n_accept) {
+    double s0 = now_sec();
+    toks[0] = best;
+    int d = mtp_draft(t, m, kv, best, pos);
+    toks[1] = d >= 0 ? d : best;
+    for (int j = 2; j < LG_MTP_N; j++) {
+        int dj = mtp_draft_chain(t, m, kv, toks[j - 1], pos + j - 1);
+        toks[j] = dj >= 0 ? dj : toks[j - 1];
+    }
+    double s1 = now_sec();
+    int adv = model_forward_spec(m, kv, toks, pos, out);
+    *t_draft += s1 - s0;
+    *t_verify += now_sec() - s1;
+    *n_draft += LG_MTP_N - 1;
+    *n_accept += adv - 1;
+    return adv;
+}
+
 // Print a token's text with the ▁ marker (U+2581 = e2 96 81) rendered as a space.
 static void print_piece(const char *s) {
     if (!s) return;
@@ -365,33 +390,29 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
                     break;
                 }
-                if (!t) {                                // plain greedy decode
+                if (!t || pos + LG_MTP_N - 1 >= SERVE_SEQ) {   // plain decode: no head, or no room for a full spec block
                     best = model_forward_next(&m, &kv, best, pos++);
                     continue;
                 }
-                // block-2 speculative: draft the successor of `best`, verify the
-                // pair in one forward. Greedy verify keeps the streamed text
-                // byte-identical to plain decode — only the forward count moves.
-                double s0 = now_sec();
-                int draft = mtp_draft(t, &m, &kv, best, pos);
-                double s1 = now_sec();
-                int out2[2];
-                int adv = model_forward2(&m, &kv, best, draft, pos, out2);
-                t_draft += s1 - s0;
-                t_verify += now_sec() - s1;
-                n_draft++;
+                // block-LG_MTP_N speculation: draft LG_MTP_N-1 tokens (chained), verify
+                // the batch in one weight pass — up to LG_MTP_N tokens for one pass's
+                // weight traffic. Greedy verify keeps the streamed text byte-identical.
+                int toks[LG_MTP_N], out[LG_MTP_N];
+                int adv = mtp_step(t, &m, &kv, best, pos, toks, out, &t_draft, &t_verify, &n_draft, &n_accept);
                 pos += adv;
-                if (adv != 2) { best = out2[0]; continue; }   // draft rejected
-                n_accept++;                                   // confirmed — stream it too
-                if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, draft)) != 0) { fail = 1; break; }
-                g++;
-                if (draft == eot || draft == eos || pos + 1 >= SERVE_SEQ) break;
-                if (g >= SERVE_GEN) {
-                    send_piece(c, " [SERVE_GEN cap]<turn|>");
-                    fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
-                    break;
+                int brk = 0;
+                for (int e = 1; e < adv && !brk; e++) {  // stream the confirmed drafts toks[1..adv-1]
+                    if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, toks[e])) != 0) { fail = 1; brk = 1; break; }
+                    g++;
+                    if (toks[e] == eot || toks[e] == eos || pos + 1 >= SERVE_SEQ) { brk = 1; break; }
+                    if (g >= SERVE_GEN) {
+                        send_piece(c, " [SERVE_GEN cap]<turn|>");
+                        fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
+                        brk = 1; break;
+                    }
                 }
-                best = out2[1];
+                if (brk) break;
+                best = out[adv - 1];
             }
             double dt = now_sec() - t1, dp = t1 - t0;
             fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",
@@ -511,10 +532,9 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     int best = model_forward_next(&m, &kv, promptv[n_prompt - 1], pos++);
     double t_prompt = now_sec() - tp;
 
-    // greedy generation — plain, or speculative at block 2 with -mtp.
-    // g counts EMITTED tokens, so the spec path stops at exactly the same
-    // N_GEN boundary as plain decoding (an accepted draft past the cap is
-    // simply never printed).
+    // greedy generation — plain, or block-LG_MTP_N speculative with -mtp. g counts
+    // EMITTED tokens, so the spec path stops at exactly the same N_GEN boundary as
+    // plain decoding (an accepted draft past the cap is simply never printed).
     double tg = now_sec();
     double t_draft = 0, t_verify = 0;
     int g = 0, n_draft = 0, n_accept = 0;
@@ -522,29 +542,22 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
         if (best == eot || best == eos) break;               // end of turn
         emit_token(tk, best, &in_thought, ch_open, ch_close);
         g++;
-        if (!t) {
-            best = model_forward_next(&m, &kv, best, pos++);
+        if (!t || g >= N_GEN || pos + LG_MTP_N - 1 >= kv.max_seq) {
+            if (g < N_GEN) best = model_forward_next(&m, &kv, best, pos++);
             continue;
         }
-        // draft the successor of `best`, then verify the pair in one step
-        double t0 = now_sec();
-        int draft = mtp_draft(t, &m, &kv, best, pos);
-        double t1 = now_sec();
-        int out2[2];
-        int adv = model_forward2(&m, &kv, best, draft, pos, out2);
-        t_draft += t1 - t0;
-        t_verify += now_sec() - t1;
-        n_draft++;
+        int toks[LG_MTP_N], out[LG_MTP_N];
+        int adv = mtp_step(t, &m, &kv, best, pos, toks, out, &t_draft, &t_verify, &n_draft, &n_accept);
         pos += adv;
-        if (adv == 2) {                                      // draft confirmed
-            n_accept++;
-            if (draft == eot || draft == eos || g >= N_GEN) { best = draft; continue; }
-            emit_token(tk, draft, &in_thought, ch_open, ch_close);
+        int stop = 0;
+        for (int e = 1; e < adv && !stop; e++) {             // emit confirmed drafts toks[1..adv-1]
+            if (g >= N_GEN) { stop = 1; break; }
+            emit_token(tk, toks[e], &in_thought, ch_open, ch_close);
             g++;
-            best = out2[1];
-        } else {
-            best = out2[0];
+            if (toks[e] == eot || toks[e] == eos) { stop = 1; break; }
         }
+        if (stop) break;
+        best = out[adv - 1];
     }
     double t_gen = now_sec() - tg;
 
