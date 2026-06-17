@@ -17,6 +17,16 @@ struct vlayer {
     const struct gguf_tensor *gate, *up, *down;      // gated FFN, 768<->3072
 };
 
+// One block of the legacy (gemma4a) audio conformer.
+struct alayer {
+    const float *ffn_norm, *ffn_post, *ffn_norm1, *ffn_post1;
+    const struct gguf_tensor *ffn_up, *ffn_down, *ffn_up1, *ffn_down1;
+    const float *attn_pre, *attn_post, *pds;        // pds: per-dim Q scale [d_head]
+    const struct gguf_tensor *q, *k, *v, *o, *k_rel;
+    const float *norm_conv, *conv_norm, *ln2, *dw;  // dw: depthwise taps [a_embd][5]
+    const struct gguf_tensor *pw1, *pw2;
+};
+
 struct media {
     struct gguf_context *ctx;
     int n_embd;                    // LLM width; every output row is this long
@@ -38,7 +48,16 @@ struct media {
     int v_embd, v_head, v_layer, v_merge;      // 768, 12, 16, 3
     const struct gguf_tensor *v_patch16;       // [16,16,3 -> 768] conv, no bias
     struct vlayer *vl;
-    void *cuda;                                // media-cuda.cu state, or NULL
+    // audio, legacy (gemma4a, E2B/E4B): log-mel frontend + 12-block conformer
+    int legacy_a;
+    int a_embd, a_head, a_layer, n_mel;        // 1024, 8, 12, 128 (d_head = a_embd/a_head)
+    const struct gguf_tensor *a_conv0, *a_conv1, *a_inp_proj, *a_out_proj;
+    const float *a_conv0_n, *a_conv1_n, *a_out_proj_b;
+    struct alayer *al;
+    float *mel_filt;                           // [n_mel][n_fft/2+1] triangles
+    float *rpe;                                // [13][a_embd] sinusoids
+    void *audio_cuda;                          // GPU conformer state (Phase 2), or NULL
+    void *cuda;                                // media-cuda.cu (vision) state, or NULL
 };
 
 #ifdef __cplusplus
@@ -48,6 +67,13 @@ extern "C" {
 // unsupported geometry) — the caller then falls back to the host path.
 float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
 void   v_cuda_free(struct media *md);
+
+// GPU gemma4a conformer. Takes the host-built feature rows F[T][Fdim] (the
+// log-mel + subsampling convs stay on the host) and runs the 12 blocks + the
+// projections on the GPU. Returns NULL when CUDA is unusable — caller falls
+// back to a_blocks_host on the same F.
+float *a_blocks_cuda(struct media *md, const float *F, int T, int n_feat, int *n_tokens);
+void   a_cuda_free(struct media *md);
 #ifdef __cplusplus
 }
 #endif

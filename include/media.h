@@ -18,15 +18,15 @@
 // at all: vision is one linear layer over 48x48 pixel patches (plus norms and
 // a learned 2-axis position table), audio is one linear layer over raw 640-
 // sample (40 ms @ 16 kHz) waveform frames. The whole projector is 11 tensors.
-// The E2B/E4B mmproj files carry a legacy 16-block vision transformer and a
-// 12-block audio conformer instead; that path is not implemented (media_open
-// rejects those files), and may never be if encoder-free models win out.
+// The E2B/E4B mmproj files instead carry two legacy towers — a 16-block vision
+// transformer and a 12-block audio conformer (log-mel frontend) — both
+// implemented here on the host (the vision encoder runs on the GPU too).
 
 struct media;
 
 // Load an mmproj GGUF. n_embd is the LLM's embedding width; the projector's
-// output width must match. Returns NULL (with a message on stderr) on a
-// legacy encoder-stack mmproj or any mismatch.
+// output width must match. Returns NULL (with a message on stderr) on an
+// unrecognized projector type or any width mismatch.
 struct media *media_open(const char *path, int n_embd);
 void media_free(struct media *md);
 
@@ -43,8 +43,10 @@ int media_frame(const struct media *md);    // samples per audio frame (640)
 // Embed raw media: returns a malloc'd [n_tokens][n_embd] row matrix (caller
 // frees) and the token count, or NULL if the geometry is wrong.
 //  image: u8 RGB, w and h multiples of media_patch() (one token per patch)
-//  audio: mono 16 kHz s16 PCM, n_samples a multiple of media_frame()
-//         (one token per frame; the tool zero-pads the tail)
+//  audio: mono 16 kHz s16 PCM. Unified (12B): n_samples a multiple of
+//         media_frame(), one token per 40 ms frame (the tool zero-pads the
+//         tail). Legacy conformer (E2B/E4B): any length up to 30 s; the
+//         log-mel frontend frames it internally (~one token per 40 ms).
 float *media_embed_image(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
 float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens);
 
