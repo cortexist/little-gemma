@@ -1134,3 +1134,52 @@ number that ever told the truth was the real kernel on the real workload. A
 micro's baseline has to be as optimized as production or its ratio is a story you
 tell yourself; and a falsifying micro can falsify the wrong thing. Measure the
 real kernel.
+
+## The chunk width: porting the kernel vs. feeding it wider
+
+The fat tile matched llama.cpp's register/occupancy/ILP shape and still trailed
+~1.7x on the Orin. The standing theory was that the residual lived in "the rest
+of their MMQ machinery" — `ldmatrix`, the `tile_C` fragment abstraction, q8_1
+staging, two-axis weight-fragment reuse. So I did the literal thing: ported
+llama.cpp's q4_K `mul_mat_q` inner kernel verbatim — `load_tiles_q4_K`, the
+`ldmatrix` A-load, `mma.m16n8k32`, the `vec_dot` with its full `ntx` loop so each
+weight A-fragment is reused across both row-minitiles and every activation column.
+f64-validated, byte-correct end to end. On the Orin it ran *slower* than the fat
+tile we already ship: the matmul stage went 3.88s -> 4.28s. The two-axis reuse
+that the journal had flagged as the missing piece is exactly what `ntx>1`
+restores, and restoring it did not help. Porting the inner kernel was never the
+lever — our fat tile already equals it.
+
+So I stopped guessing and profiled both binaries on the Orin. They are the same
+shape: both ~65% matmul, both dominated by the identical q4_K MMQ kernel. The
+difference was in the *launch counts*. For a 1608-token prompt we issued 2,938
+q4_K launches and 3,042 q6_K launches; llama.cpp issued a few hundred. We prefill
+text in 128-token chunks, so every model weight streams from DRAM thirteen times;
+llama.cpp's 512-token ubatch streams each weight four times. Same 128-wide MMA
+tile in both — the gap was how many tokens we pour through it per pass.
+
+The fix kept the proven 128-wide tile and tiled the chunk's columns across
+`gridDim.y` instead — `COLS` stays 128 per block (no 1-CTA trap), `blockIdx`
+offsets the column base, and a chunk of 512 becomes one launch of four column
+tiles. The wide-chunk path through attention, the sliding-window ring, and the
+activation buffers already existed for media spans; the gate just opens it to
+text and widens the buffer and ring reserves to hold the chunk. Output stays
+byte-identical to the 128-chunk path. On the Orin (E4B, slope of 403 vs 1608
+tokens): 270 -> 316 tok/s at a 512 chunk, +17%, with 256–768 all in the same
+band and 1024 regressing as the per-chunk attention cost outgrows the saving.
+
+The profile of *where* the win came from is the interesting part, and it splits
+cleanly along where the weights live. q6_K dropped 40%: its weights are repacked
+into device memory, which the Tegra L2 can cache, so the column tiles of one row
+co-scheduled in a single launch genuinely reuse it. q4_K dropped only 8%: it
+reads in place from zero-copy host memory, which the Tegra reads *uncached*, and
+a 16 MB weight matrix would not fit the 4 MB L2 even if it did — so its column
+tiles cannot reuse anything, and the small gain was launch and scheduling
+overhead, not bandwidth. The grid-dimension order — whether the column tile is
+the fast or slow axis — made no difference at all, which is the same fact stated
+twice: there is no q4_K reuse to schedule for. That is why the residual gap to
+llama.cpp (316 vs 471) is still the q4_K kernel's own compute, the wall the
+occupancy-trap section ran into, and not the chunk width. Wide chunks were a real
++17% that cost nothing but buffer memory; closing the rest is still the q4_K ALU,
+not a flag. The lesson rhymes with the occupancy trap: the win wasn't in the
+kernel everyone stares at — it was in how often we made it re-read its weights.
