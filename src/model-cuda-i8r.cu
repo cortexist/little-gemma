@@ -996,6 +996,103 @@ static void matmul_coverage_print(void) {
     fprintf(stderr, "\n");
 }
 
+// ---- TIER 2 experiment: faithful "load_tiles" tiled q4_K MMQ (LG_MMQ_TILED) ----
+// The structural alternative to matmul_q4k_mmq_kernel: unpack the WHOLE 256-K
+// weight superblock to shared ONCE per block (a row's 256 nibbles -> sWq[64 ints]
+// + the folded (d*sc, -dmin*m) scales -> sWdm[8]), reuse it across the COLS batch
+// tile, plain __syncthreads (NO cp.async), 8 warps tiling 128 rows at 1 CTA/128-row
+// tile — llama.cpp's load_tiles shape, the piece our fat tile never adopted.
+// The occupancy-trap micro dismissed this at 0.35x, but that micro is L2-cached and
+// LIES (it dismissed the fat tile too); this measures it on the real Orin prefill.
+// Math is byte-equivalent to the fat tile (same nib4 / d_dm / d_gsm32r / combine);
+// only the staging differs. Ported from .scratch/mmq_gemm_test.cu (f64-validated).
+template<int COLS>
+__global__ static void __launch_bounds__(256, 1)
+matmul_q4k_tiled_kernel(float *out, const unsigned char *wbase, int ts,
+                        const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    const int TILE_M = 128, SW = 64, SX = 64;             // SW/SX: 256 int8 = 64 ints per row/col
+    int    *sWq  = (int *)sh;                             // [128][64]  unpacked weight nibbles
+    float2 *sWdm = (float2 *)(sWq + TILE_M * SW);         // [128][8]   (d*sc, dmin*m) per sub-block
+    int    *sXq  = (int *)(sWdm + TILE_M * 8);            // [COLS][64] q8_1 activation
+    float2 *sXds = (float2 *)(sXq + COLS * SX);           // [COLS][8]  (d_y, sum_y)
+    const int rowTile = blockIdx.x * TILE_M;
+    const int warp = threadIdx.y, lane = threadIdx.x, tix = warp * 32 + lane;
+    const int gid = lane >> 2, tid = lane & 3, nb = k / 256;
+    const size_t rbytes = (size_t)nb * ts;                // bytes per weight row (in-place q4_K: ts=144)
+
+    float acc[COLS / 8][4];
+    #pragma unroll
+    for (int j = 0; j < COLS / 8; j++) for (int s = 0; s < 4; s++) acc[j][s] = 0.0f;
+
+    for (int blk = 0; blk < nb; blk++) {
+        for (int t = tix; t < TILE_M * SW; t += 256) {    // stage weights (row-clamped to m)
+            int r = t >> 6, ii = t & 63, sj = ii >> 3, i = ii & 7, g = sj >> 1;
+            int gr = rowTile + r; if (gr >= m) gr = m - 1;
+            const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)gr * rbytes) + blk;
+            uint32_t q4 = *(const uint32_t *)(bp->qs + g * 32 + i * 4);
+            sWq[t] = nib4(q4, sj & 1);
+        }
+        for (int t = tix; t < TILE_M * 8; t += 256) {
+            int r = t >> 3, sj = t & 7;
+            int gr = rowTile + r; if (gr >= m) gr = m - 1;
+            const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)gr * rbytes) + blk;
+            const uint32_t *s = (const uint32_t *)bp->scales;
+            uint8_t sc, mm; d_gsm32r(sj, s[0], s[1], s[2], &sc, &mm);
+            float dD, dM; d_dm(&bp->d, &dD, &dM);
+            sWdm[t] = make_float2(dD * sc, dM * mm);
+        }
+        for (int t = tix; t < COLS * SX; t += 256) {      // stage q8_1 activations
+            int c = t >> 6, ii = t & 63;
+            sXq[t] = *(const int *)(xq + (size_t)c * k + blk * 256 + ii * 4);
+        }
+        for (int t = tix; t < COLS * 8; t += 256) {
+            int c = t >> 3, sj = t & 7;
+            sXds[t] = xds[(size_t)c * (k / 32) + blk * 8 + sj];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sj = 0; sj < 8; sj++) {
+            const int rA = warp * 16 + gid, rB = warp * 16 + gid + 8;
+            uint32_t a0 = sWq[rA*SW + sj*8 + tid],     a1 = sWq[rB*SW + sj*8 + tid];
+            uint32_t a2 = sWq[rA*SW + sj*8 + tid + 4], a3 = sWq[rB*SW + sj*8 + tid + 4];
+            float2 dmA = sWdm[rA*8 + sj], dmB = sWdm[rB*8 + sj];
+            #pragma unroll
+            for (int jt = 0; jt < COLS / 8; jt++) {
+                int cB = jt*8 + gid;
+                uint32_t b0 = sXq[cB*SX + sj*8 + tid], b1 = sXq[cB*SX + sj*8 + tid + 4];
+                int col0 = jt*8 + tid*2;
+                float2 xd0 = sXds[col0*8 + sj], xd1 = sXds[(col0 + 1)*8 + sj];
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                acc[jt][0] += xd0.x * (dmA.x * c0 - dmA.y * xd0.y);
+                acc[jt][1] += xd1.x * (dmA.x * c1 - dmA.y * xd1.y);
+                acc[jt][2] += xd0.x * (dmB.x * c2 - dmB.y * xd0.y);
+                acc[jt][3] += xd1.x * (dmB.x * c3 - dmB.y * xd1.y);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int jt = 0; jt < COLS / 8; jt++) {
+        int col0 = jt*8 + tid*2, rA = rowTile + warp*16 + gid, rB = rowTile + warp*16 + gid + 8;
+        if (rA < m) { out[(size_t)col0*m + rA] = acc[jt][0]; out[(size_t)(col0 + 1)*m + rA] = acc[jt][1]; }
+        if (rB < m) { out[(size_t)col0*m + rB] = acc[jt][2]; out[(size_t)(col0 + 1)*m + rB] = acc[jt][3]; }
+    }
+}
+
+template<int COLS>
+static void launch_q4k_tiled(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m) {
+    const int TILE_M = 128, SW = 64, SX = 64;
+    size_t shm = (size_t)TILE_M*SW*4 + (size_t)TILE_M*8*sizeof(float2) + (size_t)COLS*SX*4 + (size_t)COLS*8*sizeof(float2);
+    static int carve = 0;
+    if (!carve) { if (shm > 48*1024) cudaFuncSetAttribute(matmul_q4k_tiled_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm); carve = 1; }
+    int blocks = (m + TILE_M - 1) / TILE_M;
+    matmul_q4k_tiled_kernel<COLS><<<dim3(blocks), dim3(32, TILE_M/16), shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+}
+
 // Launch the fat q4_K kernel for a compile-time COLS (= the adaptive chunk
 // width g_pf_cols). Each COLS instantiation opts into its own shared carveout
 // once (COLS>=64 needs >48KB). 16 rows/warp; wpc shrinks so the grid covers SMs.
@@ -1041,6 +1138,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type < 40) g_cov[t->type] += (double)k * m;
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
+    static int tiled = -1;                                   // TIER 2: faithful load_tiles q4_K path
+    if (tiled < 0) tiled = getenv("LG_MMQ_TILED") != NULL;
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
@@ -1061,7 +1160,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             int ct = g_pf_cols - c0; if (ct > 128) ct = 128;
             const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
             float *outc = d_out + (size_t)c0 * m;
-            switch (ct) {
+            if (tiled) switch (ct) {                         // faithful load_tiles path (A/B)
+                case 32:  launch_q4k_tiled<32 >(outc, w, ts, xqc, xdc, k, m); break;
+                case 64:  launch_q4k_tiled<64 >(outc, w, ts, xqc, xdc, k, m); break;
+                case 96:  launch_q4k_tiled<96 >(outc, w, ts, xqc, xdc, k, m); break;
+                default:  launch_q4k_tiled<128>(outc, w, ts, xqc, xdc, k, m); break;
+            } else switch (ct) {
                 case 32:  launch_q4k_mmq<32 >(outc, w, ts, xqc, xdc, k, m, sms); break;
                 case 64:  launch_q4k_mmq<64 >(outc, w, ts, xqc, xdc, k, m, sms); break;
                 case 96:  launch_q4k_mmq<96 >(outc, w, ts, xqc, xdc, k, m, sms); break;
