@@ -752,7 +752,12 @@ static void ensure_weights(struct model *m) {
     // over PCIe every token would be the opposite of the point).
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    if (prop.integrated &&
+    // LG_NO_ZEROCOPY: force the cudaMalloc device copy even on integrated GPUs, to
+    // measure the Tegra zero-copy-UNCACHED penalty (mapped host reads bypass L2; a
+    // cudaMalloc'd copy is L2-cached). Doubles weight footprint -> only for models
+    // that fit twice (E4B 4.6GB ok on 15GB; 12B OOMs).
+    static int nozc = -1; if (nozc < 0) nozc = getenv("LG_NO_ZEROCOPY") != NULL;
+    if (prop.integrated && !nozc &&
         cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
         cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
         return;
