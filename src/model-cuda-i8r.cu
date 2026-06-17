@@ -1011,11 +1011,11 @@ __global__ static void __launch_bounds__(256, 1)
 matmul_q4k_tiled_kernel(float *out, const unsigned char *wbase, int ts,
                         const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
-    const int TILE_M = 128, SW = 64, SX = 64;             // SW/SX: 256 int8 = 64 ints per row/col
-    int    *sWq  = (int *)sh;                             // [128][64]  unpacked weight nibbles
-    float2 *sWdm = (float2 *)(sWq + TILE_M * SW);         // [128][8]   (d*sc, dmin*m) per sub-block
-    int    *sXq  = (int *)(sWdm + TILE_M * 8);            // [COLS][64] q8_1 activation
-    float2 *sXds = (float2 *)(sXq + COLS * SX);           // [COLS][8]  (d_y, sum_y)
+    const int TILE_M = 128, SW = 68, SX = 68;             // PADDED strides (68, off the 32-bank
+    int    *sWq  = (int *)sh;                             // multiple) -> conflict-free fragment
+    float2 *sWdm = (float2 *)(sWq + TILE_M * SW);         // reads; 64 of the 68 ints/row are real
+    int    *sXq  = (int *)(sWdm + TILE_M * 8);            // (256 int8 = 64 ints). sWdm/sXds dense.
+    float2 *sXds = (float2 *)(sXq + COLS * SX);           // [COLS][8] (d_y, sum_y)
     const int rowTile = blockIdx.x * TILE_M;
     const int warp = threadIdx.y, lane = threadIdx.x, tix = warp * 32 + lane;
     const int gid = lane >> 2, tid = lane & 3, nb = k / 256;
@@ -1026,12 +1026,12 @@ matmul_q4k_tiled_kernel(float *out, const unsigned char *wbase, int ts,
     for (int j = 0; j < COLS / 8; j++) for (int s = 0; s < 4; s++) acc[j][s] = 0.0f;
 
     for (int blk = 0; blk < nb; blk++) {
-        for (int t = tix; t < TILE_M * SW; t += 256) {    // stage weights (row-clamped to m)
+        for (int t = tix; t < TILE_M * 64; t += 256) {    // 64 real ints/row (row-clamped to m)
             int r = t >> 6, ii = t & 63, sj = ii >> 3, i = ii & 7, g = sj >> 1;
             int gr = rowTile + r; if (gr >= m) gr = m - 1;
             const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)gr * rbytes) + blk;
             uint32_t q4 = *(const uint32_t *)(bp->qs + g * 32 + i * 4);
-            sWq[t] = nib4(q4, sj & 1);
+            sWq[r * SW + ii] = nib4(q4, sj & 1);          // padded write stride
         }
         for (int t = tix; t < TILE_M * 8; t += 256) {
             int r = t >> 3, sj = t & 7;
@@ -1042,9 +1042,9 @@ matmul_q4k_tiled_kernel(float *out, const unsigned char *wbase, int ts,
             float dD, dM; d_dm(&bp->d, &dD, &dM);
             sWdm[t] = make_float2(dD * sc, dM * mm);
         }
-        for (int t = tix; t < COLS * SX; t += 256) {      // stage q8_1 activations
+        for (int t = tix; t < COLS * 64; t += 256) {      // 64 real ints/col q8_1 activation
             int c = t >> 6, ii = t & 63;
-            sXq[t] = *(const int *)(xq + (size_t)c * k + blk * 256 + ii * 4);
+            sXq[c * SX + ii] = *(const int *)(xq + (size_t)c * k + blk * 256 + ii * 4);
         }
         for (int t = tix; t < COLS * 8; t += 256) {
             int c = t >> 3, sj = t & 7;
@@ -1085,7 +1085,7 @@ matmul_q4k_tiled_kernel(float *out, const unsigned char *wbase, int ts,
 
 template<int COLS>
 static void launch_q4k_tiled(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m) {
-    const int TILE_M = 128, SW = 64, SX = 64;
+    const int TILE_M = 128, SW = 68, SX = 68;             // padded strides (must match the kernel)
     size_t shm = (size_t)TILE_M*SW*4 + (size_t)TILE_M*8*sizeof(float2) + (size_t)COLS*SX*4 + (size_t)COLS*8*sizeof(float2);
     static int carve = 0;
     if (!carve) { if (shm > 48*1024) cudaFuncSetAttribute(matmul_q4k_tiled_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm); carve = 1; }
