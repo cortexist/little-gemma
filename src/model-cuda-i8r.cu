@@ -973,8 +973,11 @@ __device__ __forceinline__ void q4k_2tile_tile(
     __syncthreads();    // a persistent CTA must finish reading sB before the next tile's prologue overwrites it
 }
 
-template<int COLS>
-__global__ static void __launch_bounds__(256, 1)
+// MINCTA = __launch_bounds__ min blocks/SM: 1 keeps the wide 64-acc tile (COLS=64);
+// 2 caps registers so two CTAs seat per SM (COLS=32, ~122 regs) — more warps to hide
+// the q4_K WEIGHT-DRAM latency (the long-scoreboard wall the source-ncu pinned).
+template<int COLS, int MINCTA = 1>
+__global__ static void __launch_bounds__(256, MINCTA)
 matmul_q4k_mmq2_kernel(float *out, const unsigned char *wbase, int ts,
                        const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
@@ -1454,6 +1457,25 @@ static void launch_q4k_sk(float *d_out, const unsigned char *w, int ts, const in
     matmul_q4k_sk_kernel<COLS><<<grid, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m, ntx);
 }
 
+// 2-CTA occupancy variant (LG_Q4K_OCC): narrow COLS=32 (acc[2][4][4]=32 regs) +
+// launch_bounds(256,2) so two CTAs seat per SM (33% occ) — more warps to hide the
+// q4_K weight-DRAM latency (the long-scoreboard wall). Trades the wide tile's reuse
+// for occupancy; the right move ONLY because the wall is DRAM latency, not shared.
+template<int COLS>
+static void launch_q4k_mmq2_occ(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol) {
+    int wpc = 8;
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 4 * sms) wpc >>= 1;  // 2 CTAs/SM -> ~4*sms blocks
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
+    static int carve = 0;
+    if (!carve) {
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 2 * 16 * SA_ROW;
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mmq2_kernel<COLS, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        carve = 1;
+    }
+    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
+    matmul_q4k_mmq2_kernel<COLS, 2><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+}
+
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
 // (32 rows/warp), whose acc[2][COLS/8][4] fits up to COLS=64 (~121 regs); the big
 // 2*2048/warp A tile needs the carveout past COLS=32. Widening the q6_K sub-tile
@@ -1489,6 +1511,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t2 < 0) t2 = getenv("LG_Q4K_2TILE") != NULL;
     static int sk = -1;                                      // stream-K stage 1: persistent nsm CTAs (2-tile body)
     if (sk < 0) sk = getenv("LG_Q4K_SK") != NULL;
+    static int occ = -1;                                     // 2-CTA occupancy variant (COLS=32, launch_bounds 2)
+    if (occ < 0) occ = getenv("LG_Q4K_OCC") != NULL;
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
@@ -1505,6 +1529,11 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         // 512-ubatch weight reuse), instead of re-streaming them per 128-col launch.
         // At g_pf_cols==128 this is ncol=1, grid.y==1 == the legacy single launch.
         if (!port && !tiled) {
+            // 2-CTA occupancy (LG_Q4K_OCC): COLS=32, 2 CTAs/SM to hide weight-DRAM latency.
+            if (occ && g_pf_cols >= 32 && g_pf_cols % 32 == 0) {
+                launch_q4k_mmq2_occ<32>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 32);
+                return;
+            }
             // stream-K (LG_Q4K_SK): persistent nsm CTAs grind the 2-tile work-list.
             if (sk && g_pf_cols >= 64 && g_pf_cols % 64 == 0) {
                 launch_q4k_sk<64>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
