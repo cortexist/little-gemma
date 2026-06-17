@@ -862,23 +862,18 @@ matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
 // ILP as the 1-tile COLS=128), and the inner loop loads B+scale ONCE and issues
 // two mmas. Math/scale path identical to the 1-tile kernel (same nib4/d_gsm32r/
 // d_dm/combine) -> same relaxed-float-order class. Eight warps tile 256 rows.
+// One (256-row x COLS) output tile, two 16-row minitiles per warp. xq/xds/out are
+// already offset to this tile's column block; r0 is this warp's row base; sAw is
+// this warp's A region. Factored out so both the conventional grid (one tile per
+// CTA) and the persistent stream-K grid (one CTA grinds many tiles) reuse it.
 template<int COLS>
-__global__ static void __launch_bounds__(256, 1)
-matmul_q4k_mmq2_kernel(float *out, const unsigned char *wbase, int ts,
-                       const int8_t *xq, const float2 *xds, int k, int m) {
-    extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [2][COLS][SB_COL]
-    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2][COLS][SBX]
-    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [wpc][2 tiles][2 halves][16][SA_ROW]
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int wpc = blockDim.x >> 5;
-    const int r0 = blockIdx.x * (32 * wpc) + warp * 32;            // this warp's TWO 16-row tiles
+__device__ __forceinline__ void q4k_2tile_tile(
+        float *out, const unsigned char *wbase, int ts,
+        const int8_t *xq, const float2 *xds, int k, int m,
+        int8_t *sB, float2 *sBxds, int8_t *sAw, int r0) {
+    const int lane = threadIdx.x & 31;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
-    xq  += (size_t)blockIdx.y * COLS * k;
-    xds += (size_t)blockIdx.y * COLS * (k / 32);
-    out += (size_t)blockIdx.y * COLS * m;
-    int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;                 // 2 tiles
     float acc[2][COLS / 8][4];
     #pragma unroll
     for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
@@ -975,6 +970,46 @@ matmul_q4k_mmq2_kernel(float *out, const unsigned char *wbase, int ts,
             if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
             if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
         }
+    __syncthreads();    // a persistent CTA must finish reading sB before the next tile's prologue overwrites it
+}
+
+template<int COLS>
+__global__ static void __launch_bounds__(256, 1)
+matmul_q4k_mmq2_kernel(float *out, const unsigned char *wbase, int ts,
+                       const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8);
+    const int warp = threadIdx.x >> 5, wpc = blockDim.x >> 5;
+    q4k_2tile_tile<COLS>(out + (size_t)blockIdx.y * COLS * m, wbase, ts,
+                         xq + (size_t)blockIdx.y * COLS * k, xds + (size_t)blockIdx.y * COLS * (k / 32),
+                         k, m, sB, sBxds, sA + warp * 2 * 2 * 16 * SA_ROW, blockIdx.x * (32 * wpc) + warp * 32);
+}
+
+// Stream-K stage 1: persistent CTAs (grid = nsm). Each CTA grinds a strided slice
+// of the (row-tile x col-tile) work-list whole-tile at a time — no K-split/fixup
+// yet. Tests whether CTA-residency (8 CTAs x ~10 tiles vs 80 CTAs in 10 waves) is
+// the 44->58% SM lever the ncu pinned (llama.cpp runs grid=nsm here).
+template<int COLS>
+__global__ static void __launch_bounds__(256, 1)
+matmul_q4k_sk_kernel(float *out, const unsigned char *wbase, int ts,
+                     const int8_t *xq, const float2 *xds, int k, int m, int ntx) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8);
+    const int warp = threadIdx.x >> 5, wpc = blockDim.x >> 5;
+    int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
+    const int rows_per_tile = 32 * wpc;
+    const int nty = (m + rows_per_tile - 1) / rows_per_tile;
+    const int ntiles = nty * ntx;
+    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        int rt = tile / ntx, ct = tile % ntx;
+        q4k_2tile_tile<COLS>(out + (size_t)ct * COLS * m, wbase, ts,
+                             xq + (size_t)ct * COLS * k, xds + (size_t)ct * COLS * (k / 32),
+                             k, m, sB, sBxds, sAw, rt * rows_per_tile + warp * 32);
+    }
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -1402,6 +1437,23 @@ static void launch_q4k_mmq2(float *d_out, const unsigned char *w, int ts, const 
     matmul_q4k_mmq2_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
+// Stream-K stage 1 launcher (LG_Q4K_SK): grid = nsm persistent CTAs (wpc fixed 8 =
+// 256-row tiles, 1 CTA/SM), each grinds a strided slice of the ntx*nty work-list.
+template<int COLS>
+static void launch_q4k_sk(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ntx) {
+    const int wpc = 8;
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW;
+    static int carve = 0;
+    if (!carve) {
+        if (shm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_sk_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+        carve = 1;
+    }
+    long nty = (m + 32 * wpc - 1) / (32 * wpc);
+    long ntiles = nty * ntx;
+    int grid = (int)(ntiles < sms ? ntiles : sms);            // persistent: <= nsm CTAs
+    matmul_q4k_sk_kernel<COLS><<<grid, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m, ntx);
+}
+
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
 // (32 rows/warp), whose acc[2][COLS/8][4] fits up to COLS=64 (~121 regs); the big
 // 2*2048/warp A tile needs the carveout past COLS=32. Widening the q6_K sub-tile
@@ -1435,6 +1487,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (port < 0) port = getenv("LG_MMQ_PORT") != NULL;
     static int t2 = -1;                                      // 2-row-tile q4_K (B/scale reuse across 2 tiles)
     if (t2 < 0) t2 = getenv("LG_Q4K_2TILE") != NULL;
+    static int sk = -1;                                      // stream-K stage 1: persistent nsm CTAs (2-tile body)
+    if (sk < 0) sk = getenv("LG_Q4K_SK") != NULL;
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
@@ -1451,6 +1505,11 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         // 512-ubatch weight reuse), instead of re-streaming them per 128-col launch.
         // At g_pf_cols==128 this is ncol=1, grid.y==1 == the legacy single launch.
         if (!port && !tiled) {
+            // stream-K (LG_Q4K_SK): persistent nsm CTAs grind the 2-tile work-list.
+            if (sk && g_pf_cols >= 64 && g_pf_cols % 64 == 0) {
+                launch_q4k_sk<64>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+                return;
+            }
             // 2-row-tile (LG_Q4K_2TILE): COLS=64, each B+scale load feeds 2 mmas ->
             // half the per-mma shared traffic that caps the 1-tile big FFN at 44% SM.
             if (t2 && g_pf_cols >= 64 && g_pf_cols % 64 == 0) {
