@@ -1050,27 +1050,38 @@ __device__ void pload_tiles_q4K(const block_q4_K *x,int *x_tile,int kbx0,int str
         #pragma unroll
         for(int l=0;l<4;l++) x_dm[i*PMMQ_X_K + sizeof(int)*ksc + l]=dm*make_half2(s8[l],m8[l]); }
 }
+// ntx = x minitiles/warp: wide tiles (COLS>=48) use granularity 16 -> 2 minitiles,
+// amortizing each activation B-load across 2 weight A-tiles (matches mmq_get_granularity_device).
+#define PMMQ_NTX(COLS) (((COLS)>=48 ? 16 : 8) * 2 / 16)
 template<int COLS> __device__ void pvecdot(const int *x,const int *y,float *sum,int k00){
+    constexpr int ntx=PMMQ_NTX(COLS);
     const int *x_qs=x; const half2 *x_dm=(const half2*)x_qs+2*PMMQ_NE_K;
+    y += (threadIdx.y % ntx)*(8*PMMQ_Y_K);                 // tile_C::J=8
     const int *y_qs=(const int*)y+4; const half2 *y_dm=(const half2*)y;
-    pt168 A[4]; float2 dmA[2][4]; const int i0=threadIdx.y*16;
+    pt168 A[ntx][4]; float2 dmA[ntx][2][4]; const int i0=(threadIdx.y/ntx)*(ntx*16);
     #pragma unroll
-    for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) pld_ldm(A[k01/PMMQ_QI8_1], x_qs+i0*PMMQ_X_K+(k00+k01), PMMQ_X_K);
-    #pragma unroll
-    for(int l=0;l<2;l++){ int i=i0+pt168::get_i(2*l);
+    for(int n=0;n<ntx;n++){
         #pragma unroll
-        for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) dmA[l][k01/PMMQ_QI8_1]=__half22float2(x_dm[i*PMMQ_X_K+(k00+k01)/PMMQ_QI8_1]); }
+        for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) pld_ldm(A[n][k01/PMMQ_QI8_1], x_qs+(i0+n*16)*PMMQ_X_K+(k00+k01), PMMQ_X_K);
+        #pragma unroll
+        for(int l=0;l<2;l++){ int i=i0+n*16+pt168::get_i(2*l);
+            #pragma unroll
+            for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) dmA[n][l][k01/PMMQ_QI8_1]=__half22float2(x_dm[i*PMMQ_X_K+(k00+k01)/PMMQ_QI8_1]); }
+    }
     #pragma unroll
-    for(int j0=0;j0<COLS;j0+=8){
+    for(int j0=0;j0<COLS;j0+=ntx*8){
         #pragma unroll
         for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1){
             pt88 B; float2 dsB[2]; pld_gen(B, y_qs+j0*PMMQ_Y_K+k01, PMMQ_Y_K);
             #pragma unroll
             for(int l=0;l<2;l++){ int j=j0+pt168::get_j(l); dsB[l]=__half22float2(y_dm[j*PMMQ_Y_K+k01/PMMQ_QI8_1]); }
-            pt168 C; pmma(C,A[k01/PMMQ_QI8_1],B);
             #pragma unroll
-            for(int l=0;l<4;l++){ sum[(j0/8)*4+l]+=dmA[l/2][k01/PMMQ_QI8_1].x*dsB[l%2].x*C.x[l];
-                                  sum[(j0/8)*4+l]+=dmA[l/2][k01/PMMQ_QI8_1].y*dsB[l%2].y; } }
+            for(int n=0;n<ntx;n++){
+                pt168 C; pmma(C,A[n][k01/PMMQ_QI8_1],B);
+                #pragma unroll
+                for(int l=0;l<4;l++){ sum[(j0/8+n)*4+l]+=dmA[n][l/2][k01/PMMQ_QI8_1].x*dsB[l%2].x*C.x[l];
+                                      sum[(j0/8+n)*4+l]+=dmA[n][l/2][k01/PMMQ_QI8_1].y*dsB[l%2].y; } }
+        }
     }
 }
 template<int COLS> __global__ void __launch_bounds__(PMMQ_NWARP*32,1)
@@ -1090,12 +1101,15 @@ mmq_port_kernel(const block_q4_K *x,const int *y,float *dst,int nb,int ncols,int
           for(int l=tix;l<COLS*PMMQ_Y_K;l+=PMMQ_NWARP*32) tile_y[l]=by0[l]; }
         __syncthreads(); pvecdot<COLS>(tile_x,tile_y,sum,PMMQ_NE_K); __syncthreads();
     }
-    const int i0=threadIdx.y*16;
+    constexpr int ntx=PMMQ_NTX(COLS);
+    const int i0=(threadIdx.y/ntx)*(ntx*16);
     #pragma unroll
-    for(int j0=0;j0<COLS;j0+=8)
+    for(int j0=0;j0<COLS;j0+=ntx*8)
         #pragma unroll
-        for(int l=0;l<4;l++){ int j=colTile+j0+pt168::get_j(l), i=rowTile+i0+pt168::get_i(l);
-            if(i<m) dst[(size_t)j*m + i]=sum[(j0/8)*4+l]; }
+        for(int n=0;n<ntx;n++)
+            #pragma unroll
+            for(int l=0;l<4;l++){ int j=colTile+j0+(threadIdx.y%ntx)*8+pt168::get_j(l), i=rowTile+i0+n*16+pt168::get_i(l);
+                if(i<m) dst[(size_t)j*m + i]=sum[(j0/8+n)*4+l]; }
 }
 // repack our activation (g_xq int8 + g_xds (d_y, sum_q)) -> block_q8_1_mmq y[(k/128)*cols+col]
 __global__ static void pmmq_repack(block_q8_1_mmq *y,const int8_t *xq,const float2 *xds,int k,int cols){
