@@ -996,6 +996,130 @@ static void matmul_coverage_print(void) {
     fprintf(stderr, "\n");
 }
 
+// ==== TIER 2: faithful line-by-line port of llama.cpp's q4_K MMQ (LG_MMQ_PORT) ====
+// Verbatim mma primitives + load_tiles_q4_K + vec_dot_q8_1_q8_1_mma + write_back +
+// the block_q8_1_mmq activation, transcribed from ../llama.cpp (Ampere/Turing MMA).
+// f64-validated standalone in .scratch/mmq_port.cu (err 3.6e-6 / 0.0026). Activation
+// repacked from our g_xq/g_xds. ntx=1; COLS = the chunk width (a multiple of 8).
+#define PMMQ_NE_K 32
+#define PMMQ_QI8_1 8
+#define PMMQ_X_K   (2*PMMQ_NE_K + 2*PMMQ_NE_K/8 + 4)   // 76
+#define PMMQ_Y_K   (PMMQ_NE_K + PMMQ_NE_K/PMMQ_QI8_1)  // 36
+#define PMMQ_Y     128
+#define PMMQ_NWARP 8
+struct block_q8_1_mmq { half2 ds4[4]; int8_t qs[4*32]; };
+
+struct pt168 { static constexpr int I=16,J=8,ne=4; int x[4]={0,0,0,0};
+    static __device__ __forceinline__ int get_i(int l){return ((l/2)*8)+(threadIdx.x/4);}
+    static __device__ __forceinline__ int get_j(int l){return ((threadIdx.x%4)*2)+(l%2);} };
+struct pt88  { static constexpr int I=8,J=8,ne=2; int x[2]={0,0};
+    static __device__ __forceinline__ int get_i(int l){return threadIdx.x/4;}
+    static __device__ __forceinline__ int get_j(int l){return (l*4)+(threadIdx.x%4);} };
+__device__ __forceinline__ void pld_ldm(pt168 &t,const int *xs0,int stride){
+    int *xi=t.x; const int *xs=xs0+(threadIdx.x%t.I)*stride+(threadIdx.x/t.I)*(t.J/2);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        :"=r"(xi[0]),"=r"(xi[1]),"=r"(xi[2]),"=r"(xi[3]):"l"(xs)); }
+__device__ __forceinline__ void pld_gen(pt88 &t,const int *xs0,int stride){
+    #pragma unroll
+    for(int l=0;l<t.ne;l++) t.x[l]=xs0[t.get_i(l)*stride+t.get_j(l)]; }
+__device__ __forceinline__ void pmma(pt168 &D,const pt168 &A,const pt88 &B){
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+r"(D.x[0]),"+r"(D.x[1]),"+r"(D.x[2]),"+r"(D.x[3])
+        :"r"(A.x[0]),"r"(A.x[1]),"r"(A.x[2]),"r"(A.x[3]),"r"(B.x[0]),"r"(B.x[1])); }
+__device__ __forceinline__ int punpack_sc(const int *s,int ksc){
+    return ((s[(ksc%2)+(ksc!=0)] >> (4*(ksc&(ksc/2)))) & 0x0F0F0F0F)
+         | ((s[ksc/2]            >> (2*(ksc%2)))       & 0x30303030); }
+
+__device__ void pload_tiles_q4K(const block_q4_K *x,int *x_tile,int kbx0,int stride){
+    int *x_qs=x_tile; half2 *x_dm=(half2*)(x_qs+2*PMMQ_NE_K);
+    const int txi=threadIdx.x;
+    #pragma unroll
+    for(int i0=0;i0<PMMQ_Y;i0+=PMMQ_NWARP){ int i=i0+threadIdx.y;
+        const block_q4_K *bxi=x+kbx0+i*stride;
+        const int qs0=*((const int*)bxi->qs + txi);
+        x_qs[i*PMMQ_X_K + 16*(txi/8)+txi%8+0]=(qs0>>0)&0x0F0F0F0F;
+        x_qs[i*PMMQ_X_K + 16*(txi/8)+txi%8+8]=(qs0>>4)&0x0F0F0F0F; }
+    #pragma unroll
+    for(int i0=0;i0<PMMQ_Y;i0+=PMMQ_NWARP*16){
+        int i=(i0+threadIdx.y*16+threadIdx.x/2)%PMMQ_Y;
+        const block_q4_K *bxi=x+kbx0+i*stride; const int *sc=(const int*)bxi->scales;
+        const int ksc=threadIdx.x%2;
+        const int sc32=punpack_sc(sc,ksc+0), m32=punpack_sc(sc,ksc+2);
+        const uint8_t *s8=(const uint8_t*)&sc32; const uint8_t *m8=(const uint8_t*)&m32;
+        const half2 dm=*(const half2*)&bxi->d * make_half2(1.0f,-1.0f);
+        #pragma unroll
+        for(int l=0;l<4;l++) x_dm[i*PMMQ_X_K + sizeof(int)*ksc + l]=dm*make_half2(s8[l],m8[l]); }
+}
+template<int COLS> __device__ void pvecdot(const int *x,const int *y,float *sum,int k00){
+    const int *x_qs=x; const half2 *x_dm=(const half2*)x_qs+2*PMMQ_NE_K;
+    const int *y_qs=(const int*)y+4; const half2 *y_dm=(const half2*)y;
+    pt168 A[4]; float2 dmA[2][4]; const int i0=threadIdx.y*16;
+    #pragma unroll
+    for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) pld_ldm(A[k01/PMMQ_QI8_1], x_qs+i0*PMMQ_X_K+(k00+k01), PMMQ_X_K);
+    #pragma unroll
+    for(int l=0;l<2;l++){ int i=i0+pt168::get_i(2*l);
+        #pragma unroll
+        for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1) dmA[l][k01/PMMQ_QI8_1]=__half22float2(x_dm[i*PMMQ_X_K+(k00+k01)/PMMQ_QI8_1]); }
+    #pragma unroll
+    for(int j0=0;j0<COLS;j0+=8){
+        #pragma unroll
+        for(int k01=0;k01<PMMQ_NE_K;k01+=PMMQ_QI8_1){
+            pt88 B; float2 dsB[2]; pld_gen(B, y_qs+j0*PMMQ_Y_K+k01, PMMQ_Y_K);
+            #pragma unroll
+            for(int l=0;l<2;l++){ int j=j0+pt168::get_j(l); dsB[l]=__half22float2(y_dm[j*PMMQ_Y_K+k01/PMMQ_QI8_1]); }
+            pt168 C; pmma(C,A[k01/PMMQ_QI8_1],B);
+            #pragma unroll
+            for(int l=0;l<4;l++){ sum[(j0/8)*4+l]+=dmA[l/2][k01/PMMQ_QI8_1].x*dsB[l%2].x*C.x[l];
+                                  sum[(j0/8)*4+l]+=dmA[l/2][k01/PMMQ_QI8_1].y*dsB[l%2].y; } }
+    }
+}
+template<int COLS> __global__ void __launch_bounds__(PMMQ_NWARP*32,1)
+mmq_port_kernel(const block_q4_K *x,const int *y,float *dst,int nb,int ncols,int m){
+    extern __shared__ int psh[];
+    int *tile_y=psh; int *tile_x=tile_y + COLS*PMMQ_Y_K;
+    const int rowTile=blockIdx.x*PMMQ_Y, colTile=blockIdx.y*COLS;
+    const int tix=threadIdx.y*32+threadIdx.x;
+    float sum[COLS*PMMQ_Y/(PMMQ_NWARP*32)]={0};
+    const int sz=sizeof(block_q8_1_mmq)/sizeof(int);
+    for(int kb0=0;kb0<nb;kb0++){
+        pload_tiles_q4K(x+(size_t)rowTile*nb, tile_x, kb0, nb);
+        { const int *by0=y + (size_t)(colTile + (kb0*2)*ncols)*sz;
+          for(int l=tix;l<COLS*PMMQ_Y_K;l+=PMMQ_NWARP*32) tile_y[l]=by0[l]; }
+        __syncthreads(); pvecdot<COLS>(tile_x,tile_y,sum,0); __syncthreads();
+        { const int *by0=y + (size_t)(colTile + (kb0*2+1)*ncols)*sz;
+          for(int l=tix;l<COLS*PMMQ_Y_K;l+=PMMQ_NWARP*32) tile_y[l]=by0[l]; }
+        __syncthreads(); pvecdot<COLS>(tile_x,tile_y,sum,PMMQ_NE_K); __syncthreads();
+    }
+    const int i0=threadIdx.y*16;
+    #pragma unroll
+    for(int j0=0;j0<COLS;j0+=8)
+        #pragma unroll
+        for(int l=0;l<4;l++){ int j=colTile+j0+pt168::get_j(l), i=rowTile+i0+pt168::get_i(l);
+            if(i<m) dst[(size_t)j*m + i]=sum[(j0/8)*4+l]; }
+}
+// repack our activation (g_xq int8 + g_xds (d_y, sum_q)) -> block_q8_1_mmq y[(k/128)*cols+col]
+__global__ static void pmmq_repack(block_q8_1_mmq *y,const int8_t *xq,const float2 *xds,int k,int cols){
+    int c=blockIdx.x;
+    for(int g=threadIdx.x; g<k/32; g+=blockDim.x){
+        int kb=g/4, s=g%4; float2 ds=xds[(size_t)c*(k/32)+g];
+        block_q8_1_mmq *b=&y[(size_t)kb*cols + c];
+        b->ds4[s]=make_half2(ds.x, ds.x*ds.y);            // (d_y, sum_float = d_y*sum_q)
+        const int8_t *src=xq + (size_t)c*k + g*32;
+        #pragma unroll
+        for(int t=0;t<32;t++) b->qs[s*32+t]=src[t]; }
+}
+static block_q8_1_mmq *g_ymmq=NULL; static size_t g_ymmq_cap=0;
+template<int COLS>
+static void launch_q4k_port(float *d_out,const unsigned char *w,const int8_t *xq,const float2 *xds,int k,int m){
+    size_t need=(size_t)(k/128)*COLS*sizeof(block_q8_1_mmq);
+    if(need>g_ymmq_cap){ cudaFree(g_ymmq); if(cudaMalloc(&g_ymmq,need)!=cudaSuccess){g_ymmq_cap=0;return;} g_ymmq_cap=need; }
+    pmmq_repack<<<COLS, 256, 0, g_launch>>>(g_ymmq, xq, xds, k, COLS);
+    size_t shm=(size_t)(COLS*PMMQ_Y_K + PMMQ_Y*PMMQ_X_K)*4;
+    static int carve=0; if(!carve){ if(shm>48*1024) cudaFuncSetAttribute(mmq_port_kernel<COLS>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)shm); carve=1; }
+    dim3 grid((m+PMMQ_Y-1)/PMMQ_Y, 1), blk(32,PMMQ_NWARP);
+    mmq_port_kernel<COLS><<<grid, blk, shm, g_launch>>>((const block_q4_K*)w, (const int*)g_ymmq, d_out, k/256, COLS, m);
+}
+
 // ---- TIER 2 experiment: faithful "load_tiles" tiled q4_K MMQ (LG_MMQ_TILED) ----
 // The structural alternative to matmul_q4k_mmq_kernel: unpack the WHOLE 256-K
 // weight superblock to shared ONCE per block (a row's 256 nibbles -> sWq[64 ints]
@@ -1140,6 +1264,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     static int tiled = -1;                                   // TIER 2: faithful load_tiles q4_K path
     if (tiled < 0) tiled = getenv("LG_MMQ_TILED") != NULL;
+    static int port = -1;                                    // TIER 2: full line-by-line llama.cpp MMQ port
+    if (port < 0) port = getenv("LG_MMQ_PORT") != NULL;
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
@@ -1160,7 +1286,12 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             int ct = g_pf_cols - c0; if (ct > 128) ct = 128;
             const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
             float *outc = d_out + (size_t)c0 * m;
-            if (tiled) switch (ct) {                         // faithful load_tiles path (A/B)
+            if (port) switch (ct) {                          // full llama.cpp MMQ port (A/B)
+                case 32:  launch_q4k_port<32 >(outc, w, xqc, xdc, k, m); break;
+                case 64:  launch_q4k_port<64 >(outc, w, xqc, xdc, k, m); break;
+                case 96:  launch_q4k_port<96 >(outc, w, xqc, xdc, k, m); break;
+                default:  launch_q4k_port<128>(outc, w, xqc, xdc, k, m); break;
+            } else if (tiled) switch (ct) {                  // faithful load_tiles path (A/B)
                 case 32:  launch_q4k_tiled<32 >(outc, w, ts, xqc, xdc, k, m); break;
                 case 64:  launch_q4k_tiled<64 >(outc, w, ts, xqc, xdc, k, m); break;
                 case 96:  launch_q4k_tiled<96 >(outc, w, ts, xqc, xdc, k, m); break;
