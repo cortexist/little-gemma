@@ -818,6 +818,26 @@ extern "C" void model_prefill_reserve(void) {
     g_prefill_max_b = w;
 }
 
+// LG_WIDE_CHUNK=<N>: prefill TEXT in N-token chunks (a multiple of 128) instead of
+// PREFILL_B=128, so each model weight streams from DRAM once per N tokens, not once
+// per 128. The fat q4_K/q6_K kernels then tile the chunk's columns across gridDim.y
+// (COLS stays 128/64 per block — no 1-CTA trap) so a row-tile's weights stay L2-hot
+// across its column-tiles, matching llama.cpp's 512-ubatch weight reuse. The wide
+// chunk path through attention/ring/buffers already exists (media spans up to
+// g_prefill_max_b); this just opens it to text and widens the buffer/ring reserve.
+// 0 = off (legacy 128-token chunking, byte-identical default).
+static int g_wide_chunk = 0;
+static void wide_chunk_init(void) {
+    static int done = 0; if (done) return; done = 1;
+    const char *e = getenv("LG_WIDE_CHUNK");
+    if (!e) return;
+    int w = (atoi(e) / 128) * 128;                 // a whole number of 128-col tiles
+    if (w < PREFILL_B) w = PREFILL_B;
+    if (w > PREFILL_MAX_B) w = PREFILL_MAX_B;
+    g_wide_chunk = w;
+    if (w > g_prefill_max_b) g_prefill_max_b = w;  // size float buffers + KV ring for the wide chunk
+}
+
 // Adaptive prefill chunk width. Full chunks use PREFILL_B (128) so long prefills
 // (system prompt, media) keep the wide-tile win; the short TAIL of a turn rounds
 // up to a multiple of 32 instead of padding to 128 — a 16-token serve turn pays
@@ -948,8 +968,9 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
         // run, and with a window-exact ring the write for the chunk's last
         // token would land on a row its first query still needs.
         int seq = max_seq;
-        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + PREFILL_B < max_seq)
-            seq = c->sliding_window + PREFILL_B;
+        const int chunk_spare = g_wide_chunk ? g_wide_chunk : PREFILL_B;  // ring must hold a whole chunk's writes
+        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + chunk_spare < max_seq)
+            seq = c->sliding_window + chunk_spare;
         kv->seq[L] = seq;
         kv->f16[L] = !m->is_local[L];         // global rows are f16 (see model.h)
         size_t bytes = (size_t)seq * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
@@ -1515,11 +1536,15 @@ static void prefill_act_presize(struct model *m) {
 }
 
 extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
+    wide_chunk_init();                                // before ensure_scratch sizes buffers + ring
     ensure_weights(m);
     ensure_scratch(m);
     prefill_act_presize(m);
+    const int CB = g_wide_chunk ? g_wide_chunk : PREFILL_B;
     int i = 0;
-    for (; n - i >= PREFILL_B; i += PREFILL_B)        // full chunks: weights read once per chunk
+    for (; n - i >= CB; i += CB)                       // wide chunks: weights read once per CB tokens
+        forward_chunk(m, kv, tokens + i, pos0 + i, CB);
+    for (; n - i >= PREFILL_B; i += PREFILL_B)         // remainder (< CB) in legacy 128-chunks
         forward_chunk(m, kv, tokens + i, pos0 + i, PREFILL_B);
     // The warmup tokens exist so ensure_act's one-time cudaMallocs precede graph
     // capture; one chunk does all of them (its activations are BÃ— decode's), so

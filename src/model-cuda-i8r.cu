@@ -760,6 +760,12 @@ matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
     const int r0 = blockIdx.x * (16 * wpc) + warp * 16;            // this warp's 16-row tile
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
+    // gridDim.y column-tiling (wide chunk): this block owns column tile blockIdx.y,
+    // i.e. the COLS columns at offset blockIdx.y*COLS. blockIdx.y==0 (every legacy
+    // single-tile launch) => zero offset => byte-identical to the narrow path.
+    xq  += (size_t)blockIdx.y * COLS * k;
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
     int8_t *sAw = sA + warp * 2 * 16 * SA_ROW;
     float acc[COLS / 8][4];
     #pragma unroll
@@ -879,6 +885,9 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
+    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2048;
     float acc[2][COLS / 8][4];                                     // [tile][h][slot]
     #pragma unroll
@@ -1235,9 +1244,9 @@ static void launch_q4k_tiled(float *d_out, const unsigned char *w, int ts, const
 // width g_pf_cols). Each COLS instantiation opts into its own shared carveout
 // once (COLS>=64 needs >48KB). 16 rows/warp; wpc shrinks so the grid covers SMs.
 template<int COLS>
-static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
+static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;
+    while (wpc > 1 && (long)((m + 16 * wpc - 1) / (16 * wpc)) * ncol < 2 * sms) wpc >>= 1;  // ncol col-tiles also fill SMs
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 16 * SA_ROW;
     static int carve = 0;
     if (!carve) {
@@ -1246,7 +1255,7 @@ static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const i
         carve = 1;
     }
     int blocks = (m + 16 * wpc - 1) / (16 * wpc);
-    matmul_q4k_mmq_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+    matmul_q4k_mmq_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
@@ -1255,9 +1264,9 @@ static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const i
 // 32->64 halves its weight passes (the wide-tile win, applied to the 9%-of-prefill
 // q6_K share without a 1-tile rewrite).
 template<int COLS>
-static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
+static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
     static int carve = 0;
     if (!carve) {
@@ -1266,7 +1275,7 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
         carve = 1;
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    matmul_q6k_mma_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+    matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
@@ -1291,6 +1300,14 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     // g_pf_cols (32/64/96/128): full chunks 128 (4x the old 32-wide reuse), the
     // short tail of a turn smaller so it doesn't pay a 128-wide chunk.
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0 && !no_mma) {
+        // Wide chunk: tile the COLS=128 columns across gridDim.y in ONE launch so a
+        // row-tile's q4_K weights stay L2-hot across its column-tiles (llama.cpp's
+        // 512-ubatch weight reuse), instead of re-streaming them per 128-col launch.
+        // At g_pf_cols==128 this is ncol=1, grid.y==1 == the legacy single launch.
+        if (!port && !tiled && g_pf_cols >= 128 && g_pf_cols % 128 == 0) {
+            launch_q4k_mmq<128>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 128);
+            return;
+        }
         // The fat kernel templates COLS<=128 (acc[COLS/8][4] regs). A whole-image
         // chunk can be wider (bidirectional spans, stage 2), so tile the columns in
         // <=128 passes over offset slices of g_xq/d_out. g_pf_cols is a multiple of
@@ -1329,6 +1346,13 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
     }
     if (q6src && PREFILL_B % 32 == 0) {
+        // Wide chunk: one launch, COLS=64 tiles across gridDim.y -> the row-tile's
+        // q6_K weights stay L2-hot across all its column-tiles (this is q6_K's bigger
+        // win — its 64-col tile re-streams weights twice as often as q4_K's 128).
+        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+            launch_q6k_mmq<64>(d_out, q6src, q6ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+            return;
+        }
         // 64-wide sub-tiles where the chunk allows (halves weight passes vs 32),
         // a 32-wide tail for the leftover 32 cols (g_pf_cols in {32,64,96,128}).
         for (int c0 = 0; c0 < g_pf_cols; ) {
