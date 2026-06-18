@@ -1260,6 +1260,135 @@ matmul_q4k_lean_kernel(float *out, const unsigned char *wbase, int ts,
         }
 }
 
+// PIPE (LG_Q4K_PIPE): lean + software-pipelined weight prefetch — the causal test on
+// the long_scoreboard residual. Issue the NEXT sub-block-pair's weight global loads
+// (into registers) BEFORE unpacking+computing the current one, so the ~400-cycle
+// load latency overlaps the mma work (independent of the in-flight load). If long_sb
+// drops and SM rises, the latency stall was our schedulable ILP; if regs spill and
+// it doesn't, it's register-bound. +16 regs (qc0/qc1/qn0/qn1 uint4) on top of the 64 acc.
+template<int COLS>
+__global__ static void __launch_bounds__(256, 1)
+matmul_q4k_pipe_kernel(float *out, const unsigned char *wbase, int ts,
+                       const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, wpc = blockDim.x >> 5;
+    float2 *sSc = (float2 *)(sA + (size_t)wpc * 2 * 2 * 16 * SA_ROW);
+    const int gid = lane >> 2, tid = lane & 3, nbk = k / 256;
+    xq  += (size_t)blockIdx.y * COLS * k;
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
+    const int r0 = blockIdx.x * (32 * wpc) + warp * 32;
+    int8_t *sAw  = sA + warp * 2 * 2 * 16 * SA_ROW;
+    float2 *sScw = sSc + warp * LEAN_SC;
+    float acc[2][COLS / 8][4];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
+    const int ar = lane & 15, hi = lane >> 4;
+    int row0 = r0 + ar;      if (row0 >= m) row0 = m - 1;       // tile 0 weight row for this lane
+    int row1 = r0 + 16 + ar; if (row1 >= m) row1 = m - 1;       // tile 1
+    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);
+    asm volatile("cp.async.commit_group;\n");
+
+    for (int blk = 0; blk < nbk; blk++) {
+        int buf = blk & 1;
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        if (blk + 1 < nbk) {
+            mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
+            asm volatile("cp.async.commit_group;\n");
+        }
+        const int8_t *sBb = sB + buf * COLS * SB_COL;
+        const float2 *sBxd = sBxds + buf * COLS * SBX;
+        const uint8_t *qs0 = ((const block_q4_K *)(wbase + (size_t)row0 * nbk * ts) + blk)->qs + hi * 16;
+        const uint8_t *qs1 = ((const block_q4_K *)(wbase + (size_t)row1 * nbk * ts) + blk)->qs + hi * 16;
+
+        {   // scale staging (same as lean)
+            int tl = lane >> 4, row16 = lane & 15;
+            int grow = r0 + tl * 16 + row16; if (grow >= m) grow = m - 1;
+            const block_q4_K *hp = (const block_q4_K *)(wbase + (size_t)grow * nbk * ts) + blk;
+            const uint32_t *sc = (const uint32_t *)hp->scales;
+            float dD, dM; d_dm(&hp->d, &dD, &dM);
+            #pragma unroll
+            for (int sj = 0; sj < 8; sj++) {
+                uint8_t s8, m8; d_gsm32r(sj, sc[0], sc[1], sc[2], &s8, &m8);
+                sScw[tl * (16 * 8) + row16 * 8 + sj] = make_float2(dD * s8, dM * m8);
+            }
+        }
+        __syncwarp();
+
+        uint4 qc0 = *(const uint4 *)(qs0), qc1 = *(const uint4 *)(qs1);   // prologue: sjp=0 weights
+        #pragma unroll
+        for (int sjp = 0; sjp < 4; sjp++) {
+            uint4 qn0, qn1;
+            if (sjp + 1 < 4) {                                            // PREFETCH sjp+1 (overlaps compute below)
+                qn0 = *(const uint4 *)(qs0 + (sjp + 1) * 32);
+                qn1 = *(const uint4 *)(qs1 + (sjp + 1) * 32);
+            }
+            {   // unpack CURRENT (qc) into shared
+                int8_t *sAt0 = sAw + 0 * 2 * 16 * SA_ROW;
+                int8_t *sAt1 = sAw + 1 * 2 * 16 * SA_ROW;
+                uint32_t *lo0 = (uint32_t *)(sAt0 + ar * SA_ROW + hi * 16), *hh0 = (uint32_t *)(sAt0 + 16 * SA_ROW + ar * SA_ROW + hi * 16);
+                uint32_t *lo1 = (uint32_t *)(sAt1 + ar * SA_ROW + hi * 16), *hh1 = (uint32_t *)(sAt1 + 16 * SA_ROW + ar * SA_ROW + hi * 16);
+                lo0[0] = (uint32_t)nib4(qc0.x, 0); lo0[1] = (uint32_t)nib4(qc0.y, 0); lo0[2] = (uint32_t)nib4(qc0.z, 0); lo0[3] = (uint32_t)nib4(qc0.w, 0);
+                hh0[0] = (uint32_t)nib4(qc0.x, 1); hh0[1] = (uint32_t)nib4(qc0.y, 1); hh0[2] = (uint32_t)nib4(qc0.z, 1); hh0[3] = (uint32_t)nib4(qc0.w, 1);
+                lo1[0] = (uint32_t)nib4(qc1.x, 0); lo1[1] = (uint32_t)nib4(qc1.y, 0); lo1[2] = (uint32_t)nib4(qc1.z, 0); lo1[3] = (uint32_t)nib4(qc1.w, 0);
+                hh1[0] = (uint32_t)nib4(qc1.x, 1); hh1[1] = (uint32_t)nib4(qc1.y, 1); hh1[2] = (uint32_t)nib4(qc1.z, 1); hh1[3] = (uint32_t)nib4(qc1.w, 1);
+            }
+            __syncwarp();
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                int sj = sjp * 2 + half;
+                float2 sa0 = sScw[0 * (16 * 8) + gid * 8 + sj], sb0 = sScw[0 * (16 * 8) + (gid + 8) * 8 + sj];
+                float2 sa1 = sScw[1 * (16 * 8) + gid * 8 + sj], sb1 = sScw[1 * (16 * 8) + (gid + 8) * 8 + sj];
+                const int8_t *sAh0 = sAw + 0 * 2 * 16 * SA_ROW + half * 16 * SA_ROW;
+                const int8_t *sAh1 = sAw + 1 * 2 * 16 * SA_ROW + half * 16 * SA_ROW;
+                uint32_t a0_0 = *(uint32_t *)(sAh0 + gid * SA_ROW + tid * 4), a1_0 = *(uint32_t *)(sAh0 + (gid + 8) * SA_ROW + tid * 4);
+                uint32_t a2_0 = *(uint32_t *)(sAh0 + gid * SA_ROW + tid * 4 + 16), a3_0 = *(uint32_t *)(sAh0 + (gid + 8) * SA_ROW + tid * 4 + 16);
+                uint32_t a0_1 = *(uint32_t *)(sAh1 + gid * SA_ROW + tid * 4), a1_1 = *(uint32_t *)(sAh1 + (gid + 8) * SA_ROW + tid * 4);
+                uint32_t a2_1 = *(uint32_t *)(sAh1 + gid * SA_ROW + tid * 4 + 16), a3_1 = *(uint32_t *)(sAh1 + (gid + 8) * SA_ROW + tid * 4 + 16);
+                const int8_t *pB = sBb + gid * SB_COL + sj * 32 + tid * 4;
+                const float2 *pX = sBxd + (tid * 2) * SBX + sj;
+                #pragma unroll
+                for (int h = 0; h < COLS / 8; h++) {
+                    uint32_t b0 = *(const uint32_t *)pB;
+                    uint32_t b1 = *(const uint32_t *)(pB + 16);
+                    float2 xd0 = pX[0];
+                    float2 xd1 = pX[SBX];
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0, e0 = 0, e1 = 0, e2 = 0, e3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3) : "r"(a0_0), "r"(a1_0), "r"(a2_0), "r"(a3_0), "r"(b0), "r"(b1));
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(e0), "+r"(e1), "+r"(e2), "+r"(e3) : "r"(a0_1), "r"(a1_1), "r"(a2_1), "r"(a3_1), "r"(b0), "r"(b1));
+                    acc[0][h][0] += xd0.x * (sa0.x * (float)c0 - sa0.y * xd0.y);
+                    acc[0][h][1] += xd1.x * (sa0.x * (float)c1 - sa0.y * xd1.y);
+                    acc[0][h][2] += xd0.x * (sb0.x * (float)c2 - sb0.y * xd0.y);
+                    acc[0][h][3] += xd1.x * (sb0.x * (float)c3 - sb0.y * xd1.y);
+                    acc[1][h][0] += xd0.x * (sa1.x * (float)e0 - sa1.y * xd0.y);
+                    acc[1][h][1] += xd1.x * (sa1.x * (float)e1 - sa1.y * xd1.y);
+                    acc[1][h][2] += xd0.x * (sb1.x * (float)e2 - sb1.y * xd0.y);
+                    acc[1][h][3] += xd1.x * (sb1.x * (float)e3 - sb1.y * xd1.y);
+                    pB += 8 * SB_COL;
+                    pX += 8 * SBX;
+                }
+            }
+            __syncwarp();
+            qc0 = qn0; qc1 = qn1;                                         // advance the pipeline
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 2; t++)
+        #pragma unroll
+        for (int h = 0; h < COLS / 8; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
+            if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
+            if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+        }
+}
+
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
 // Same CTA shape and double-buffered activation staging as the q4_K kernel;
 // what changes is the A side. q6_K carries a per-16-element int8 scale, so the
@@ -1753,6 +1882,22 @@ static void launch_q4k_lean(float *d_out, const unsigned char *w, int ts, const 
     matmul_q4k_lean_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
+// Pipe launcher (LG_Q4K_PIPE): lean + software-pipelined weight prefetch. Same shared as lean.
+template<int COLS>
+static void launch_q4k_pipe(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol) {
+    int wpc = 8;
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2 * 16 * SA_ROW + (size_t)wpc * LEAN_SC * sizeof(float2);
+    static int carve = 0;
+    if (!carve) {
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 2 * 16 * SA_ROW + (size_t)8 * LEAN_SC * sizeof(float2);
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_pipe_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        carve = 1;
+    }
+    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
+    matmul_q4k_pipe_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+}
+
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
 // (32 rows/warp), whose acc[2][COLS/8][4] fits up to COLS=64 (~121 regs); the big
 // 2*2048/warp A tile needs the carveout past COLS=32. Widening the q6_K sub-tile
@@ -1794,6 +1939,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (bulk < 0) bulk = getenv("LG_Q4K_BULK") != NULL;
     static int lean = -1;                                    // scales-in-shared + pointer-increment addressing
     if (lean < 0) lean = getenv("LG_Q4K_LEAN") != NULL;
+    static int pipe = -1;                                    // lean + software-pipelined weight prefetch
+    if (pipe < 0) pipe = getenv("LG_Q4K_PIPE") != NULL;
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
@@ -1810,6 +1957,11 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         // 512-ubatch weight reuse), instead of re-streaming them per 128-col launch.
         // At g_pf_cols==128 this is ncol=1, grid.y==1 == the legacy single launch.
         if (!port && !tiled) {
+            // pipe (LG_Q4K_PIPE): lean + software-pipelined weight prefetch (hide long_sb).
+            if (pipe && g_pf_cols >= 64 && g_pf_cols % 64 == 0) {
+                launch_q4k_pipe<64>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+                return;
+            }
             // lean (LG_Q4K_LEAN): scales-in-shared (kill shuffles) + pointer-increment addressing.
             if (lean && g_pf_cols >= 64 && g_pf_cols % 64 == 0) {
                 launch_q4k_lean<64>(d_out, w, ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
