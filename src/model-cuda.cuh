@@ -1310,8 +1310,15 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
         static int no_splitk = -1;
         if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
-        bool flash = !no_flash && B > 2 && !g_chunk_verify && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
-        bool share = (B > 2) && !g_chunk_verify && (window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
+        // LG_FORCE_KVSHARE: route E4B's flash path through K/V-sharing instead. The
+        // ncu showed flash is L1-bandwidth bound (92-95%) re-reading K/V per query;
+        // the L2-footprint gate that disabled sharing on E4B measured the wrong
+        // resource. Test whether staging K/V to shared (reuse across QT queries)
+        // relieves the L1 wall. Text-prefill only (share path has no bidir mask).
+        static int force_share = -1;
+        if (force_share < 0) force_share = getenv("LG_FORCE_KVSHARE") != NULL;
+        bool flash = !no_flash && !force_share && B > 2 && !g_chunk_verify && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
+        bool share = (B > 2) && !g_chunk_verify && (force_share || window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
         // The B<=2 MTP verify runs the SAME split-K kernel as decode (one extra
         // grid axis for the 2 query rows): out[0]/out[1] then byte-match plain
         // decode's forwards at pos/pos+1 by construction, and verify's attention
