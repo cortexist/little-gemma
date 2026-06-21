@@ -8,7 +8,7 @@
 // are NOT sqrt(n_embd)-scaled — the model scales only real token lookups).
 //
 // little-gemma does not read media FILES. Decoding, resizing and resampling
-// belong to an upstream tool (tools/media_cat.c) that delivers model-ready
+// belong to an upstream tool (mmcat, in little-gemma-tools) that delivers model-ready
 // raw data over the socket: u8 RGB with both sides multiples of the patch
 // size, and mono 16 kHz s16 PCM padded to whole frames. What stays here is
 // exactly what the mmproj tensors define — the patch layout, the

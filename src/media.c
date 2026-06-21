@@ -1,5 +1,5 @@
 // Multimodal embedders for the gemma-4 mmproj files (see media.h).
-// Raw data in, embedding rows out — file decoding lives in tools/media_cat.c.
+// Raw data in, embedding rows out — file decoding lives in mmcat (little-gemma-tools).
 // Everything runs on the host in f32: even the 16-block legacy vision
 // transformer is a few hundred GFLOP per image, done once per prompt.
 // The math mirrors llama.cpp's clip graphs (gemma4uv/gemma4ua for the 12B,

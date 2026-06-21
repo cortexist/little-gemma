@@ -108,16 +108,8 @@ else()
     target_link_libraries(socket_cat PRIVATE Threads::Threads)
 endif()
 
-# media_cat: decodes image/audio FILES into the raw frames the server's media
-# protocol carries (the model runner itself never reads media files). The only
-# place third-party code (vendor/stb_image.h) is compiled.
-add_executable(media_cat tools/media_cat.c)
-target_include_directories(media_cat PRIVATE include vendor)
-if(WIN32)
-    target_link_libraries(media_cat PRIVATE ws2_32)
-elseif(UNIX)
-    target_link_libraries(media_cat PRIVATE m)
-endif()
+# media files (decode/resize/resample) are handled by mmcat in the sibling repo
+# little-gemma-tools — kept out of the core so it stays dependency-free C/CUDA.
 
 # --- tensor/graph self-test ------------------------------------------------
 add_executable(graph_test test/graph_test.c src/graph.c)
