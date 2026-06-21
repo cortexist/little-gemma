@@ -275,7 +275,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             // " 00:01 " frame ...) — then the text line. The first byte tells
             // frame from line, so a text-only client speaks the same protocol
             // it always did.
-            #define MAX_SEG 32
+            // Practical per-turn media-span cap (a video frame is 2 segs: its
+            // MM:SS text + the image, so this holds ~128 frames). Longer video
+            // and live streams are the application's job — split across turns and
+            // stitched as one conversation via skills, not buffered in one turn.
+            // The real token bound is the SERVE_SEQ context check below; this is
+            // just the span-collection array, so a generous cap is cheap.
+            #define MAX_SEG 256
             struct { char kind; float *rows; int n; char *text; } seg[MAX_SEG];
             int n_seg = 0, in_media = 0, in_text = 0;
             char c0 = 0;
