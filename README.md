@@ -44,7 +44,7 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
                     │   readable f32 matmul     │  int8 dp4a + wide loads  │
                     └───────────────────────────┴──────────────────────────┘
 
- tools/  — socket_cat (the raw wire) · media_cat (files → frames + question)
+ tools/  — socket_cat (the raw wire); media files → frames via mmcat (sibling repo little-gemma-tools)
  graph.c — a minimal tensor/graph layer (matmul, rmsnorm, softmax, …) kept as
            the "what a compute graph is" teaching reference (graph_test only).
 ```
@@ -214,21 +214,23 @@ text — they are just rows the tokenizer didn't make. Media embeddings are
 The runner never reads media **files**. The split mirrors the socket design:
 file formats — JPEG entropy coding, WAV chunk soup, resampling, resize
 filters — belong to an upstream tool, and the model runner handles only what
-its own tensors define. `media_cat` (`tools/media_cat.c`) decodes files into
-the raw shape the model wants (u8 RGB at 48-multiple dimensions, mono 16 kHz
-s16 PCM in whole frames), sends them as typed length-prefixed frames followed
-by the question line, and streams the answer:
+its own tensors define. That tool is **`mmcat`**, in the sibling repo
+[`little-gemma-tools`](../little-gemma-tools): it auto-detects each file with
+`ffprobe` and decodes with `ffmpeg` (so it takes mp4/mkv/webm/jpg/png/wav/… and
+an mp4's video+soundtrack from one argument), then sends the raw shape the model
+wants (u8 RGB at 48-multiple dimensions, mono 16 kHz s16 PCM in whole frames) as
+typed length-prefixed frames followed by the question line, and streams the
+answer. Keeping it a separate repo is the point — the core stays dependency-free
+C/CUDA; the file-decoding dependency (ffmpeg) lives with the tool, not the engine.
 
 ```
 run-cuda-i8r -m gemma-4-12B-it-Q4_K_M.gguf -mm mmproj-F16.gguf -s %TEMP%\lg.sock
-media_cat %TEMP%\lg.sock -i photo.jpg "What is in this image?"
-media_cat %TEMP%\lg.sock -a clip.wav  "Transcribe this."
-media_cat %TEMP%\lg.sock -t "Frame at 0:01: " -i f1.jpg -t " Frame at 0:02: " -i f2.jpg \
-          "What changes between the frames?"
+mmcat %TEMP%\lg.sock photo.jpg "What is in this image?"
+mmcat %TEMP%\lg.sock clip.mp4  "What happens, and what is said?"
 ```
 
-A turn over the socket is zero or more typed frames — media spans, and `-t`
-text that lands between them — then the usual newline-terminated text line;
+A turn over the socket is zero or more typed frames — media spans, and text
+frames that land between them — then the usual newline-terminated text line;
 a text-only client speaks the same protocol it always did. The interleaved
 text is what makes a multi-image turn legible to the model: given two bare
 images it answers "there is only one image", but with timestamp text between
@@ -245,7 +247,7 @@ Text is optional when media frames are sent: a spoken question, or a written
 note shown to the camera, is a complete turn by itself —
 
 ```
-media_cat %TEMP%\lg.sock -a question.wav
+mmcat %TEMP%\lg.sock question.wav
 ```
 
 — and the model answers the *voice*, because past the projection it cannot
@@ -430,9 +432,10 @@ is for.
 | include   | 6     |   254 |
 
 ~6,060 lines of code in the repository (the original 3,000 exploring ceiling was
-retired when the sandbox phase began; `tools/` and the vendored
-`vendor/stb_image.h` — compiled only into `media_cat` — are not counted). The
-backends are mutually exclusive, so no single program is anywhere near that.
+retired when the sandbox phase began; `tools/` is not counted). The core now
+vendors **nothing** — pure C/CUDA — since media-file decoding moved to `mmcat` in
+the sibling little-gemma-tools repo (the old `vendor/stb_image.h` went with it).
+The backends are mutually exclusive, so no single program is anywhere near that.
 Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
 multimodal embedders, the MTP draft head, CLI + socket server — 2,657 lines)
 plus exactly one backend:

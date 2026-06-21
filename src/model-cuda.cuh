@@ -812,7 +812,7 @@ static int kv_src_dev(const struct model *m, int L) {
 // to the ceiling when a media projector is loaded (model_prefill_reserve), so the
 // activation buffers are sized ONCE at scratch init and the decode graph captures
 // the final pointers (never realloc'd -> decode untouched). If a big image OOMs,
-// that is the deployment's signal to throttle media_cat's -n, not the engine's to cap.
+// that is the deployment's signal to throttle mmcat's -n, not the engine's to cap.
 #define PREFILL_MAX_B 1120
 static int g_prefill_max_b = PREFILL_B;
 extern "C" void model_prefill_reserve(void) {
