@@ -748,22 +748,22 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 //               a2 row gid   k16..31, a3 row gid+8 k16..31
 //   B (2 regs): b0 col gid   k0..15, b1 col gid   k16..31
 //   C (4 regs): c0/c1 row gid col tid*2/+1, c2/c3 row gid+8 same
+// One CTA's tile body, factored so the plain kernel and the stream-K kernel
+// share the exact same MMA / dequant / epilogue math. r0base is this CTA's tile
+// origin row (blockIdx.x*32*wpc); xq/xds/out already point at this column-tile.
+// [kb0, kb1) is the superblock RANGE this CTA covers for the tile (plain = full
+// [0,nbk)). The acc registers come out in the same (row,col) layout the epilogue
+// stores: acc[t][h][slot] -> (col0=h*8+tid*2 (+1), row=r0+t*16+gid (+8)).
 template<int COLS>
-__global__ static void __launch_bounds__(256)
-matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m) {
-    extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS][SB_COL]
-    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS][SBX]
-    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][2 halves][16][SA_ROW]
+__device__ static void q4k_tile(const block_q4_K *w, const int8_t *xq, const float2 *xds,
+                                int k, int m, int r0base, int kb0, int kb1,
+                                int8_t *sB, float2 *sBxds, int8_t *sA,
+                                float acc[2][COLS / 8][4]) {
     const int nbk = k / 256;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    const int r0 = r0base + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
-    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
-    xds += (size_t)blockIdx.y * COLS * (k / 32);
-    out += (size_t)blockIdx.y * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
-    float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
     for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
@@ -771,14 +771,19 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const block_q4_K *myrow = w + (size_t)rowL * nbk;
 
-    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
+    // CTA-wide barrier before the prologue restages sB/sBxds: when a stream-K CTA
+    // processes several tiles back-to-back this stops the next tile's mma_stage_b
+    // from clobbering a buffer a slower warp is still reading. Harmless (no prior
+    // shared deps) on the first call from the plain kernel.
+    __syncthreads();
+    mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, kb0, threadIdx.x);  // prologue: first block in flight
     asm volatile("cp.async.commit_group;\n");
 
-    for (int blk = 0; blk < nbk; blk++) {
-        int buf = blk & 1;
+    for (int blk = kb0; blk < kb1; blk++) {
+        int buf = (blk - kb0) & 1;
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();                                           // staged data visible CTA-wide
-        if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
+        if (blk + 1 < kb1) {                                       // next block overlaps this one's mma
             mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
@@ -853,6 +858,24 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
             __syncwarp();                                          // all reads done before re-stage
         }
     }
+}
+
+template<int COLS>
+__global__ static void __launch_bounds__(256)
+matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS][SB_COL]
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS][SBX]
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][2 halves][16][SA_ROW]
+    const int nbk = k / 256;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    const int gid = lane >> 2, tid = lane & 3;
+    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
+    float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
+    q4k_tile<COLS>(w, xq, xds, k, m, blockIdx.x * (32 * (blockDim.x >> 5)), 0, nbk, sB, sBxds, sA, acc);
 
     #pragma unroll
     for (int t = 0; t < 2; t++)
@@ -861,6 +884,170 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
             int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
             if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
             if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+        }
+}
+
+// ==== stream-K q4_K (LG_Q4K_STREAMK) ========================================
+// A lock-free split-K that slices the K dimension only when a CTA spans a tile
+// boundary — mirrors llama's matmul_q_prefill + _stream_k_fixup (src/llama-mmq.cu)
+// stripped of all the MoE / ids / expert / channel / sample generality (for us
+// nsamples_y = nchannels_y = 1, no experts). NO ATOMICS anywhere.
+//
+// Work is flattened as (tiles x superblocks): T = nty * ncol tiles (nty row-tiles
+// of 32*wpc rows, ncol column-tiles of COLS), each tile loops nbk = k/256
+// superblocks. The grid is nsm CTAs; CTA c owns the contiguous flattened range
+// [kbc, kbc_stop) where kbc = c*(T*nbk)/nsm. Lock-free WRITE RULE: a CTA that
+// computes a tile's FINAL superblock (kb1 == nbk) writes acc DIRECTLY to dst —
+// and since each tile's last superblock is computed by exactly one CTA, dst is
+// written by exactly one CTA, so no atomics and no races. A CTA's trailing
+// PARTIAL tile (kb1 < nbk) goes to its own private scratch slot tmp_fixup[c],
+// to be summed in by the fixup kernel.
+//
+// tmp_fixup layout: nsm slots of COLS*(32*wpc) floats, each slot the tile's acc
+// in [col][row] column-major order (col*rows_per_cta + row), so the fixup kernel
+// re-reads at the same (col,row) the main kernel's epilogue would have stored.
+
+// store this CTA's acc into the private fixup slot (or add to dst); col-major
+// [col][localrow] within a rows_per_cta-tall tile.
+template<int COLS>
+__device__ static void q4k_acc_to_fixup(float *slot, int rows_per_cta,
+                                        float acc[2][COLS / 8][4]) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rl0 = warp * 32;                       // this warp's local row origin
+    const int gid = lane >> 2, tid = lane & 3;
+    #pragma unroll
+    for (int t = 0; t < 2; t++)
+        for (int h = 0; h < COLS / 8; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = rl0 + t * 16 + gid, rB = rl0 + t * 16 + gid + 8;
+            slot[(size_t)col0 * rows_per_cta + rA]       = acc[t][h][0];
+            slot[(size_t)(col0 + 1) * rows_per_cta + rA] = acc[t][h][1];
+            slot[(size_t)col0 * rows_per_cta + rB]       = acc[t][h][2];
+            slot[(size_t)(col0 + 1) * rows_per_cta + rB] = acc[t][h][3];
+        }
+}
+
+template<int COLS>
+__global__ static void __launch_bounds__(256)
+matmul_q4k_streamk_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
+                          int k, int m, int nty, int ncol, float *tmp_fixup) {
+    extern __shared__ unsigned char sh[];
+    int8_t *sB    = (int8_t *)sh;
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8);
+    const int nbk = k / 256;
+    const int rows_per_cta = 32 * (blockDim.x >> 5);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tid = lane & 3;
+    const long T = (long)nty * ncol;
+
+    long kbc      = (long)blockIdx.x       * T * nbk / gridDim.x;
+    long kbc_stop = (long)(blockIdx.x + 1) * T * nbk / gridDim.x;
+
+    int kb0 = kbc % nbk;                                          // start superblock within first tile
+    int kb1 = min((long)nbk, kb0 + (kbc_stop - kbc));            // end superblock within first tile
+    while (kbc < kbc_stop && kb1 == nbk) {                        // tiles this CTA finishes -> direct dst write
+        long t  = kbc / nbk;                                      // flattened tile index
+        int  it = t % nty;                                        // row-tile
+        int  jt = t / nty;                                        // column-tile
+        const int8_t  *xqc = xq  + (size_t)jt * COLS * k;
+        const float2  *xdc = xds + (size_t)jt * COLS * (k / 32);
+        float         *oc  = out + (size_t)jt * COLS * m;
+        float acc[2][COLS / 8][4];
+        q4k_tile<COLS>(w, xqc, xdc, k, m, it * rows_per_cta, kb0, kb1, sB, sBxds, sA, acc);
+
+        const int r0 = it * rows_per_cta + warp * 32;
+        #pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+            for (int h = 0; h < COLS / 8; h++) {
+                int col0 = h * 8 + tid * 2;
+                int rA = r0 + tt * 16 + gid, rB = r0 + tt * 16 + gid + 8;
+                if (rA < m) { oc[(size_t)col0 * m + rA] = acc[tt][h][0]; oc[(size_t)(col0 + 1) * m + rA] = acc[tt][h][1]; }
+                if (rB < m) { oc[(size_t)col0 * m + rB] = acc[tt][h][2]; oc[(size_t)(col0 + 1) * m + rB] = acc[tt][h][3]; }
+            }
+
+        kbc = t * nbk + kb1;                                      // advance to next tile boundary
+        kb0 = 0;
+        kb1 = min((long)nbk, kbc_stop - kbc);
+    }
+
+    if (kbc >= kbc_stop) return;                                 // no trailing partial
+
+    // trailing partial tile: kb1 < nbk -> this CTA did NOT finish the tile, so
+    // write its prefix-partial to its own private fixup slot (no contention).
+    long t  = kbc / nbk;
+    int  it = t % nty;
+    int  jt = t / nty;
+    const int8_t  *xqc = xq  + (size_t)jt * COLS * k;
+    const float2  *xdc = xds + (size_t)jt * COLS * (k / 32);
+    float acc[2][COLS / 8][4];
+    q4k_tile<COLS>(w, xqc, xdc, k, m, it * rows_per_cta, kb0, kb1, sB, sBxds, sA, acc);
+    q4k_acc_to_fixup<COLS>(tmp_fixup + (size_t)blockIdx.x * COLS * rows_per_cta, rows_per_cta, acc);
+}
+
+// Fixup: combine the prefix-partials a previous CTA wrote into the dst tile that
+// THIS CTA c0 finished (started mid-tile and wrote its last superblock to dst).
+// Backward-walk c = c0-1, c0-2, ... adding each prior CTA's private slot to dst
+// until a CTA that started at a tile boundary. Each dst tile is fixed by exactly
+// one c0, so plain loads/stores — no atomics.
+template<int COLS>
+__global__ static void __launch_bounds__(256)
+matmul_q4k_streamk_fixup(float *out, const float *tmp_fixup, int m, int nbk, int nty, int ncol) {
+    const int rows_per_cta = 32 * (blockDim.x >> 5);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tid = lane & 3;
+    const long T = (long)nty * ncol;
+
+    long kbc0      = (long)blockIdx.x       * T * nbk / gridDim.x;
+    long kbc0_stop = (long)(blockIdx.x + 1) * T * nbk / gridDim.x;
+
+    bool no_data        = kbc0 == kbc0_stop;
+    bool began_at_tile  = kbc0 % nbk == 0;                        // wrote a tile from its start (its last -> dst)
+    bool did_not_finish = kbc0 / nbk == kbc0_stop / nbk && kbc0_stop % nbk != 0; // stayed inside one tile, ended mid
+    if (no_data || began_at_tile || did_not_finish) return;
+
+    long t  = kbc0 / nbk;                                         // the tile this CTA finished (wrote dst)
+    int  it = t % nty;
+    int  jt = t / nty;
+    float *oc = out + (size_t)jt * COLS * m;                      // it offset lives in r0/rA (matches the direct write)
+
+    float sum[2][COLS / 8][4];
+    #pragma unroll
+    for (int tt = 0; tt < 2; tt++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) sum[tt][h][s] = 0.0f;
+
+    long bidx = (long)blockIdx.x - 1;
+    long stop = kbc0;
+    while (true) {
+        long kbc = bidx * T * nbk / gridDim.x;
+        if (kbc == stop) { bidx--; stop = kbc; continue; }       // that CTA had no data; skip
+
+        const float *slot = tmp_fixup + (size_t)bidx * COLS * rows_per_cta;
+        #pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+            for (int h = 0; h < COLS / 8; h++) {
+                int col0 = h * 8 + tid * 2;
+                int rlA = warp * 32 + tt * 16 + gid, rlB = warp * 32 + tt * 16 + gid + 8;
+                sum[tt][h][0] += slot[(size_t)col0 * rows_per_cta + rlA];
+                sum[tt][h][1] += slot[(size_t)(col0 + 1) * rows_per_cta + rlA];
+                sum[tt][h][2] += slot[(size_t)col0 * rows_per_cta + rlB];
+                sum[tt][h][3] += slot[(size_t)(col0 + 1) * rows_per_cta + rlB];
+            }
+        // Done once a previous CTA started this tile from superblock 0, OR started
+        // in an EARLIER tile — in the latter case its trailing partial (the slot we
+        // just read) already covered our whole prefix, so don't walk further back.
+        if (kbc % nbk == 0 || kbc / nbk < t) break;
+        bidx--;
+        stop = kbc;
+    }
+
+    const int r0 = it * rows_per_cta + warp * 32;
+    #pragma unroll
+    for (int tt = 0; tt < 2; tt++)
+        for (int h = 0; h < COLS / 8; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = r0 + tt * 16 + gid, rB = r0 + tt * 16 + gid + 8;
+            if (rA < m) { oc[(size_t)col0 * m + rA] += sum[tt][h][0]; oc[(size_t)(col0 + 1) * m + rA] += sum[tt][h][1]; }
+            if (rB < m) { oc[(size_t)col0 * m + rB] += sum[tt][h][2]; oc[(size_t)(col0 + 1) * m + rB] += sum[tt][h][3]; }
         }
 }
 
@@ -882,6 +1069,40 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
     matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
+}
+
+// stream-K fixup scratch: nsm slots of COLS*(32*wpc) floats (lazy-grown, like the
+// activation buffers). Holds at most one prefix-partial tile per CTA.
+static float *g_q4k_fixup = NULL; static size_t g_q4k_fixup_cap = 0;
+static float *ensure_q4k_fixup(size_t floats) {
+    if (floats <= g_q4k_fixup_cap) return g_q4k_fixup;
+    cudaFree(g_q4k_fixup);
+    CUDA_CHECK(cudaMalloc(&g_q4k_fixup, floats * sizeof(float)));
+    g_q4k_fixup_cap = floats;
+    return g_q4k_fixup;
+}
+
+// stream-K q4_K launcher (LG_Q4K_STREAMK). Same CTA shape as launch_q4k_mma, but
+// the grid is nsm CTAs that share the (tiles x superblocks) work; a separate
+// fixup launch (also nsm CTAs) folds in the prefix-partials.
+template<int COLS>
+static void launch_q4k_streamk(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
+                               int k, int m, int sms, int ncol = 1) {
+    int wpc = 8;
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    int rows_per_cta = 32 * wpc;
+    int nty = (m + rows_per_cta - 1) / rows_per_cta;
+    size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
+    static int carve = 0;
+    if (!carve) {
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_streamk_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        carve = 1;
+    }
+    float *fixup = ensure_q4k_fixup((size_t)sms * COLS * rows_per_cta);
+    matmul_q4k_streamk_kernel<COLS><<<sms, 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, nty, ncol, fixup);
+    matmul_q4k_streamk_fixup<COLS><<<sms, 32 * wpc, 0, g_launch>>>(d_out, fixup, m, k / 256, nty, ncol);
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -1097,8 +1318,23 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     if (t->type == GGML_TYPE_Q4_K) {
         static int own = -1;
         if (own < 0) own = getenv("LG_Q4K_OWN") != NULL;
+        static int streamk = -1;
+        if (streamk < 0) streamk = getenv("LG_Q4K_STREAMK") != NULL;
         if (own && PREFILL_B % 32 == 0) {
             const block_q4_K *q4 = (const block_q4_K *)w;
+            if (streamk) {                                            // 3rd mode: lock-free stream-K
+                if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+                    launch_q4k_streamk<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+                    return;
+                }
+                for (int c0 = 0; c0 < g_pf_cols; ) {
+                    const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+                    float *outc = d_out + (size_t)c0 * m;
+                    if (g_pf_cols - c0 >= 64) { launch_q4k_streamk<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
+                    else                     { launch_q4k_streamk<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
+                }
+                return;
+            }
             if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
                 launch_q4k_mma<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
                 return;
