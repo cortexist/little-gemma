@@ -82,6 +82,16 @@ __device__ static void d_gsm32(int j, const uint32_t *s, uint8_t *d, uint8_t *m)
         *m = (((s[2] >> b) >> 4) & 0x0F) | (((s[1] >> (b + 6)) & 3) << 4);
     }
 }
+// Same bits, the 3 scale words already in registers (the mma kernel loads them
+// once per row rather than re-reading the uncached in-place blob per sub-block).
+__device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = (s0 >> (8 * j)) & 63; *m = (s1 >> (8 * j)) & 63; }
+    else {
+        int b = 8 * (j - 4);
+        *d = ((s2 >> b) & 0x0F) | (((s0 >> (b + 6)) & 3) << 4);
+        *m = (((s2 >> b) >> 4) & 0x0F) | (((s1 >> (b + 6)) & 3) << 4);
+    }
+}
 // d and dmin are adjacent fp16 — one word load covers both.
 __device__ static void d_dm(const ggml_half *dp, float *d, float *mn) {
     uint32_t w = ld32(dp);
@@ -657,42 +667,24 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     }
 }
 
-// ==== the tensor-core chunk matmul (q4_K, prefill only) ======================
+// ==== the tensor-core chunk matmul (q4_K + q6_K, prefill only) ===============
 // The dp4a chunk kernel above is issue-bound: every 4-element dot pays its own
 // unpack ALU chain, one warp per row, ~1 int8-TOPS on the Orin (the journal's
 // prefill chapter has the full audit trail — B-sweeps and memory staging were
-// measured dead ends). Here one mma.m16n8k32 instruction does 4,096 MACs, so
-// a warp covers 16 rows x 16 columns and each unpacked weight nibble feeds 16
-// columns through one instruction instead of 16 dp4a chains.
+// measured dead ends). Here one mma.m16n8k32 instruction does 4,096 MACs, so a
+// warp's 16-row tile feeds every unpacked weight nibble to COLS columns through
+// one instruction instead of COLS dp4a chains.
 //
-// Q4_K only (85% of chunk MACs on both Q4_K_M models — the coverage probe
-// below); everything else stays on the dp4a kernel. PREFILL ONLY: decode and
-// the B=2 MTP verify never run this, so their byte-identity gates are
-// untouched. The integer sub-block dots here are EXACT (s32 accumulate, same
-// values dp4a produces); only the float ORDER of combining sub-block
-// contributions differs — each (row, column) is summed by one lane in
-// ascending k — so chunked prefill is no longer byte-identical to per-token
-// prefill, the same gate relaxation the online-softmax step shipped with
-// (deterministic + numerically equivalent; the step-2 harness measured this
-// kernel slightly CLOSER to a double reference than the dp4a path).
-// LG_NO_MMA=1 forces the dp4a path back for A/B.
-//
-// Per CTA: 8 warps, 128 rows x 16 columns. Per q4_K block (256 weights), the
-// CTA stages all 16 columns' activations once (two barriers per block, ten
-// per typical k); per sub-block, each warp stages its 16 rows' unpacked
-// nibbles warp-synchronously (no CTA barrier), builds fragments by direct
-// shared reads (the lane mapping is the documented m16n8k32 layout — see
-// .scratch/mma_test.cu, the validating harness), and shuffle-broadcasts the
-// per-row scale pairs from the 16 lanes that hold block headers in registers.
-
-__device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, uint8_t *d, uint8_t *m) {
-    if (j < 4) { *d = (s0 >> (8 * j)) & 63; *m = (s1 >> (8 * j)) & 63; }
-    else {
-        int b = 8 * (j - 4);
-        *d = ((s2 >> b) & 0x0F) | (((s0 >> (b + 6)) & 3) << 4);
-        *m = (((s2 >> b) >> 4) & 0x0F) | (((s1 >> (b + 6)) & 3) << 4);
-    }
-}
+// Q4_K is 85% of chunk MACs on both Q4_K_M models (the coverage probe below);
+// q6_K is most of the rest; everything else stays on the dp4a kernel. PREFILL
+// ONLY: decode and the MTP verify never run this, so their byte-identity gates
+// are untouched. The integer sub-block dots here are EXACT (s32 accumulate,
+// same values dp4a produces); only the float ORDER of combining sub-block
+// contributions differs — each (row, column) is summed by one lane in ascending
+// k — so chunked prefill is numerically equivalent but not byte-identical to
+// per-token prefill, the same gate relaxation the online-softmax step shipped
+// with. LG_NO_MMA=1 forces the dp4a path back for A/B. Fragment mappings validated
+// in .scratch/mma4_test.cu (k32) and mma6_test.cu (k16) before either kernel existed.
 
 // One thread's share of staging activation block `blk` into buffer `buf`,
 // issued as cp.async so it overlaps the previous block's mma work.
@@ -734,39 +726,45 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
     }
 }
 
-// ==== fat-tile MMQ q4_K kernel (the q4_K prefill matmul; in-place decode) =====
-// llama.cpp's measured regime, which beats us on the Orin at HALF our occupancy:
-// a wide COLS-column tile (COLS = PREFILL_B = 128) so each staged weight feeds
-// 128 mma-columns — 4x the 32-wide chunk this replaced — and each warp owns ONE
-// 16-row tile across all COLS cols, so the accumulator is acc[COLS/8][4] = 64
-// floats/thread = 64 independent mma chains whose ILP hides the shared-load
-// latency that warp-count never did. Runs ~1 CTA/SM at ~254 regs (carveout +
-// launch_bounds(256,1)); the Orin ncu confirmed occ 16.5% == llama.cpp's 16.66%.
-// Reads q4_K IN PLACE: a coalesced second-copy twin was measured PURE HARM on the
-// Orin (its 2.33 GB footprint cost more L2/bandwidth than the coalescing saved —
-// in-place 227 vs twin 198 tok/s), so the twin was deleted. Eight warps tile 128
-// rows; decode/mma/scale math matches the per-token path, so output is the
-// deterministic relaxed-float-order class (gated == dp4a, -mtp == plain).
+// q4_K kernel proper. Minimal signature on purpose (the keep-vs-own contrast is
+// against llama's mul_mat_q, which carries a wall of always-the-same args for
+// quant-generic / MoE / stream-K work we do not have): just out, the in-place
+// q4_K blob, the int8 activation + its (d,sum) pairs, k, m. Templated ONLY on
+// COLS, the chunk width — same as the q6_K twin. No experts, no ids, no batch,
+// no split-K fixup: a plain grid tiles m (32 rows/warp) x COLS.
+//
+// Each warp owns TWO 16-row tiles; the B fragment and xds scales load once and
+// feed both tiles' mma (the q6_K twin's shared-traffic answer). Per q4_K
+// superblock the four sub-block PAIRS share 32 qs bytes, so one unpack pass
+// stages both nibble halves; one mma.m16n8k32 per sub-block (K=32 == q4_K's
+// 32-element scale granule), then d*sc on the s32 acc minus dmin*m*sum, summed
+// in f32 ascending in k. Fragment mapping pinned in .scratch/mma4_test.cu:
+//   A (4 regs): a0 row gid   k0..15, a1 row gid+8 k0..15,
+//               a2 row gid   k16..31, a3 row gid+8 k16..31
+//   B (2 regs): b0 col gid   k0..15, b1 col gid   k16..31
+//   C (4 regs): c0/c1 row gid col tid*2/+1, c2/c3 row gid+8 same
 template<int COLS>
-__global__ static void __launch_bounds__(256, 1)
-matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
-                      const int8_t *xq, const float2 *xds, int k, int m) {
+__global__ static void __launch_bounds__(256)
+matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m) {
     extern __shared__ unsigned char sh[];
-    int8_t *sB    = (int8_t *)sh;                                  // [2][COLS][SB_COL]
-    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2][COLS][SBX]
-    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [wpc][2 halves][16][SA_ROW]
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int wpc = blockDim.x >> 5;
-    const int r0 = blockIdx.x * (16 * wpc) + warp * 16;            // this warp's 16-row tile
-    const int gid = lane >> 2, tid = lane & 3;
+    int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS][SB_COL]
+    float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS][SBX]
+    int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][2 halves][16][SA_ROW]
     const int nbk = k / 256;
-    int8_t *sAw = sA + warp * 2 * 16 * SA_ROW;
-    float acc[COLS / 8][4];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    const int gid = lane >> 2, tid = lane & 3;
+    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
+    int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
+    float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
-    for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[h][s] = 0.0f;
+    for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
 
-    int rowL = r0 + (lane & 15); if (rowL >= m) rowL = m - 1;      // lanes 0..15 -> this warp's 16 rows
-    const unsigned char *myrow = wbase + (size_t)rowL * nbk * ts;
+    // this lane's header row: lanes 0..15 hold tile 0's rows, 16..31 tile 1's
+    int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
+    const block_q4_K *myrow = w + (size_t)rowL * nbk;
 
     mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
@@ -774,28 +772,34 @@ matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
     for (int blk = 0; blk < nbk; blk++) {
         int buf = blk & 1;
         asm volatile("cp.async.wait_group 0;\n");
-        __syncthreads();
-        if (blk + 1 < nbk) {
+        __syncthreads();                                           // staged data visible CTA-wide
+        if (blk + 1 < nbk) {                                       // next block overlaps this one's mma
             mma_stage_b<COLS>(sB, sBxds, buf ^ 1, xq, xds, k, blk + 1, threadIdx.x);
             asm volatile("cp.async.commit_group;\n");
         }
         const int8_t *sBb = sB + buf * COLS * SB_COL;
         const float2 *sBxd = sBxds + buf * COLS * SBX;
 
-        const block_q4_K *hp = (const block_q4_K *)(myrow + (size_t)blk * ts);
+        const block_q4_K *hp = myrow + blk;                        // my header row's scales + (d,dmin)
         uint32_t s0 = ((const uint32_t *)hp->scales)[0];
         uint32_t s1 = ((const uint32_t *)hp->scales)[1];
         uint32_t s2 = ((const uint32_t *)hp->scales)[2];
         float dD, dM; d_dm(&hp->d, &dD, &dM);
 
-        for (int sjp = 0; sjp < 4; sjp++) {
-            {
-                int ar = lane & 15, hi = lane >> 4;                // row-in-tile, which 16B half
-                int row = r0 + ar; if (row >= m) row = m - 1;
-                const block_q4_K *bp = (const block_q4_K *)(wbase + (size_t)row * nbk * ts) + blk;
+        for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS (shared 32 qs bytes)
+            // stage: lane (ar = row-in-tile, hi = which 16-B half) reads one
+            // uint4 of qs and writes both nibble halves into the sub-block-major
+            // tile. 32-B rows aliased a bank in a [row][32] layout; SA_ROW=48
+            // (12 words) spreads the gid fragment read across all 32 banks.
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                int ar = lane & 15, hi = lane >> 4;
+                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                const block_q4_K *bp = w + (size_t)row * nbk + blk;
                 uint4 q4 = *(const uint4 *)(bp->qs + sjp * 32 + hi * 16);
-                uint32_t *lo = (uint32_t *)(sAw + ar * SA_ROW + hi * 16);
-                uint32_t *hh = (uint32_t *)(sAw + 16 * SA_ROW + ar * SA_ROW + hi * 16);
+                int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
+                uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);             // half sjp*2
+                uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16); // half sjp*2+1
                 lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
                 lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
                 hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
@@ -807,13 +811,14 @@ matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
                 int sj = sjp * 2 + half;
                 uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
                 float dscL = dD * sc, mnmL = dM * mm;              // my header ROW's pair
-                float dsc0 = __shfl_sync(0xffffffffu, dscL, gid),     dsc1 = __shfl_sync(0xffffffffu, dscL, gid + 8);
-                float mnm0 = __shfl_sync(0xffffffffu, mnmL, gid),     mnm1 = __shfl_sync(0xffffffffu, mnmL, gid + 8);
-                const int8_t *sAh = sAw + half * 16 * SA_ROW;
-                uint32_t a0 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4);
-                uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4);
-                uint32_t a2 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
-                uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
+                float dsc[2][2], mnm[2][2];                        // [tile][row-half] -> the 16 rows
+                #pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    dsc[t][0] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid);
+                    dsc[t][1] = __shfl_sync(0xffffffffu, dscL, t * 16 + gid + 8);
+                    mnm[t][0] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid);
+                    mnm[t][1] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid + 8);
+                }
                 #pragma unroll
                 for (int h = 0; h < COLS / 8; h++) {
                     int colb = h * 8 + gid;
@@ -821,28 +826,57 @@ matmul_q4k_mmq_kernel(float *out, const unsigned char *wbase, int ts,
                     uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
                     float2 xd0 = sBxd[(h * 8 + tid * 2) * SBX + sj];
                     float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * SBX + sj];
-                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-                    acc[h][0] += xd0.x * (dsc0 * (float)c0 - mnm0 * xd0.y);
-                    acc[h][1] += xd1.x * (dsc0 * (float)c1 - mnm0 * xd1.y);
-                    acc[h][2] += xd0.x * (dsc1 * (float)c2 - mnm1 * xd0.y);
-                    acc[h][3] += xd1.x * (dsc1 * (float)c3 - mnm1 * xd1.y);
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {                  // both tiles ride one B load
+                        const int8_t *sAh = sAw + t * 2 * 16 * SA_ROW + half * 16 * SA_ROW;
+                        uint32_t a0 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4);
+                        uint32_t a1 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4);
+                        uint32_t a2 = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
+                        uint32_t a3 = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                        acc[t][h][0] += xd0.x * (dsc[t][0] * (float)c0 - mnm[t][0] * xd0.y);
+                        acc[t][h][1] += xd1.x * (dsc[t][0] * (float)c1 - mnm[t][0] * xd1.y);
+                        acc[t][h][2] += xd0.x * (dsc[t][1] * (float)c2 - mnm[t][1] * xd0.y);
+                        acc[t][h][3] += xd1.x * (dsc[t][1] * (float)c3 - mnm[t][1] * xd1.y);
+                    }
                 }
             }
-            __syncwarp();
+            __syncwarp();                                          // all reads done before re-stage
         }
     }
 
     #pragma unroll
-    for (int h = 0; h < COLS / 8; h++) {
-        int col0 = h * 8 + tid * 2;
-        int rA = r0 + gid, rB = r0 + gid + 8;
-        if (rA < m) { out[(size_t)col0 * m + rA] = acc[h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[h][1]; }
-        if (rB < m) { out[(size_t)col0 * m + rB] = acc[h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[h][3]; }
+    for (int t = 0; t < 2; t++)
+        for (int h = 0; h < COLS / 8; h++) {
+            int col0 = h * 8 + tid * 2;
+            int rA = r0 + t * 16 + gid, rB = r0 + t * 16 + gid + 8;
+            if (rA < m) { out[(size_t)col0 * m + rA] = acc[t][h][0]; out[(size_t)(col0 + 1) * m + rA] = acc[t][h][1]; }
+            if (rB < m) { out[(size_t)col0 * m + rB] = acc[t][h][2]; out[(size_t)(col0 + 1) * m + rB] = acc[t][h][3]; }
+        }
+}
+
+// q4_K mma launcher for a compile-time COLS. Mirrors launch_q6k_mmq: 32 rows/warp,
+// shrink warps-per-CTA to keep the grid over the SMs, carve out the dynamic shared
+// past 48 KB once. The A tile is 2 tiles x 2 halves x 16 rows x SA_ROW per warp.
+template<int COLS>
+static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
+                           int k, int m, int sms, int ncol = 1) {
+    int wpc = 8;
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
+    static int carve = 0;
+    if (!carve) {
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        carve = 1;
     }
+    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
+    matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -879,6 +913,9 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
+    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
+    xds += (size_t)blockIdx.y * COLS * (k / 32);
+    out += (size_t)blockIdx.y * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2048;
     float acc[2][COLS / 8][4];                                     // [tile][h][slot]
     #pragma unroll
@@ -996,33 +1033,15 @@ static void matmul_coverage_print(void) {
     fprintf(stderr, "\n");
 }
 
-// Launch the fat q4_K kernel for a compile-time COLS (= the adaptive chunk
-// width g_pf_cols). Each COLS instantiation opts into its own shared carveout
-// once (COLS>=64 needs >48KB). 16 rows/warp; wpc shrinks so the grid covers SMs.
-template<int COLS>
-static void launch_q4k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
-    int wpc = 8;
-    while (wpc > 1 && (m + 16 * wpc - 1) / (16 * wpc) < 2 * sms) wpc >>= 1;
-    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 16 * SA_ROW;
-    static int carve = 0;
-    if (!carve) {
-        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 16 * SA_ROW;
-        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mmq_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
-        carve = 1;
-    }
-    int blocks = (m + 16 * wpc - 1) / (16 * wpc);
-    matmul_q4k_mmq_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
-}
-
 // q6_K twin launcher for a compile-time COLS. The q6_K mma kernel stays 2-tile
 // (32 rows/warp), whose acc[2][COLS/8][4] fits up to COLS=64 (~121 regs); the big
 // 2*2048/warp A tile needs the carveout past COLS=32. Widening the q6_K sub-tile
 // 32->64 halves its weight passes (the wide-tile win, applied to the 9%-of-prefill
 // q6_K share without a 1-tile rewrite).
 template<int COLS>
-static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms) {
+static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (m + 32 * wpc - 1) / (32 * wpc) < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
+    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
     static int carve = 0;
     if (!carve) {
@@ -1031,55 +1050,73 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
         carve = 1;
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    matmul_q6k_mma_kernel<COLS><<<blocks, 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+    matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
+// The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
+// own m16n8k32 / m16n8k16 tensor-core mma kernel (above); everything else falls to
+// the dp4a chunk kernel. PREFILL ONLY: decode (matmul_q) and the MTP verify
+// (matmul_q_spec) keep the byte-identical i8r kernels, so their gates are untouched.
+// LG_NO_MMA forces the dp4a path (debug / A-B).
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
     if (t->type < 40) g_cov[t->type] += (double)k * m;
+
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
+    if (no_mma) {
+        // dp4a fallback (q3/q5/q8 and the residual f32/bf16): float s[NB] spills past
+        // ~32, so loop 32-col sub-tiles here too.
+        int rows_per_block = 256 / 32;
+        int blocks = (m + rows_per_block - 1) / rows_per_block;
+        for (int c0 = 0; c0 < g_pf_cols; c0 += 32)                   // chunk width (adaptive), 32-col sub-tiles
+            matmul_i8r_n_kernel<32><<<blocks, 256, 0, g_launch>>>(
+                d_out + (size_t)c0 * m, w, (int)t->type, ts, blck, d_x + (size_t)c0 * k,
+                g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
+        return;
+    }
+
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
-    // q4_K: fat-tile MMQ — one wide launch over the chunk's columns, in-place (no
-    // REPACK twin). One 16-row tile per warp -> acc[COLS/8][4]; eight warps tile
-    // 128 rows at ~1 CTA/SM, the carveout + launch_bounds(256,1) regime the Orin
-    // measurement showed beats llama.cpp's at half our occupancy (ILP over the
-    // wide accumulator hides the LDS latency). COLS is the adaptive chunk width
-    // g_pf_cols (32/64/96/128): full chunks 128 (4x the old 32-wide reuse), the
-    // short tail of a turn smaller so it doesn't pay a 128-wide chunk.
-    if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0 && !no_mma) {
-        // The fat kernel templates COLS<=128 (acc[COLS/8][4] regs). A whole-image
-        // chunk can be wider (bidirectional spans, stage 2), so tile the columns in
-        // <=128 passes over offset slices of g_xq/d_out. g_pf_cols is a multiple of
-        // 32, so each tile is too -> the {32,64,96,128} templates cover it exactly.
-        // At g_pf_cols<=128 this is a single pass = the old single launch.
-        for (int c0 = 0; c0 < g_pf_cols; c0 += 128) {
-            int ct = g_pf_cols - c0; if (ct > 128) ct = 128;
+    // q4_K (the bulk of prefill MACs): our own m16n8k32 mma kernel over the chunk.
+    // Reads the in-place q4_K blob and the producer's i8r activation (g_xq/g_xds);
+    // one mma.m16n8k32.s8 per 32-element sub-block, d*sc*acc - dmin*m*sum epilogue,
+    // the same wide-tile shape as q6_K. COLS tiles the chunk in 64/32-wide passes.
+    if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0) {
+        const block_q4_K *q4 = (const block_q4_K *)w;
+        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+            launch_q4k_mma<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+            return;
+        }
+        for (int c0 = 0; c0 < g_pf_cols; ) {
             const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
             float *outc = d_out + (size_t)c0 * m;
-            switch (ct) {
-                case 32:  launch_q4k_mmq<32 >(outc, w, ts, xqc, xdc, k, m, sms); break;
-                case 64:  launch_q4k_mmq<64 >(outc, w, ts, xqc, xdc, k, m, sms); break;
-                case 96:  launch_q4k_mmq<96 >(outc, w, ts, xqc, xdc, k, m, sms); break;
-                default:  launch_q4k_mmq<128>(outc, w, ts, xqc, xdc, k, m, sms); break;
-            }
+            if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
+            else                     { launch_q4k_mma<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
         }
         return;
     }
+
     // q6_K (native) and the f32/bf16 PLE q6_K twin share the 2-tile mma kernel,
     // whose acc[2][COLS/8][4] spills past COLS=32 — so loop the chunk in 32-col
     // sub-tiles (offset out/xq/xds per slice). At PREFILL_B=32 that's a single
     // iteration = the old single launch; same float order either way.
     const unsigned char *q6src = NULL; int q6ts = 0;
-    if (!no_mma) {
-        if (t->type == GGML_TYPE_Q6_K) { q6src = w; q6ts = ts; }
-        else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
-    }
+
+    if (t->type == GGML_TYPE_Q6_K) { q6src = w; q6ts = ts; }
+    else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
+
     if (q6src && PREFILL_B % 32 == 0) {
+        // Wide chunk: one launch, COLS=64 tiles across gridDim.y -> the row-tile's
+        // q6_K weights stay L2-hot across all its column-tiles (this is q6_K's bigger
+        // win — its 64-col tile re-streams weights twice as often as q4_K's 128).
+        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+            launch_q6k_mmq<64>(d_out, q6src, q6ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+            return;
+        }
         // 64-wide sub-tiles where the chunk allows (halves weight passes vs 32),
         // a 32-wide tail for the leftover 32 cols (g_pf_cols in {32,64,96,128}).
         for (int c0 = 0; c0 < g_pf_cols; ) {
@@ -1088,17 +1125,9 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             if (g_pf_cols - c0 >= 64) { launch_q6k_mmq<64>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 64; }
             else                     { launch_q6k_mmq<32>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 32; }
         }
-        return;
     }
-    // dp4a fallback (q3/q5/q8 and the residual f32/bf16): float s[NB] spills past
-    // ~32, so loop 32-col sub-tiles here too.
-    int rows_per_block = 256 / 32;
-    int blocks = (m + rows_per_block - 1) / rows_per_block;
-    for (int c0 = 0; c0 < g_pf_cols; c0 += 32)                   // chunk width (adaptive), 32-col sub-tiles
-        matmul_i8r_n_kernel<32><<<blocks, 256, 0, g_launch>>>(
-            d_out + (size_t)c0 * m, w, (int)t->type, ts, blck, d_x + (size_t)c0 * k,
-            g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
 }
+
 // The MTP verify matmul: LG_MTP_N query columns in one launch. Byte-identical to
 // decode per query — the integer sub-block dots are order-independent for any NB,
 // and the NB==LG_MTP_N float-aux guards above keep the float matmuls in decode order.

@@ -59,7 +59,9 @@ if(OpenMP_C_FOUND)
 endif()
 
 # --- CUDA build (optional) -------------------------------------------------
-set(LG_CUDA_ARCH "86" CACHE STRING "CUDA architecture (A5000 = 86, Orin NX = 87)")
+# Ampere (sm_80) is the floor — build for Ampere and forward. fa_mma uses mma.m16n8k16.f16
+# and the staging kernels use cp.async, both sm_80+; a sub-Ampere build won't compile.
+set(LG_CUDA_ARCH "86" CACHE STRING "CUDA architecture, Ampere+ (A5000 = 86, Orin NX = 87)")
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
