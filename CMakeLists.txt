@@ -74,7 +74,7 @@ if(CMAKE_CUDA_COMPILER)
     # a good CPU, well under a second on the GPU). The host encoder stays in as
     # oracle and fallback; LG_MEDIA_CUDA switches media.c's dispatch.
     add_executable(run-cuda     ${CORE} src/model-cuda-f32.cu src/media-cuda.cu)
-    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu src/llama-mmq.cu src/media-cuda.cu)
+    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu src/media-cuda.cu)
     foreach(tgt run-cuda run-cuda-i8r)
         target_include_directories(${tgt} PRIVATE include)
         target_compile_definitions(${tgt} PRIVATE LG_MEDIA_CUDA)
@@ -93,14 +93,6 @@ if(CMAKE_CUDA_COMPILER)
         target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
     endforeach()
     message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8r")
-
-    # q4_K prefill matmul: llama.cpp's mul_mat_q, vendored & pruned to the q4_K path
-    # (renamed matmul_q_prefill) in src/llama-mmq.cu. Self-contained — no ggml -I, no
-    # GGML_USE_CUDA; see that file's provenance header. Needs --extended-lambda (the
-    # vendored MMA primitives use extended lambdas). matmul_q_n routes q4_K prefill to
-    # its lg_mmq_q4k; decode + MTP verify keep little-gemma's own i8r kernels.
-    set_source_files_properties(src/llama-mmq.cu PROPERTIES
-        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>")
 else()
     message(STATUS "CUDA not found — skipping run-cuda")
 endif()

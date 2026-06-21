@@ -29,9 +29,6 @@
 // format are paid once per model, not per sub-block per row per token.
 
 #include "model-cuda.cuh"
-#include "llama-mmq.h"       // lg_mmq_q4k: q4_K prefill via llama's mul_mat_q, vendored &
-                             // pruned to the q4_K path as matmul_q_prefill (src/llama-mmq.cu,
-                             // self-contained — no ggml -I)
 
 // Quantize a whole activation in one kernel (one thread per 32-element group).
 // Almost every activation is quantized by its producer's epilogue instead (see
@@ -686,10 +683,8 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
 // contributions differs — each (row, column) is summed by one lane in ascending
 // k — so chunked prefill is numerically equivalent but not byte-identical to
 // per-token prefill, the same gate relaxation the online-softmax step shipped
-// with. LG_NO_MMA=1 forces the dp4a path back for A/B; the q4_K mma kernel is
-// LG_Q4K_OWN-gated against llama's mul_mat_q (the keep-vendored-vs-own A/B).
-// Fragment mappings validated in .scratch/mma4_test.cu (k32) and mma6_test.cu
-// (k16) before either kernel existed.
+// with. LG_NO_MMA=1 forces the dp4a path back for A/B. Fragment mappings validated
+// in .scratch/mma4_test.cu (k32) and mma6_test.cu (k16) before either kernel existed.
 
 // One thread's share of staging activation block `blk` into buffer `buf`,
 // issued as cp.async so it overlaps the previous block's mma work.
@@ -1058,13 +1053,11 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
     matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
-// The chunk form. q4_K (the bulk of prefill MACs) goes through llama.cpp's
-// mul_mat_q — vendored & pruned to the q4_K path as matmul_q_prefill in
-// src/llama-mmq.cu — whose integrated tensor-core schedule beats our own MMA
-// kernels (~58% SM vs ~45%, journal-proven). q6_K keeps our 2-tile mma kernel;
-// everything else falls to the dp4a chunk kernel. PREFILL ONLY: decode (matmul_q)
-// and the MTP verify (matmul_q_spec) keep the byte-identical i8r kernels, so their
-// gates are untouched. LG_NO_MMA forces the dp4a path (debug / A-B).
+// The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
+// own m16n8k32 / m16n8k16 tensor-core mma kernel (above); everything else falls to
+// the dp4a chunk kernel. PREFILL ONLY: decode (matmul_q) and the MTP verify
+// (matmul_q_spec) keep the byte-identical i8r kernels, so their gates are untouched.
+// LG_NO_MMA forces the dp4a path (debug / A-B).
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = ggml_blck_size(t->type), ts;
@@ -1088,30 +1081,22 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     static int sms = 0;
     if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
 
-    // q4_K: llama's mul_mat_q over the whole chunk in one stream-K launch. d_x is
-    // token-major f32; lg_mmq_q4k quantizes it to q8_1 itself (it does not read the
-    // producer's i8r activation — its MMA path needs the block_q8_1_mmq layout).
-    // LG_Q4K_OWN swaps in our own m16n8k32 kernel (same int8 dot, our scheduling)
-    // for the keep-vendored-vs-own A/B — it reads the in-place q4_K blob and the
-    // producer's i8r activation (g_xq/g_xds), the same tiling shape as q6_K.
-    if (t->type == GGML_TYPE_Q4_K) {
-        static int own = -1;
-        if (own < 0) own = getenv("LG_Q4K_OWN") != NULL;
-        if (own && PREFILL_B % 32 == 0) {
-            const block_q4_K *q4 = (const block_q4_K *)w;
-            if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
-                launch_q4k_mma<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
-                return;
-            }
-            for (int c0 = 0; c0 < g_pf_cols; ) {
-                const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
-                float *outc = d_out + (size_t)c0 * m;
-                if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
-                else                     { launch_q4k_mma<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
-            }
+    // q4_K (the bulk of prefill MACs): our own m16n8k32 mma kernel over the chunk.
+    // Reads the in-place q4_K blob and the producer's i8r activation (g_xq/g_xds);
+    // one mma.m16n8k32.s8 per 32-element sub-block, d*sc*acc - dmin*m*sum epilogue,
+    // the same wide-tile shape as q6_K. COLS tiles the chunk in 64/32-wide passes.
+    if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0) {
+        const block_q4_K *q4 = (const block_q4_K *)w;
+        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+            launch_q4k_mma<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
             return;
         }
-        lg_mmq_q4k(d_out, w, k, m, d_x, g_pf_cols, g_launch);
+        for (int c0 = 0; c0 < g_pf_cols; ) {
+            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+            float *outc = d_out + (size_t)c0 * m;
+            if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
+            else                     { launch_q4k_mma<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
+        }
         return;
     }
 
