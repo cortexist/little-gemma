@@ -218,7 +218,7 @@ __device__ static void d_attn(float *xb, const float *q, const KT *Kc, const KT 
     float acc[ATTN_HD_MAX / 32];
     #pragma unroll
     for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
-    float m = -INFINITY, s = 0.0f;
+    float m = -1e30f, s = 0.0f;
     // one WARP per timestep — the lanes split the K dot, so the row is read with
     // coalesced 128-byte loads; the V row follows while the score is still warm.
     for (int t = warp; t < T; t += nwarp) {
@@ -273,7 +273,7 @@ __device__ static void d_attn(float *xb, const float *q, const KT *Kc, const KT 
     __syncthreads();
     // merge the warps: T>=1 keeps warp 0 active, so the global max is finite; an
     // idle warp (T < nwarp) carries m=-inf, s=0 and weighs in as exactly zero.
-    float gm = -INFINITY;
+    float gm = -1e30f;
     for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
     float gs = 0.0f;
     for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
@@ -351,7 +351,7 @@ __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *
     int pos = *d_pos + qi, start = (window > 0 && pos - window + 1 > 0) ? pos - window + 1 : 0, T = pos - start + 1;
     int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
     size_t hs = ((size_t)qi * n_head + hh) * MAXSPLIT;     // (query,head) base in pacc/pml
-    if (split >= n_split) { if (threadIdx.x == 0) pml[hs + split] = make_float2(-INFINITY, 0.0f); return; }
+    if (split >= n_split) { if (threadIdx.x == 0) pml[hs + split] = make_float2(-1e30f, 0.0f); return; }
     int per = (T + n_split - 1) / n_split, lo = start + split * per, hi = min(pos, lo + per - 1);
     const float *qh = q + (size_t)qi * n_head * hd + (size_t)hh * hd;
     extern __shared__ float comb[];                       // [nwarp][hd]
@@ -360,7 +360,7 @@ __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *
     float acc[ATTN_HD_MAX / 32];
     #pragma unroll
     for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
-    float m = -INFINITY, s = 0.0f;
+    float m = -1e30f, s = 0.0f;
     for (int t = lo + warp; t <= hi; t += nwarp) {
         int r = RING ? (t >= seq ? t % seq : t) : t;
         const KT *kt = Kc + (size_t)r * kv_dim + (size_t)kvh * hd;
@@ -393,7 +393,7 @@ __global__ static void split_attn_kernel(float *pacc, float2 *pml, const float *
         for (int j = 0; j < ATTN_HD_MAX / 32; j++) if (j < nv) comb[warp * hd + lane + j * 32] = acc[j];
     }
     __syncthreads();
-    float gm = -INFINITY; for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
+    float gm = -1e30f; for (int w = 0; w < nwarp; w++) gm = fmaxf(gm, wm[w]);
     if (threadIdx.x == 0) { float gs = 0.0f; for (int w = 0; w < nwarp; w++) gs += ws[w] * expf(wm[w] - gm);
         pml[hs + split] = make_float2(gm, gs); }
     float *po = pacc + (hs + split) * hd;
@@ -410,7 +410,7 @@ __global__ static void combine_attn_kernel(float *xb, const float *pacc, const f
     int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
     size_t hs = ((size_t)qi * n_head + hh) * MAXSPLIT, qoff = (size_t)qi * n_head * hd;
     __shared__ float M, L;
-    if (threadIdx.x == 0) { float mm = -INFINITY, ll = 0.0f;
+    if (threadIdx.x == 0) { float mm = -1e30f, ll = 0.0f;
         for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[hs + sp]; if (ml.y > 0) mm = fmaxf(mm, ml.x); }
         for (int sp = 0; sp < n_split; sp++) { float2 ml = pml[hs + sp]; if (ml.y > 0) ll += ml.y * expf(ml.x - mm); }
         M = mm; L = ll; }
@@ -467,7 +467,7 @@ __global__ static void attn_kvshare_n_kernel(float *xb, const float *q, const KT
     float acc[ATTN_HD_MAX / 32];
     #pragma unroll
     for (int j = 0; j < ATTN_HD_MAX / 32; j++) acc[j] = 0.0f;
-    float m = -INFINITY, s = 0.0f;
+    float m = -1e30f, s = 0.0f;
 
     // positions this block streams: from the tile's earliest window-start to its
     // latest query position. (For full layers window==0 -> from 0.)
@@ -720,7 +720,7 @@ __global__ static void softcap_kernel(float *l, float sc, int n) { int i = block
 // toward the lower index, matching the CPU's first-max scan exactly.
 __global__ static void argmax_kernel(const float *x, int n, int *out) {
     __shared__ float bv[1024]; __shared__ int bi[1024];
-    float v = -INFINITY; int idx = 0;
+    float v = -1e30f; int idx = 0;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         if (x[i] > v) { v = x[i]; idx = i; }
     bv[threadIdx.x] = v; bi[threadIdx.x] = idx;
@@ -1871,6 +1871,7 @@ struct mtp_ld {
     float out_scale;                                               // scalar, by value
     __half *q, *o, *gate, *up, *down;
 };
+
 struct mtp_cuda {
     struct mtp_ld *l;
     __half *pre, *post, *head;
@@ -1897,6 +1898,7 @@ static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type ->
     free(f); free(hh);
     return ok ? d : NULL;
 }
+
 static float *mtp_up_f(const float *src, size_t n) {
     float *d = NULL;
     if (cudaMalloc(&d, n * 4) != cudaSuccess) return NULL;

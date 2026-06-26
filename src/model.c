@@ -28,12 +28,12 @@ static float arch_f32(const struct gguf_context *ctx, const char *arch,
 static int arch_ff(const struct gguf_context *ctx, const char *arch) {
     char key[128];
     snprintf(key, sizeof key, "%s.feed_forward_length", arch);
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (kv && kv->type == GGUF_TYPE_ARRAY &&
-        kv->value.arr.type == GGUF_TYPE_INT32 && kv->value.arr.n > 0) {
-        const int32_t *a = kv->value.arr.data;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (meta && meta->type == GGUF_TYPE_ARRAY &&
+        meta->value.arr.type == GGUF_TYPE_INT32 && meta->value.arr.n > 0) {
+        const int32_t *a = meta->value.arr.data;
         int mx = 0;
-        for (uint64_t i = 0; i < kv->value.arr.n; i++) if (a[i] > mx) mx = a[i];
+        for (uint64_t i = 0; i < meta->value.arr.n; i++) if (a[i] > mx) mx = a[i];
         return mx;
     }
     return (int)gguf_get_u32(ctx, key, 0);
@@ -45,10 +45,10 @@ static int arch_int0(const struct gguf_context *ctx, const char *arch,
                      const char *suffix, int fb) {
     char key[128];
     snprintf(key, sizeof key, "%s.%s", arch, suffix);
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (kv && kv->type == GGUF_TYPE_ARRAY &&
-        kv->value.arr.type == GGUF_TYPE_INT32 && kv->value.arr.n > 0)
-        return ((const int32_t *)kv->value.arr.data)[0];
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (meta && meta->type == GGUF_TYPE_ARRAY &&
+        meta->value.arr.type == GGUF_TYPE_INT32 && meta->value.arr.n > 0)
+        return ((const int32_t *)meta->value.arr.data)[0];
     return (int)gguf_get_u32(ctx, key, (uint32_t)fb);
 }
 
@@ -57,11 +57,11 @@ static void load_ffn_lens(const struct gguf_context *ctx, const char *arch,
                           int *out, int n_layer, int fallback) {
     char key[128];
     snprintf(key, sizeof key, "%s.feed_forward_length", arch);
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    const int32_t *a = (kv && kv->type == GGUF_TYPE_ARRAY &&
-                        kv->value.arr.type == GGUF_TYPE_INT32) ? kv->value.arr.data : NULL;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    const int32_t *a = (meta && meta->type == GGUF_TYPE_ARRAY &&
+                        meta->value.arr.type == GGUF_TYPE_INT32) ? meta->value.arr.data : NULL;
     for (int L = 0; L < n_layer; L++)
-        out[L] = (a && (uint64_t)L < kv->value.arr.n) ? a[L] : fallback;
+        out[L] = (a && (uint64_t)L < meta->value.arr.n) ? a[L] : fallback;
 }
 
 int config_load(struct config *c, const struct gguf_context *ctx) {
@@ -97,7 +97,7 @@ int config_load(struct config *c, const struct gguf_context *ctx) {
     c->n_kv_start = shared > 0 ? c->n_layer - shared : c->n_layer;
 
     // Vocabulary size = number of tokens in the tokenizer list.
-    const struct gguf_kv *toks = gguf_find_kv(ctx, "tokenizer.ggml.tokens");
+    const struct gguf_meta *toks = gguf_find_meta(ctx, "tokenizer.ggml.tokens");
     if (toks && toks->type == GGUF_TYPE_ARRAY) c->n_vocab = (int)toks->value.arr.n;
 
     // Bounded, not just nonzero: block_count comes off disk as a u32, and a
@@ -153,10 +153,10 @@ int model_init(struct model *m, const struct gguf_context *ctx) {
     if (!m->is_local) return -1;
     char key[128];
     snprintf(key, sizeof key, "%s.attention.sliding_window_pattern", m->cfg.arch);
-    const struct gguf_kv *pat = gguf_find_kv(ctx, key);
-    if (pat && pat->type == GGUF_TYPE_ARRAY && pat->value.arr.type == GGUF_TYPE_BOOL) {
-        const int8_t *b = pat->value.arr.data;
-        for (int L = 0; L < m->cfg.n_layer && (uint64_t)L < pat->value.arr.n; L++)
+    const struct gguf_meta *pattern = gguf_find_meta(ctx, key);
+    if (pattern && pattern->type == GGUF_TYPE_ARRAY && pattern->value.arr.type == GGUF_TYPE_BOOL) {
+        const int8_t *b = pattern->value.arr.data;
+        for (int L = 0; L < m->cfg.n_layer && (uint64_t)L < pattern->value.arr.n; L++)
             m->is_local[L] = b[L] != 0;
     }
 

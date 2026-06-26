@@ -80,6 +80,10 @@ if(CMAKE_CUDA_COMPILER)
         target_compile_definitions(${tgt} PRIVATE LG_MEDIA_CUDA)
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+            # NVIDIA's prebuilt cudart_static.lib uses the STATIC CRT (LIBCMT[D]); our code
+            # uses the DYNAMIC CRT (MSVCRT). Drop the redundant static one so the binary
+            # resolves a single CRT (silences LNK4098). MSVC-only; a no-op elsewhere.
+            target_link_options(${tgt} PRIVATE "/NODEFAULTLIB:$<IF:$<CONFIG:Debug>,LIBCMTD,LIBCMT>")
         elseif(UNIX)
             target_link_libraries(${tgt} PRIVATE m)
         endif()

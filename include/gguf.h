@@ -34,13 +34,13 @@ struct gguf_header {
     uint32_t magic;
     uint32_t version;
     uint64_t num_tensors;
-    uint64_t num_kv;
+    uint64_t num_meta;
 };
 
 // A single metadata key/value pair.
 // `type` is the tag; it selects which member of `value` is live.
 // Scalars are stored inline (no allocation); only STRING and ARRAY own heap memory.
-struct gguf_kv {
+struct gguf_meta {
     char    *key;        // owned
     uint32_t type;       // enum gguf_type
     union {
@@ -77,7 +77,7 @@ struct gguf_tensor {
 
 struct gguf_context {
     struct gguf_header  header;
-    struct gguf_kv     *kv;        // header.num_kv entries
+    struct gguf_meta   *meta;        // header.num_meta entries
     struct gguf_tensor *tensors;   // header.num_tensors entries
     size_t              alignment; // general.alignment (default 32)
     size_t              data_offset;
@@ -111,7 +111,7 @@ void gguf_dump(const struct gguf_context *ctx);
 // ---- lookup ---------------------------------------------------------------
 
 // Find a metadata pair / tensor by name. NULL if absent.
-const struct gguf_kv     *gguf_find_kv(const struct gguf_context *ctx, const char *key);
+const struct gguf_meta   *gguf_find_meta(const struct gguf_context *ctx, const char *key);
 const struct gguf_tensor *gguf_find_tensor(const struct gguf_context *ctx, const char *name);
 
 // Typed metadata accessors. Return `fallback` if the key is missing or the value

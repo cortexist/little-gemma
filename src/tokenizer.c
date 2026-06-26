@@ -27,7 +27,7 @@ static void map_init(struct map *m, size_t count) {
     m->vals = malloc(cap * sizeof(int));
 }
 
-static void map_free(struct map *m) { free(m->keys); free(m->vals); }
+static void map_free(struct map *m) { free((void *)m->keys); free(m->vals); }
 
 static void map_put(struct map *m, const char *key, int val) {
     size_t mask = m->cap - 1, i = fnv1a(key, strlen(key)) & mask;
@@ -69,8 +69,8 @@ static int cmp_special_desc(const void *a, const void *b) {
 }
 
 struct tokenizer *tokenizer_init(const struct gguf_context *ctx) {
-    const struct gguf_kv *toks = gguf_find_kv(ctx, "tokenizer.ggml.tokens");
-    const struct gguf_kv *mrg  = gguf_find_kv(ctx, "tokenizer.ggml.merges");
+    const struct gguf_meta *toks = gguf_find_meta(ctx, "tokenizer.ggml.tokens");
+    const struct gguf_meta *mrg  = gguf_find_meta(ctx, "tokenizer.ggml.merges");
     if (!toks || toks->type != GGUF_TYPE_ARRAY) return NULL;
 
     struct tokenizer *tk = calloc(1, sizeof(*tk));
@@ -93,7 +93,7 @@ struct tokenizer *tokenizer_init(const struct gguf_context *ctx) {
     }
 
     // Collect control (3) and user-defined (4) tokens, matched atomically.
-    const struct gguf_kv *tt = gguf_find_kv(ctx, "tokenizer.ggml.token_type");
+    const struct gguf_meta *tt = gguf_find_meta(ctx, "tokenizer.ggml.token_type");
     const int32_t *types = (tt && tt->type == GGUF_TYPE_ARRAY &&
                             tt->value.arr.type == GGUF_TYPE_INT32) ? tt->value.arr.data : NULL;
     if (types) {

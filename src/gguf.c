@@ -152,44 +152,44 @@ static char *read_string(FILE *f) {
     return str;
 }
 
-// Read one value of the given scalar type into the kv union.
+// Read one value of the given scalar type into the meta union.
 // Does NOT handle STRING or ARRAY (callers do). Returns false on error.
-static bool read_scalar(FILE *f, uint32_t type, struct gguf_kv *kv) {
+static bool read_scalar(FILE *f, uint32_t type, struct gguf_meta *meta) {
     size_t size = gguf_type_size(type);
     if (size == 0) return false; // not a fixed-size scalar
-    return read_exact(f, &kv->value, size);
+    return read_exact(f, &meta->value, size);
 }
 
-// Free everything a kv owns. Safe on a zero-initialized kv.
-static void free_kv(struct gguf_kv *kv) {
-    free(kv->key);
-    if (kv->type == GGUF_TYPE_STRING) {
-        free(kv->value.str);
-    } else if (kv->type == GGUF_TYPE_ARRAY) {
-        if (kv->value.arr.type == GGUF_TYPE_STRING && kv->value.arr.data) {
-            char **items = kv->value.arr.data;
-            for (uint64_t j = 0; j < kv->value.arr.n; j++) free(items[j]);
+// Free everything a meta owns. Safe on a zero-initialized meta.
+static void free_meta(struct gguf_meta *meta) {
+    free(meta->key);
+    if (meta->type == GGUF_TYPE_STRING) {
+        free(meta->value.str);
+    } else if (meta->type == GGUF_TYPE_ARRAY) {
+        if (meta->value.arr.type == GGUF_TYPE_STRING && meta->value.arr.data) {
+            char **items = meta->value.arr.data;
+            for (uint64_t j = 0; j < meta->value.arr.n; j++) free(items[j]);
         }
-        free(kv->value.arr.data);
+        free(meta->value.arr.data);
     }
 }
 
-static bool read_array(FILE *f, struct gguf_kv *kv) {
+static bool read_array(FILE *f, struct gguf_meta *meta) {
     uint32_t et;
     uint64_t n;
     if (!read_exact(f, &et, sizeof(et))) return false;
     if (!read_exact(f, &n,  sizeof(n)))  return false;
     if (et == GGUF_TYPE_ARRAY)           return false; // nested arrays are illegal
 
-    kv->value.arr.type = et;
-    kv->value.arr.n    = n;
-    kv->value.arr.data = NULL;
+    meta->value.arr.type = et;
+    meta->value.arr.n    = n;
+    meta->value.arr.data = NULL;
     if (n == 0) return true;
 
     if (et == GGUF_TYPE_STRING) {
         char **items = calloc(n, sizeof(char *));
         if (!items) return false;
-        kv->value.arr.data = items; // assign first so free_kv can clean partial reads
+        meta->value.arr.data = items; // assign first so free_meta can clean partial reads
         for (uint64_t j = 0; j < n; j++) {
             items[j] = read_string(f);
             if (!items[j]) return false;
@@ -202,23 +202,23 @@ static bool read_array(FILE *f, struct gguf_kv *kv) {
     if (n > GGUF_MAX_LEN / esize) return false;        // overflow / absurd size
     void *buf = malloc(n * esize);
     if (!buf) return false;
-    kv->value.arr.data = buf;
+    meta->value.arr.data = buf;
     return read_exact(f, buf, n * esize);
 }
 
-static bool read_kv(FILE *f, struct gguf_kv *kv) {
-    kv->key = read_string(f);
-    if (!kv->key) return false;
-    if (!read_exact(f, &kv->type, sizeof(kv->type))) return false;
+static bool read_meta(FILE *f, struct gguf_meta *meta) {
+    meta->key = read_string(f);
+    if (!meta->key) return false;
+    if (!read_exact(f, &meta->type, sizeof(meta->type))) return false;
 
-    switch (kv->type) {
+    switch (meta->type) {
         case GGUF_TYPE_STRING:
-            kv->value.str = read_string(f);
-            return kv->value.str != NULL;
+            meta->value.str = read_string(f);
+            return meta->value.str != NULL;
         case GGUF_TYPE_ARRAY:
-            return read_array(f, kv);
+            return read_array(f, meta);
         default:
-            return read_scalar(f, kv->type, kv);
+            return read_scalar(f, meta->type, meta);
     }
 }
 
@@ -235,11 +235,11 @@ static bool read_tensor(FILE *f, struct gguf_tensor *t) {
 
 // Pull general.alignment out of the metadata if present (default 32).
 static size_t find_alignment(const struct gguf_context *ctx) {
-    for (uint64_t i = 0; i < ctx->header.num_kv; i++) {
-        const struct gguf_kv *kv = &ctx->kv[i];
-        if (kv->type == GGUF_TYPE_UINT32 &&
-            strcmp(kv->key, "general.alignment") == 0) {
-            return kv->value.u32 ? kv->value.u32 : 32;
+    for (uint64_t i = 0; i < ctx->header.num_meta; i++) {
+        const struct gguf_meta *meta = &ctx->meta[i];
+        if (meta->type == GGUF_TYPE_UINT32 &&
+            strcmp(meta->key, "general.alignment") == 0) {
+            return meta->value.u32 ? meta->value.u32 : 32;
         }
     }
     return 32;
@@ -276,12 +276,12 @@ struct gguf_context *load_gguf(const char *filepath) {
         goto fail;
     }
 
-    if (ctx->header.num_kv) {
-        ctx->kv = calloc(ctx->header.num_kv, sizeof(*ctx->kv));
-        if (!ctx->kv) goto fail;
+    if (ctx->header.num_meta) {
+        ctx->meta = calloc(ctx->header.num_meta, sizeof(*ctx->meta));
+        if (!ctx->meta) goto fail;
     }
-    for (uint64_t i = 0; i < ctx->header.num_kv; i++) {
-        if (!read_kv(f, &ctx->kv[i])) {
+    for (uint64_t i = 0; i < ctx->header.num_meta; i++) {
+        if (!read_meta(f, &ctx->meta[i])) {
             fprintf(stderr, "Failed to read KV pair %llu.\n", (unsigned long long)i);
             goto fail;
         }
@@ -365,9 +365,9 @@ fail:
 void free_gguf(struct gguf_context *ctx) {
     if (!ctx) return;
     free(ctx->data);
-    if (ctx->kv) {
-        for (uint64_t i = 0; i < ctx->header.num_kv; i++) free_kv(&ctx->kv[i]);
-        free(ctx->kv);
+    if (ctx->meta) {
+        for (uint64_t i = 0; i < ctx->header.num_meta; i++) free_meta(&ctx->meta[i]);
+        free(ctx->meta);
     }
     if (ctx->tensors) {
         for (uint64_t i = 0; i < ctx->header.num_tensors; i++) free(ctx->tensors[i].name);
@@ -378,28 +378,28 @@ void free_gguf(struct gguf_context *ctx) {
 
 // ---- pretty-printing ------------------------------------------------------
 
-static void print_scalar(const struct gguf_kv *kv, uint32_t type) {
+static void print_scalar(const struct gguf_meta *meta, uint32_t type) {
     switch (type) {
-        case GGUF_TYPE_UINT8:   printf("%u",   kv->value.u8);  break;
-        case GGUF_TYPE_INT8:    printf("%d",   kv->value.i8);  break;
-        case GGUF_TYPE_UINT16:  printf("%u",   kv->value.u16); break;
-        case GGUF_TYPE_INT16:   printf("%d",   kv->value.i16); break;
-        case GGUF_TYPE_UINT32:  printf("%u",   kv->value.u32); break;
-        case GGUF_TYPE_INT32:   printf("%d",   kv->value.i32); break;
-        case GGUF_TYPE_FLOAT32: printf("%g",   kv->value.f32); break;
-        case GGUF_TYPE_FLOAT64: printf("%g",   kv->value.f64); break;
-        case GGUF_TYPE_BOOL:    printf("%s",   kv->value.bool_ ? "true" : "false"); break;
-        case GGUF_TYPE_UINT64:  printf("%llu", (unsigned long long)kv->value.u64); break;
-        case GGUF_TYPE_INT64:   printf("%lld", (long long)kv->value.i64);          break;
+        case GGUF_TYPE_UINT8:   printf("%u",   meta->value.u8);  break;
+        case GGUF_TYPE_INT8:    printf("%d",   meta->value.i8);  break;
+        case GGUF_TYPE_UINT16:  printf("%u",   meta->value.u16); break;
+        case GGUF_TYPE_INT16:   printf("%d",   meta->value.i16); break;
+        case GGUF_TYPE_UINT32:  printf("%u",   meta->value.u32); break;
+        case GGUF_TYPE_INT32:   printf("%d",   meta->value.i32); break;
+        case GGUF_TYPE_FLOAT32: printf("%g",   meta->value.f32); break;
+        case GGUF_TYPE_FLOAT64: printf("%g",   meta->value.f64); break;
+        case GGUF_TYPE_BOOL:    printf("%s",   meta->value.bool_ ? "true" : "false"); break;
+        case GGUF_TYPE_UINT64:  printf("%llu", (unsigned long long)meta->value.u64); break;
+        case GGUF_TYPE_INT64:   printf("%lld", (long long)meta->value.i64);          break;
         default:                printf("?"); break;
     }
 }
 
-// Read element `idx` out of a scalar array buffer into a temporary kv and print it.
-static void print_array_element(const struct gguf_kv *arr, uint64_t idx) {
+// Read element `idx` out of a scalar array buffer into a temporary meta and print it.
+static void print_array_element(const struct gguf_meta *arr, uint64_t idx) {
     uint32_t et = arr->value.arr.type;
     size_t esize = gguf_type_size(et);
-    struct gguf_kv tmp = {0};
+    struct gguf_meta tmp = {0};
     memcpy(&tmp.value, (const char *)arr->value.arr.data + idx * esize, esize);
     print_scalar(&tmp, et);
 }
@@ -433,31 +433,31 @@ static void print_string(const char *s, size_t max) {
 
 #define GGUF_STR_PREVIEW 40
 
-static void print_value(const struct gguf_kv *kv) {
-    if (kv->type == GGUF_TYPE_STRING) {
-        print_string(kv->value.str, GGUF_STR_PREVIEW);
+static void print_value(const struct gguf_meta *meta) {
+    if (meta->type == GGUF_TYPE_STRING) {
+        print_string(meta->value.str, GGUF_STR_PREVIEW);
         return;
     }
-    if (kv->type == GGUF_TYPE_ARRAY) {
-        uint64_t n = kv->value.arr.n;
-        uint32_t et = kv->value.arr.type;
+    if (meta->type == GGUF_TYPE_ARRAY) {
+        uint64_t n = meta->value.arr.n;
+        uint32_t et = meta->value.arr.type;
         printf("[%s; %llu] ", gguf_type_name(et), (unsigned long long)n);
         uint64_t show = n < 4 ? n : 4; // preview the first few
         printf("{");
         for (uint64_t j = 0; j < show; j++) {
             if (j) printf(", ");
             if (et == GGUF_TYPE_STRING) {
-                char **items = kv->value.arr.data;
+                char **items = meta->value.arr.data;
                 print_string(items[j], GGUF_STR_PREVIEW);
                 break;
             } 
-            print_array_element(kv, j);
+            print_array_element(meta, j);
         }
         if (n > show) printf(", ...");
         printf("}");
         return;
     }
-    print_scalar(kv, kv->type);
+    print_scalar(meta, meta->type);
 }
 
 void gguf_dump(const struct gguf_context *ctx) {
@@ -466,16 +466,16 @@ void gguf_dump(const struct gguf_context *ctx) {
     printf("--- header ---\n");
     printf("version: %u\n", ctx->header.version);
     printf("tensors: %llu\n", (unsigned long long)ctx->header.num_tensors);
-    printf("kv pairs: %llu\n", (unsigned long long)ctx->header.num_kv);
+    printf("meta pairs: %llu\n", (unsigned long long)ctx->header.num_meta);
     printf("alignment: %zu\n", ctx->alignment);
     printf("data offset: %zu\n", ctx->data_offset);
     printf("data: %zu bytes (in memory)\n", ctx->data_size);
 
     printf("\n--- metadata ---\n");
-    for (uint64_t i = 0; i < ctx->header.num_kv; i++) {
-        const struct gguf_kv *kv = &ctx->kv[i];
-        printf("%s (%s) = ", kv->key, gguf_type_name(kv->type));
-        print_value(kv);
+    for (uint64_t i = 0; i < ctx->header.num_meta; i++) {
+        const struct gguf_meta *meta = &ctx->meta[i];
+        printf("%s (%s) = ", meta->key, gguf_type_name(meta->type));
+        print_value(meta);
         printf("\n");
     }
 
@@ -497,9 +497,9 @@ void gguf_dump(const struct gguf_context *ctx) {
 
 // ---- lookup ---------------------------------------------------------------
 
-const struct gguf_kv *gguf_find_kv(const struct gguf_context *ctx, const char *key) {
-    for (uint64_t i = 0; i < ctx->header.num_kv; i++) {
-        if (strcmp(ctx->kv[i].key, key) == 0) return &ctx->kv[i];
+const struct gguf_meta *gguf_find_meta(const struct gguf_context *ctx, const char *key) {
+    for (uint64_t i = 0; i < ctx->header.num_meta; i++) {
+        if (strcmp(ctx->meta[i].key, key) == 0) return &ctx->meta[i];
     }
     return NULL;
 }
@@ -512,33 +512,33 @@ const struct gguf_tensor *gguf_find_tensor(const struct gguf_context *ctx, const
 }
 
 uint32_t gguf_get_u32(const struct gguf_context *ctx, const char *key, uint32_t fallback) {
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (!kv) return fallback;
-    switch (kv->type) {
-        case GGUF_TYPE_UINT32: return kv->value.u32;
-        case GGUF_TYPE_INT32:  return (uint32_t)kv->value.i32;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (!meta) return fallback;
+    switch (meta->type) {
+        case GGUF_TYPE_UINT32: return meta->value.u32;
+        case GGUF_TYPE_INT32:  return (uint32_t)meta->value.i32;
         default:               return fallback;
     }
 }
 
 int32_t gguf_get_i32(const struct gguf_context *ctx, const char *key, int32_t fallback) {
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (!kv) return fallback;
-    switch (kv->type) {
-        case GGUF_TYPE_INT32:  return kv->value.i32;
-        case GGUF_TYPE_UINT32: return (int32_t)kv->value.u32;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (!meta) return fallback;
+    switch (meta->type) {
+        case GGUF_TYPE_INT32:  return meta->value.i32;
+        case GGUF_TYPE_UINT32: return (int32_t)meta->value.u32;
         default:               return fallback;
     }
 }
 
 float gguf_get_f32(const struct gguf_context *ctx, const char *key, float fallback) {
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (!kv || kv->type != GGUF_TYPE_FLOAT32) return fallback;
-    return kv->value.f32;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (!meta || meta->type != GGUF_TYPE_FLOAT32) return fallback;
+    return meta->value.f32;
 }
 
 const char *gguf_get_str(const struct gguf_context *ctx, const char *key, const char *fallback) {
-    const struct gguf_kv *kv = gguf_find_kv(ctx, key);
-    if (!kv || kv->type != GGUF_TYPE_STRING) return fallback;
-    return kv->value.str;
+    const struct gguf_meta *meta = gguf_find_meta(ctx, key);
+    if (!meta || meta->type != GGUF_TYPE_STRING) return fallback;
+    return meta->value.str;
 }
