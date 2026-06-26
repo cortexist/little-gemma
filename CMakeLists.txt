@@ -42,8 +42,8 @@ endif()
 set(CORE src/run.c src/gguf.c src/quant.c src/model.c src/tokenizer.c src/media.c src/mtp.c)
 
 # --- CPU build -------------------------------------------------------------
-add_executable(run ${CORE} src/model-cpu.c)
-target_include_directories(run PRIVATE include)
+add_executable(run ${CORE} src/cpu/model-cpu.c src/cpu/media-gpu-stub.c)   # CPU backend + no-op GPU seam
+target_include_directories(run PRIVATE include src)   # src/ for mtp-internal.h, media-internal.h
 if(WIN32)
     target_link_libraries(run PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
 elseif(UNIX)
@@ -67,17 +67,17 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     # Two CUDA backends behind the same model.h, sharing model-cuda.cuh:
-    # run-cuda = readable f32-dequant matmul; run-cuda-i8r = int8 matmul with
-    # wide loads from (re)aligned weights. (The intermediate byte-load int8
-    # backend, model-cuda-i8.cu, lives in git history — see the README.)
+    # run-cuda = readable f32-dequant matmul; run-cuda-i8 = int8 matmul with
+    # wide loads from (re)aligned weights. (An earlier byte-load int8 variant
+    # lives in git history — see the README.)
     # media-cuda.cu: the gemma4v encoder on the GPU (~1 TFLOP/image — ~15 s on
     # a good CPU, well under a second on the GPU). The host encoder stays in as
-    # oracle and fallback; LG_MEDIA_CUDA switches media.c's dispatch.
-    add_executable(run-cuda     ${CORE} src/model-cuda-f32.cu src/media-cuda.cu)
-    add_executable(run-cuda-i8r ${CORE} src/model-cuda-i8r.cu src/media-cuda.cu)
-    foreach(tgt run-cuda run-cuda-i8r)
-        target_include_directories(${tgt} PRIVATE include)
-        target_compile_definitions(${tgt} PRIVATE LG_MEDIA_CUDA)
+    # oracle and fallback. media.c calls the GPU seam unconditionally; the CPU run
+    # target links a no-op stub (media-gpu-stub.c), the CUDA targets link media-cuda.cu.
+    add_executable(run-cuda     ${CORE} src/cuda/model-cuda-f32.cu src/cuda/media-cuda.cu)
+    add_executable(run-cuda-i8  ${CORE} src/cuda/model-cuda-i8.cu src/cuda/media-cuda.cu)
+    foreach(tgt run-cuda run-cuda-i8)
+        target_include_directories(${tgt} PRIVATE include src)   # src/ for media-internal.h & mtp-internal.h
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
             # NVIDIA's prebuilt cudart_static.lib uses the STATIC CRT (LIBCMT[D]); our code
@@ -96,7 +96,7 @@ if(CMAKE_CUDA_COMPILER)
         # (the legacy default stream is not capturable). model_forward always replays a graph.
         target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
     endforeach()
-    message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8r")
+    message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER_VERSION}) — building run-cuda, run-cuda-i8")
 else()
     message(STATUS "CUDA not found — skipping run-cuda")
 endif()

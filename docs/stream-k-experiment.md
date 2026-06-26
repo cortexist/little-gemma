@@ -1,7 +1,7 @@
 # Stream-K and the q4_K prefill matmul: a research case
 
 This documents why little-gemma ships its **own** `m16n8k32` q4_K prefill kernel
-(`matmul_q4k_mma_kernel` in `src/model-cuda-i8r.cu`) rather than vendoring
+(`matmul_q4k_mma_kernel` in `src/model-cuda-i8.cu`) rather than vendoring
 llama.cpp's `mul_mat_q`, and the experiments that settled it. The vendored kernel
 and every experimental variant are preserved on branches (see the end) as the
 research record; `main` carries only the clean own kernel.

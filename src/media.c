@@ -237,9 +237,7 @@ struct media *media_open(const char *path, int n_embd) {
 
 void media_free(struct media *md) {
     if (!md) return;
-#ifdef LG_MEDIA_CUDA
-    v_cuda_free(md);
-#endif
+    v_gpu_free(md);   // no-op in the CPU build (stub); frees GPU state in GPU builds
     free_gguf(md->ctx);
     free(md->vl);
     free(md);
@@ -515,8 +513,8 @@ float *media_embed_image(struct media *md, const uint8_t *rgb, int w, int h, int
     }
     if (!md->legacy_v)
         return uv_embed_image(md, rgb, w, h, n_tokens);
-#ifdef LG_MEDIA_CUDA
-    float *rows = v_embed_image_cuda(md, rgb, w, h, n_tokens);
+    // legacy gemma4v: try the GPU encoder (NULL in the CPU build / when unusable), then host
+    float *rows = v_embed_image_gpu(md, rgb, w, h, n_tokens);
     if (rows && getenv("LG_MEDIA_VERIFY")) {        // host path as numeric oracle
         int n2 = 0;
         float *ref = v_embed_image(md, rgb, w, h, &n2);
@@ -529,8 +527,7 @@ float *media_embed_image(struct media *md, const uint8_t *rgb, int w, int h, int
         fprintf(stderr, "media: gpu vs host max |diff| %.3g over %d rows\n", mx, n2);
         free(ref);
     }
-    if (rows) return rows;                          // NULL: CUDA unusable -> host
-#endif
+    if (rows) return rows;                          // NULL: no GPU / unusable -> host
     return v_embed_image(md, rgb, w, h, n_tokens);
 }
 

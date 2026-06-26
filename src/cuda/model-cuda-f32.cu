@@ -3,7 +3,7 @@
 //
 // This is the readable reference: one warp per output row, the lanes cooperate on
 // each quantized block, and the dequant is fused straight into the f32 dot. The
-// int8 variant (model-cuda-i8r.cu) is the same forward with a faster matmul — diff
+// int8 variant (model-cuda-i8.cu) is the same forward with a faster matmul — diff
 // the two files to see exactly where the speedup comes from.
 
 #include "model-cuda.cuh"
@@ -109,7 +109,7 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
 // per chunk in the forward — a media span prefills as one chunk and can exceed
 // PREFILL_B). Looping a fixed PREFILL_B here silently dropped the tail of a
 // wide image span. The readable backend keeps the one-column kernel and forgoes
-// the weight-reuse win (see model-cuda-i8r.cu for the real thing — its batched
+// the weight-reuse win (see model-cuda-i8.cu for the real thing — its batched
 // kernel reads each weight row once for the whole chunk).
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     for (int j = 0; j < g_pf_cols; j++)

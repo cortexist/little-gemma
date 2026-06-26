@@ -40,7 +40,7 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
  │ doubles as the│  │ prefill, B=2 verify, device MTP draft — plus the GPU │
  │ reference spec│  │ vision encoder (media-cuda.cu)                       │
  └───────────────┘  ├───────────────────────────┬──────────────────────────┤
-                    │     model-cuda-f32.cu     │    model-cuda-i8r.cu     │
+                    │     model-cuda-f32.cu     │    model-cuda-i8.cu     │
                     │   readable f32 matmul     │  int8 dp4a + wide loads  │
                     └───────────────────────────┴──────────────────────────┘
 
@@ -87,14 +87,14 @@ Threading is via OpenMP (auto-detected by CMake); the matmul scales across cores
 ### CUDA build (optional)
 
 If the CUDA toolkit is found, CMake also builds `run-cuda` (readable f32 matmul)
-and `run-cuda-i8r` (int8 matmul, the fast one):
+and `run-cuda-i8` (int8 matmul, the fast one):
 
 ```
-cmake --build build --config Release --target run-cuda-i8r
+cmake --build build --config Release --target run-cuda-i8
 ```
 
 Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
-(`model-cuda-f32.cu`, `model-cuda-i8r.cu`) implement the same `model.h`; only the compute kernels differ.
+(`model-cuda-f32.cu`, `model-cuda-i8.cu`) implement the same `model.h`; only the compute kernels differ.
 
 ## Usage
 
@@ -132,7 +132,7 @@ security surface; transport concerns (TCP exposure, TLS, auth) belong to `nc`,
 `socat`, and whatever chat server or agent sits downstream:
 
 ```
-run-cuda-i8r -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
+run-cuda-i8 -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
 echo "What is the capital of France?" | nc -N -U /tmp/lg.sock
 ```
 
@@ -224,7 +224,7 @@ answer. Keeping it a separate repo is the point — the core stays dependency-fr
 C/CUDA; the file-decoding dependency (ffmpeg) lives with the tool, not the engine.
 
 ```
-run-cuda-i8r -m gemma-4-12B-it-Q4_K_M.gguf -mm mmproj-F16.gguf -s %TEMP%\lg.sock
+run-cuda-i8 -m gemma-4-12B-it-Q4_K_M.gguf -mm mmproj-F16.gguf -s %TEMP%\lg.sock
 mmcat %TEMP%\lg.sock photo.jpg "What is in this image?"
 mmcat %TEMP%\lg.sock clip.mp4  "What happens, and what is said?"
 ```
@@ -274,7 +274,7 @@ its inputs are the target's own embedding of the freshly chosen token plus
 the target's last hidden state. `mtp.c` implements it; `-mtp` turns it on:
 
 ```
-run-cuda-i8r -m gemma-4-E4B-it-Q4_K_M.gguf -mtp gemma-e4b-assistant-mtp.gguf -p "..."
+run-cuda-i8 -m gemma-4-E4B-it-Q4_K_M.gguf -mtp gemma-e4b-assistant-mtp.gguf -p "..."
 ```
 
 Each round drafts one token and verifies `[token, draft]` as a single
@@ -344,7 +344,7 @@ load time instead of a mysterious crawl (`load_gguf` checks the size and bails).
 The whole forward, the kv cache, and every non-matmul kernel live in
 `model-cuda.cuh`; the **matmul is the only thing that differs** between the two
 GPU backends, so each is a thin file that includes the header and defines just
-`matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8r.cu` to see exactly
+`matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8.cu` to see exactly
 where the speed comes from.
 
 Getting the speed was a journey of two dozen gated steps: two profiling-led
@@ -365,7 +365,7 @@ the edge target produces, it speeds decode up to ~1.6×. The full log, dead ends
 and bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
 
 Where things stand — both sides re-measured the same day on the same machine,
-same prompt (little-gemma = `run-cuda-i8r`, 256 generated tokens, warm;
+same prompt (little-gemma = `run-cuda-i8`, 256 generated tokens, warm;
 llama.cpp = `llama-bench tg32`). These rows are **plain decode**; MTP is a
 further 1.2–1.6× on top of them (the table above):
 
@@ -444,7 +444,7 @@ plus exactly one backend:
 |---------------|----------------------------------------------------------|-----------:|
 | `run`         | `model-cpu.c`                                            |      3,025 |
 | `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,645 |
-| `run-cuda-i8r`| `model-cuda.cuh` + `model-cuda-i8r.cu` + `media-cuda.cu` |      5,405 |
+| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      5,405 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
 only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every

@@ -278,12 +278,12 @@ static int ensure_bufs(struct vcuda *vc, int np, int ne, int n_embd) {
 
 // ---- the encoder ------------------------------------------------------------
 
-extern "C" float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens) {
-    if (md->cuda == (void *)-1) return NULL;            // init already failed once
-    struct vcuda *vc = (struct vcuda *)md->cuda;
+extern "C" float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens) {
+    if (md->gpu == (void *)-1) return NULL;            // init already failed once
+    struct vcuda *vc = (struct vcuda *)md->gpu;
     if (!vc) {
         vc = vcuda_init(md);
-        md->cuda = vc ? (void *)vc : (void *)-1;
+        md->gpu = vc ? (void *)vc : (void *)-1;
         if (!vc) return NULL;
     }
 
@@ -361,9 +361,9 @@ extern "C" float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w
     return out;
 }
 
-extern "C" void v_cuda_free(struct media *md) {
-    struct vcuda *vc = (struct vcuda *)md->cuda;
-    if (!vc || md->cuda == (void *)-1) return;
+extern "C" void v_gpu_free(struct media *md) {
+    struct vcuda *vc = (struct vcuda *)md->gpu;
+    if (!vc || md->gpu == (void *)-1) return;
     for (int L = 0; L < md->v_layer; L++) {
         struct vld *d = &vc->vl[L];
         cudaFree(d->ln1); cudaFree(d->ln2); cudaFree(d->attn_post); cudaFree(d->ffn_post);
@@ -377,5 +377,5 @@ extern "C" void v_cuda_free(struct media *md) {
     cudaFree(vc->G); cudaFree(vc->U); cudaFree(vc->pooled); cudaFree(vc->rows);
     free(vc->vl);
     free(vc);
-    md->cuda = NULL;
+    md->gpu = NULL;
 }

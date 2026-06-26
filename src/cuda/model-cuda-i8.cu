@@ -1,4 +1,4 @@
-// CUDA backend, int8 matmul with wide (32-bit) weight loads — "i8r" = repacked.
+// CUDA backend, int8 matmul with wide (32-bit) weight loads — repacked weights.
 //
 // Idea 1 (llama.cpp's mul_mat_vec_q, simplified): the activation x is the same
 // for every output row, so quantize it to int8 ONCE per matmul — per 32-element
@@ -10,10 +10,10 @@
 //     sum_i w_i x_i = d_x ( d*sc * Σ q_i·xq_i  [- dmin*m * Σ xq_i] )
 // The Σ q_i·xq_i is a small-integer dot taken 4 elements at a time by __dp4a.
 // This is lossy (int8 activation), exactly like llama.cpp's GPU path. It first
-// shipped as a byte-load backend, model-cuda-i8.cu (in git history); idea 2
+// shipped as a byte-load backend (in git history); idea 2
 // then replaced it, bit-identical and strictly faster.
 //
-// Idea 2 ("r" = repacked): profiling (Nsight Compute) showed the large matmuls
+// Idea 2 (repacked): profiling (Nsight Compute) showed the large matmuls
 // saturate the load/store unit's issue queue (lg_throttle) — every __dp4a group
 // was built from 4-16 single-byte loads plus shift/or assembly. Here each group
 // is ONE aligned uint32 load, and the 4 packed values are extracted with

@@ -19,7 +19,7 @@ against the CPU output (byte-identical) before keeping it (E2B tok/s):
 4. **the warp cooperates on each block**, with per-element dequant fused into the
    dot — every lane stays busy and the per-row scratch buffer is gone. (36)
 
-**`model-cuda-i8r.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
+**`model-cuda-i8.cu` — the int8 matmul** (llama.cpp's `mul_mat_vec_q` idea,
 simplified). The activation is the same for every output row, so quantize it to
 int8 once per matmul (per 32-element group: a scale, the int8 values, and their
 sum). The per-row dot is then done in **integer arithmetic** per weight sub-block —
@@ -29,7 +29,7 @@ instruction. Because an integer dot is order-independent, this is **byte-identic
 to the scalar version: pure speedup, zero numerical change. (The int8 *activation*
 is lossy, like every GPU inference engine, so the greedy path differs slightly from
 f32, but the output stays coherent and accurate.) The int8 idea first shipped as a
-byte-load backend, `model-cuda-i8.cu`; the wide-load rework documented below replaced
+byte-load backend; the wide-load rework documented below replaced
 it — bit-identical output, strictly faster — and the original now lives in git history.
 
 Decode throughput at that first int8 milestone (single token, all layers on GPU):
@@ -42,7 +42,7 @@ Decode throughput at that first int8 milestone (single token, all layers on GPU)
 So the int8 path is ~48× over the CPU backend (E2B) and closes the gap to
 llama.cpp's heavily-tuned kernels from ~4× to ~2×. (Those `int8+dp4a` numbers are the
 starting point; the optimizations documented below — activation-quant dedup, a CUDA
-graph, wide weight loads, and the long-tail wins (`run-cuda-i8r`) — then take E2B to
+graph, wide weight loads, and the long-tail wins (`run-cuda-i8`) — then take E2B to
 ~134 and 12B to ~50 tok/s.) The rest of this journal walks the attempts to close the
 remaining gap: first two that **did not work**, then those that did — the negative
 results are as instructive as the wins.
@@ -85,7 +85,7 @@ bandwidth-bound, so the int8 *tensor cores* that accelerate llama.cpp's batched 
 kernel (`mul_mat_q`, MMQ — used for prompt processing) don't apply here; the win is memory
 efficiency, not compute. A full rewrite stayed off the table, but the next two wins were
 elsewhere entirely — and then a thin slice of the MMVQ idea (just its wide loads, none of
-its restructuring) turned out to fit in ~30 changed lines: `model-cuda-i8r.cu`, below.
+its restructuring) turned out to fit in ~30 changed lines: `model-cuda-i8.cu`, below.
 
 ## What did work: activation-quant dedup
 
@@ -132,9 +132,9 @@ Two things make this work:
 CUDA at this point was ~1.8× (from the ~2× dp4a starting point above), all of it matmul
 memory efficiency.
 
-## What did work in the matmul after all: wide loads (`model-cuda-i8r.cu`)
+## What did work in the matmul after all: wide loads (`model-cuda-i8.cu`)
 
-The matmul win that finally landed — `run-cuda-i8r` ("r" = repacked) — and the failed
+The matmul win that finally landed — the repacked kernel `matmul_i8r` ("r" = repacked) — and the failed
 attempts above pointed straight at it. The kernel keeps the byte-load backend's exact
 structure (one warp per row, same lane→sub-block mapping, same integer dots, same float
 order — the output was verified **bit-identical** against `run-cuda-i8` on both models
@@ -262,7 +262,7 @@ kernel everyone stares at.
 
 Decode throughput (tok/s, single-token generation, greedy) after each step, on the same
 machine (RTX A5000, Windows/WDDM). Steps 1–4 built up `model-cuda-f32.cu`; steps 5–13 are
-the int8 line that became `model-cuda-i8r.cu`. Numbers were measured as each step landed,
+the int8 line that became `model-cuda-i8.cu`. Numbers were measured as each step landed,
 in different sessions, so adjacent baselines drift by a tok/s or two (e.g. step 4 f32
 re-measured 34.7 later) — each step's delta was verified against its immediate
 predecessor at the time. "—" = not measured at that step.
@@ -299,7 +299,7 @@ workload the comparison shifts slightly further in little-gemma's favor.
 
 ## Where things stand, across the whole Gemma 4 family
 
-Same machine, same day, both sides re-measured (little-gemma = `run-cuda-i8r`,
+Same machine, same day, both sides re-measured (little-gemma = `run-cuda-i8`,
 ~166–187 generated tokens; llama.cpp = `llama-bench tg32`):
 
 | model | size | params | little-gemma | llama.cpp CUDA | ratio |

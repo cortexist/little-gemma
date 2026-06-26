@@ -1,6 +1,6 @@
 // Shared CUDA backend: everything except the matmul. Included by exactly one
 // compute file per binary — model-cuda-f32.cu (f32 dequant dot) or
-// model-cuda-i8r.cu (int8 dot) — each of which defines matmul_q. The forward
+// model-cuda-i8.cu (int8 dot) — each of which defines matmul_q. The forward
 // pass, the kv cache, and every non-matmul kernel (rmsnorm, rope, attention,
 // elementwise) are identical across both, so they live here. This is a
 // single-include unit, not a normal header: it holds definitions, and the

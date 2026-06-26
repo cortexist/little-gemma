@@ -1,7 +1,7 @@
 // Shared between media.c (host embedders) and media-cuda.cu (the GPU gemma4v
 // encoder). Not part of the public API — that is include/media.h. The CPU-only
-// build compiles media.c alone and never defines LG_MEDIA_CUDA; the CUDA
-// targets add media-cuda.cu and the host path stays in as oracle + fallback
+// build links a no-op stub (media-gpu-stub.c) for the GPU seam below; the CUDA
+// targets link media-cuda.cu instead, and the host path stays in as oracle + fallback
 // (set LG_MEDIA_VERIFY=1 to run both per image and print the max difference).
 #ifndef MEDIA_INTERNAL_H
 #define MEDIA_INTERNAL_H
@@ -38,16 +38,16 @@ struct media {
     int v_embd, v_head, v_layer, v_merge;      // 768, 12, 16, 3
     const struct gguf_tensor *v_patch16;       // [16,16,3 -> 768] conv, no bias
     struct vlayer *vl;
-    void *cuda;                                // media-cuda.cu state, or NULL
+    void *gpu;                                 // GPU backend state (media-cuda.cu), or NULL
 };
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-// GPU gemma4v encoder. Returns NULL when CUDA is unusable (init failure, an
+// GPU gemma4v encoder. Returns NULL when the GPU path is unusable (init failure, an
 // unsupported geometry) — the caller then falls back to the host path.
-float *v_embed_image_cuda(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
-void   v_cuda_free(struct media *md);
+float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
+void   v_gpu_free(struct media *md);
 #ifdef __cplusplus
 }
 #endif
