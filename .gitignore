@@ -1,6 +1,7 @@
 .claude/
 .data/
 .scratch/
+.benchmarks/
 build/
 
 # stray in-source CMake artifacts (the real build is out-of-source in build/)
