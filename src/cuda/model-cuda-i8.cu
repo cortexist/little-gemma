@@ -788,13 +788,32 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
         uint32_t s2 = ((const uint32_t *)hp->scales)[2];
         float dD, dM; d_dm(&hp->d, &dD, &dM);
 
+        // Software-pipeline global qs loads across sjp: issue sjp+1 reads before
+        // the long mma loop on sjp so uncached host-mapped weight traffic overlaps
+        // compute (sync loads only — cp.async from zero-copy qs is broken on Tegra).
+        uint4 q4w[2];
+        #pragma unroll
+        for (int t = 0; t < 2; t++) {
+            int ar = lane & 15, hi = lane >> 4;
+            int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+            const block_q4_K *bp = w + (size_t)row * nbk + blk;
+            q4w[t] = *(const uint4 *)(bp->qs + hi * 16);
+        }
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS (shared 32 qs bytes)
+            uint4 q4n[2];
+            if (sjp + 1 < 4) {
+                #pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    int ar = lane & 15, hi = lane >> 4;
+                    int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                    const block_q4_K *bp = w + (size_t)row * nbk + blk;
+                    q4n[t] = *(const uint4 *)(bp->qs + (sjp + 1) * 32 + hi * 16);
+                }
+            }
             #pragma unroll
             for (int t = 0; t < 2; t++) {
                 int ar = lane & 15, hi = lane >> 4;
-                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-                const block_q4_K *bp = w + (size_t)row * nbk + blk;
-                uint4 q4 = *(const uint4 *)(bp->qs + sjp * 32 + hi * 16);
+                uint4 q4 = q4w[t];
                 int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
                 uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);
                 uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16);
@@ -869,6 +888,10 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                 }
             }
             __syncwarp();                                          // all reads done before re-stage
+            if (sjp + 1 < 4) {
+                #pragma unroll
+                for (int t = 0; t < 2; t++) q4w[t] = q4n[t];
+            }
         }
     }
 
