@@ -854,18 +854,28 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                 uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
                 float2 xd0 = sBxd[(tid * 2) * SBX + sj];
                 float2 xd1 = sBxd[(tid * 2 + 1) * SBX + sj];
-                #pragma unroll
-                for (int h = 0; h < COLS / 8; h++) {
+                for (int h = 0; h < COLS / 8; ) {
+                    const int hp = h + 1;
+                    const int has_hp = hp < COLS / 8;
+                    uint32_t b0p = 0, b1p = 0;
+                    float2 xd0p = {}, xd1p = {};
+                    int ncolp = (h + 2) * 8 + gid;
+                    if (has_hp) {
+                        b0p = *(uint32_t *)(sBb + (hp * 8 + gid) * SB_COL + sj * 32 + tid * 4);
+                        b1p = *(uint32_t *)(sBb + (hp * 8 + gid) * SB_COL + sj * 32 + tid * 4 + 16);
+                        xd0p = sBxd[(hp * 8 + tid * 2) * SBX + sj];
+                        xd1p = sBxd[(hp * 8 + tid * 2 + 1) * SBX + sj];
+                    }
                     uint32_t bn0 = 0, bn1 = 0;
                     float2 xdn0 = {}, xdn1 = {};
-                    if (h + 1 < COLS / 8) {
-                        int ncolb = (h + 1) * 8 + gid;
-                        bn0 = *(uint32_t *)(sBb + ncolb * SB_COL + sj * 32 + tid * 4);
-                        bn1 = *(uint32_t *)(sBb + ncolb * SB_COL + sj * 32 + tid * 4 + 16);
-                        xdn0 = sBxd[((h + 1) * 8 + tid * 2) * SBX + sj];
-                        xdn1 = sBxd[((h + 1) * 8 + tid * 2 + 1) * SBX + sj];
+                    if (h + 2 < COLS / 8) {
+                        bn0 = *(uint32_t *)(sBb + ncolp * SB_COL + sj * 32 + tid * 4);
+                        bn1 = *(uint32_t *)(sBb + ncolp * SB_COL + sj * 32 + tid * 4 + 16);
+                        xdn0 = sBxd[((h + 2) * 8 + tid * 2) * SBX + sj];
+                        xdn1 = sBxd[((h + 2) * 8 + tid * 2 + 1) * SBX + sj];
                     }
                     int c0[2], c1[2], c2[2], c3[2];
+                    int c0p[2], c1p[2], c2p[2], c3p[2];
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
                         c0[t] = 0; c1[t] = 0; c2[t] = 0; c3[t] = 0;
@@ -873,6 +883,16 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                             : "+r"(c0[t]), "+r"(c1[t]), "+r"(c2[t]), "+r"(c3[t])
                             : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]), "r"(b0), "r"(b1));
+                    }
+                    if (has_hp) {
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            c0p[t] = 0; c1p[t] = 0; c2p[t] = 0; c3p[t] = 0;
+                            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                : "+r"(c0p[t]), "+r"(c1p[t]), "+r"(c2p[t]), "+r"(c3p[t])
+                                : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]), "r"(b0p), "r"(b1p));
+                        }
                     }
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
@@ -885,8 +905,21 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                         acc[t][h][2] += p2;
                         acc[t][h][3] += p3;
                     }
+                    if (has_hp) {
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            float p0 = xd0p.x * (dsc[t][0] * (float)c0p[t] - mnm[t][0] * xd0p.y);
+                            float p1 = xd1p.x * (dsc[t][0] * (float)c1p[t] - mnm[t][0] * xd1p.y);
+                            float p2 = xd0p.x * (dsc[t][1] * (float)c2p[t] - mnm[t][1] * xd0p.y);
+                            float p3 = xd1p.x * (dsc[t][1] * (float)c3p[t] - mnm[t][1] * xd1p.y);
+                            acc[t][hp][0] += p0;
+                            acc[t][hp][1] += p1;
+                            acc[t][hp][2] += p2;
+                            acc[t][hp][3] += p3;
+                        }
+                    }
                     b0 = bn0; b1 = bn1; xd0 = xdn0; xd1 = xdn1;
-                    colb = (h + 1) * 8 + gid;
+                    h += has_hp ? 2 : 1;
                 }
             }
             __syncwarp();                                          // all reads done before re-stage
@@ -921,7 +954,10 @@ template<int COLS>
 static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
                            int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    static int force_wpc = -1;
+    if (force_wpc < 0) force_wpc = getenv("LG_FORCE_WPC") != NULL;
+    if (!force_wpc)
+        while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
     size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
     static int carve = 0;
