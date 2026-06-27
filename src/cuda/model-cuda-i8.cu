@@ -745,6 +745,127 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 //               a2 row gid   k16..31, a3 row gid+8 k16..31
 //   B (2 regs): b0 col gid   k0..15, b1 col gid   k16..31
 //   C (4 regs): c0/c1 row gid col tid*2/+1, c2/c3 row gid+8 same
+static __constant__ int c_mma_pair = 8;
+
+static int mma_pair_w(void) {
+    static int w = -1;
+    if (w < 0) {
+        const char *e = getenv("LG_MMA_PAIR");
+        w = e ? atoi(e) : 8;
+        if (w < 1) w = 1;
+        if (w > 8) w = 8;
+    }
+    return w;
+}
+
+// Issue NW column-group mmas before epilogue, prefetching the next batch.
+// Outer h loop is intentionally not unrolled (variable step when NW does not divide COLS/8).
+template<int NW, int COLS>
+__device__ __forceinline__ void q4k_colgroup_mmas(
+    int gid, int tid, int sj, const int8_t *sBb, const float2 *sBxd,
+    const uint32_t afrag[2][4], const float dsc[2][2], const float mnm[2][2],
+    float acc[2][COLS / 8][4])
+{
+    constexpr int NCOLG = COLS / 8;
+    uint32_t bg0[NW], bg1[NW];
+    float2 xg0[NW], xg1[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; i++) {
+        if (i >= NCOLG) break;
+        bg0[i] = *(uint32_t *)(sBb + (i * 8 + gid) * SB_COL + sj * 32 + tid * 4);
+        bg1[i] = *(uint32_t *)(sBb + (i * 8 + gid) * SB_COL + sj * 32 + tid * 4 + 16);
+        xg0[i] = sBxd[(i * 8 + tid * 2) * SBX + sj];
+        xg1[i] = sBxd[(i * 8 + tid * 2 + 1) * SBX + sj];
+    }
+    for (int h = 0; h < NCOLG; ) {
+        const int n = (h + NW <= NCOLG) ? NW : (NCOLG - h);
+        const int hn = h + n;
+        int c0[NW][2], c1[NW][2], c2[NW][2], c3[NW][2];
+        #pragma unroll
+        for (int i = 0; i < NW; i++) {
+            if (i >= n) continue;
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                c0[i][t] = 0; c1[i][t] = 0; c2[i][t] = 0; c3[i][t] = 0;
+                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+r"(c0[i][t]), "+r"(c1[i][t]), "+r"(c2[i][t]), "+r"(c3[i][t])
+                    : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]),
+                      "r"(bg0[i]), "r"(bg1[i]));
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < NW; i++) {
+            if (i >= n) continue;
+            const int hc = h + i;
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                float p0 = xg0[i].x * (dsc[t][0] * (float)c0[i][t] - mnm[t][0] * xg0[i].y);
+                float p1 = xg1[i].x * (dsc[t][0] * (float)c1[i][t] - mnm[t][0] * xg1[i].y);
+                float p2 = xg0[i].x * (dsc[t][1] * (float)c2[i][t] - mnm[t][1] * xg0[i].y);
+                float p3 = xg1[i].x * (dsc[t][1] * (float)c3[i][t] - mnm[t][1] * xg1[i].y);
+                acc[t][hc][0] += p0;
+                acc[t][hc][1] += p1;
+                acc[t][hc][2] += p2;
+                acc[t][hc][3] += p3;
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < NW; i++) {
+            int hi = hn + i;
+            if (hi >= NCOLG) break;
+            bg0[i] = *(uint32_t *)(sBb + (hi * 8 + gid) * SB_COL + sj * 32 + tid * 4);
+            bg1[i] = *(uint32_t *)(sBb + (hi * 8 + gid) * SB_COL + sj * 32 + tid * 4 + 16);
+            xg0[i] = sBxd[(hi * 8 + tid * 2) * SBX + sj];
+            xg1[i] = sBxd[(hi * 8 + tid * 2 + 1) * SBX + sj];
+        }
+        h += n;
+    }
+}
+
+// COLS=64 wide-chunk path: all 8 column groups in one batch (no h loop).
+template<>
+__device__ __forceinline__ void q4k_colgroup_mmas<8, 64>(
+    int gid, int tid, int sj, const int8_t *sBb, const float2 *sBxd,
+    const uint32_t afrag[2][4], const float dsc[2][2], const float mnm[2][2],
+    float acc[2][8][4])
+{
+    uint32_t bg0[8], bg1[8];
+    float2 xg0[8], xg1[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        bg0[i] = *(uint32_t *)(sBb + (i * 8 + gid) * SB_COL + sj * 32 + tid * 4);
+        bg1[i] = *(uint32_t *)(sBb + (i * 8 + gid) * SB_COL + sj * 32 + tid * 4 + 16);
+        xg0[i] = sBxd[(i * 8 + tid * 2) * SBX + sj];
+        xg1[i] = sBxd[(i * 8 + tid * 2 + 1) * SBX + sj];
+    }
+    int c0[8][2], c1[8][2], c2[8][2], c3[8][2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++)
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            c0[i][t] = 0; c1[i][t] = 0; c2[i][t] = 0; c3[i][t] = 0;
+            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(c0[i][t]), "+r"(c1[i][t]), "+r"(c2[i][t]), "+r"(c3[i][t])
+                : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]),
+                  "r"(bg0[i]), "r"(bg1[i]));
+        }
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int t = 0; t < 2; t++) {
+            float p0 = xg0[i].x * (dsc[t][0] * (float)c0[i][t] - mnm[t][0] * xg0[i].y);
+            float p1 = xg1[i].x * (dsc[t][0] * (float)c1[i][t] - mnm[t][0] * xg1[i].y);
+            float p2 = xg0[i].x * (dsc[t][1] * (float)c2[i][t] - mnm[t][1] * xg0[i].y);
+            float p3 = xg1[i].x * (dsc[t][1] * (float)c3[i][t] - mnm[t][1] * xg1[i].y);
+            acc[t][i][0] += p0;
+            acc[t][i][1] += p1;
+            acc[t][i][2] += p2;
+            acc[t][i][3] += p3;
+        }
+}
+
 template<int COLS>
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m) {
@@ -849,77 +970,16 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                     afrag[t][2] = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
                     afrag[t][3] = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
                 }
-                int colb = gid;
-                uint32_t b0 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4);
-                uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
-                float2 xd0 = sBxd[(tid * 2) * SBX + sj];
-                float2 xd1 = sBxd[(tid * 2 + 1) * SBX + sj];
-                for (int h = 0; h < COLS / 8; ) {
-                    const int hp = h + 1;
-                    const int has_hp = hp < COLS / 8;
-                    uint32_t b0p = 0, b1p = 0;
-                    float2 xd0p = {}, xd1p = {};
-                    int ncolp = (h + 2) * 8 + gid;
-                    if (has_hp) {
-                        b0p = *(uint32_t *)(sBb + (hp * 8 + gid) * SB_COL + sj * 32 + tid * 4);
-                        b1p = *(uint32_t *)(sBb + (hp * 8 + gid) * SB_COL + sj * 32 + tid * 4 + 16);
-                        xd0p = sBxd[(hp * 8 + tid * 2) * SBX + sj];
-                        xd1p = sBxd[(hp * 8 + tid * 2 + 1) * SBX + sj];
-                    }
-                    uint32_t bn0 = 0, bn1 = 0;
-                    float2 xdn0 = {}, xdn1 = {};
-                    if (h + 2 < COLS / 8) {
-                        bn0 = *(uint32_t *)(sBb + ncolp * SB_COL + sj * 32 + tid * 4);
-                        bn1 = *(uint32_t *)(sBb + ncolp * SB_COL + sj * 32 + tid * 4 + 16);
-                        xdn0 = sBxd[((h + 2) * 8 + tid * 2) * SBX + sj];
-                        xdn1 = sBxd[((h + 2) * 8 + tid * 2 + 1) * SBX + sj];
-                    }
-                    int c0[2], c1[2], c2[2], c3[2];
-                    int c0p[2], c1p[2], c2p[2], c3p[2];
-                    #pragma unroll
-                    for (int t = 0; t < 2; t++) {
-                        c0[t] = 0; c1[t] = 0; c2[t] = 0; c3[t] = 0;
-                        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                            : "+r"(c0[t]), "+r"(c1[t]), "+r"(c2[t]), "+r"(c3[t])
-                            : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]), "r"(b0), "r"(b1));
-                    }
-                    if (has_hp) {
-                        #pragma unroll
-                        for (int t = 0; t < 2; t++) {
-                            c0p[t] = 0; c1p[t] = 0; c2p[t] = 0; c3p[t] = 0;
-                            asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                                : "+r"(c0p[t]), "+r"(c1p[t]), "+r"(c2p[t]), "+r"(c3p[t])
-                                : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]), "r"(b0p), "r"(b1p));
-                        }
-                    }
-                    #pragma unroll
-                    for (int t = 0; t < 2; t++) {
-                        float p0 = xd0.x * (dsc[t][0] * (float)c0[t] - mnm[t][0] * xd0.y);
-                        float p1 = xd1.x * (dsc[t][0] * (float)c1[t] - mnm[t][0] * xd1.y);
-                        float p2 = xd0.x * (dsc[t][1] * (float)c2[t] - mnm[t][1] * xd0.y);
-                        float p3 = xd1.x * (dsc[t][1] * (float)c3[t] - mnm[t][1] * xd1.y);
-                        acc[t][h][0] += p0;
-                        acc[t][h][1] += p1;
-                        acc[t][h][2] += p2;
-                        acc[t][h][3] += p3;
-                    }
-                    if (has_hp) {
-                        #pragma unroll
-                        for (int t = 0; t < 2; t++) {
-                            float p0 = xd0p.x * (dsc[t][0] * (float)c0p[t] - mnm[t][0] * xd0p.y);
-                            float p1 = xd1p.x * (dsc[t][0] * (float)c1p[t] - mnm[t][0] * xd1p.y);
-                            float p2 = xd0p.x * (dsc[t][1] * (float)c2p[t] - mnm[t][1] * xd0p.y);
-                            float p3 = xd1p.x * (dsc[t][1] * (float)c3p[t] - mnm[t][1] * xd1p.y);
-                            acc[t][hp][0] += p0;
-                            acc[t][hp][1] += p1;
-                            acc[t][hp][2] += p2;
-                            acc[t][hp][3] += p3;
-                        }
-                    }
-                    b0 = bn0; b1 = bn1; xd0 = xdn0; xd1 = xdn1;
-                    h += has_hp ? 2 : 1;
+                const int pw = c_mma_pair;
+                switch (pw) {
+                case 8: q4k_colgroup_mmas<8, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 7: q4k_colgroup_mmas<7, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 6: q4k_colgroup_mmas<6, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 5: q4k_colgroup_mmas<5, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 4: q4k_colgroup_mmas<4, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 3: q4k_colgroup_mmas<3, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                case 1: q4k_colgroup_mmas<1, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
+                default: q4k_colgroup_mmas<2, COLS>(gid, tid, sj, sBb, sBxd, afrag, dsc, mnm, acc); break;
                 }
             }
             __syncwarp();                                          // all reads done before re-stage
@@ -950,6 +1010,8 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
 // q4_K mma launcher for a compile-time COLS. Mirrors launch_q6k_mmq: 32 rows/warp,
 // shrink warps-per-CTA to keep the grid over the SMs, carve out the dynamic shared
 // past 48 KB once. The A tile is 2 tiles x 2 halves x 16 rows x SA_ROW per warp.
+static int g_sms = 0;
+
 template<int COLS>
 static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
                            int k, int m, int sms, int ncol = 1) {
@@ -960,12 +1022,6 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
         while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
     size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
-    static int carve = 0;
-    if (!carve) {
-        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
-        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
-        carve = 1;
-    }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
     matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
 }
@@ -1134,35 +1190,21 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
     int wpc = 8;
     while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
-    static int carve = 0;
-    if (!carve) {
-        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 2048;
-        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q6k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
-        carve = 1;
-    }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
     matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
-// The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
-// own m16n8k32 / m16n8k16 tensor-core mma kernel (above); everything else falls to
-// the dp4a chunk kernel. PREFILL ONLY: decode (matmul_q) and the MTP verify
-// (matmul_q_spec) keep the byte-identical i8r kernels, so their gates are untouched.
-// LG_NO_MMA forces the dp4a path (debug / A-B).
-static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
-    rweight_init_all();
+// Kernel launches only — safe inside CUDA graph capture (no rweight_init_all).
+static void matmul_q_n_launch(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     int blck = ggml_blck_size(t->type), ts;
     const unsigned char *w = rweight(t, &ts);
-    if (t->type < 40) g_cov[t->type] += (double)k * m;
 
     static int no_mma = -1;
     if (no_mma < 0) no_mma = getenv("LG_NO_MMA") != NULL;
     if (no_mma) {
-        // dp4a fallback (q3/q5/q8 and the residual f32/bf16): float s[NB] spills past
-        // ~32, so loop 32-col sub-tiles here too.
         int rows_per_block = 256 / 32;
         int blocks = (m + rows_per_block - 1) / rows_per_block;
-        for (int c0 = 0; c0 < g_pf_cols; c0 += 32)                   // chunk width (adaptive), 32-col sub-tiles
+        for (int c0 = 0; c0 < g_pf_cols; c0 += 32)
             matmul_i8r_n_kernel<32><<<blocks, 256, 0, g_launch>>>(
                 d_out + (size_t)c0 * m, w, (int)t->type, ts, blck, d_x + (size_t)c0 * k,
                 g_xq + (size_t)c0 * k, g_xds + (size_t)c0 * (k / 32), k, m);
@@ -1170,12 +1212,8 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     }
 
     static int sms = 0;
-    if (!sms) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); sms = p.multiProcessorCount; }
+    if (!sms) sms = g_sms;
 
-    // q4_K (the bulk of prefill MACs): our own m16n8k32 mma kernel over the chunk.
-    // Reads the in-place q4_K blob and the producer's i8r activation (g_xq/g_xds);
-    // one mma.m16n8k32.s8 per 32-element sub-block, d*sc*acc - dmin*m*sum epilogue,
-    // the same wide-tile shape as q6_K. COLS tiles the chunk in 64/32-wide passes.
     if (t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0) {
         const block_q4_K *q4 = (const block_q4_K *)w;
         if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
@@ -1191,25 +1229,15 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         return;
     }
 
-    // q6_K (native) and the f32/bf16 PLE q6_K twin share the 2-tile mma kernel,
-    // whose acc[2][COLS/8][4] spills past COLS=32 — so loop the chunk in 32-col
-    // sub-tiles (offset out/xq/xds per slice). At PREFILL_B=32 that's a single
-    // iteration = the old single launch; same float order either way.
     const unsigned char *q6src = NULL; int q6ts = 0;
-
     if (t->type == GGML_TYPE_Q6_K) { q6src = w; q6ts = ts; }
     else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
 
     if (q6src && PREFILL_B % 32 == 0) {
-        // Wide chunk: one launch, COLS=64 tiles across gridDim.y -> the row-tile's
-        // q6_K weights stay L2-hot across all its column-tiles (this is q6_K's bigger
-        // win — its 64-col tile re-streams weights twice as often as q4_K's 128).
         if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
             launch_q6k_mmq<64>(d_out, q6src, q6ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
             return;
         }
-        // 64-wide sub-tiles where the chunk allows (halves weight passes vs 32),
-        // a 32-wide tail for the leftover 32 cols (g_pf_cols in {32,64,96,128}).
         for (int c0 = 0; c0 < g_pf_cols; ) {
             const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
             float *outc = d_out + (size_t)c0 * m;
@@ -1217,6 +1245,65 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             else                     { launch_q6k_mmq<32>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 32; }
         }
     }
+}
+
+// Matmul-only CUDA graph for wide-chunk prefill (OPT-IN: LG_MM_GRAPH=1). Each
+// (tensor, d_out, stream) captured once, then replayed. Elementwise/attention
+// stay outside the graph. Currently broken on Orin 12B — see
+// docs/prefill-performance-journal.md. LG_NO_MM_GRAPH=1 forces direct launch.
+struct mm_graph_slot { cudaGraphExec_t exec; const struct gguf_tensor *t; float *d_out; cudaStream_t stream; };
+static mm_graph_slot *g_mm_graph = NULL;
+static int g_mm_graph_n = 0, g_mm_graph_cap = 0, g_mm_graph_cols = 0, g_mm_graph_on = -1;
+
+static int mm_graph_wanted(void) {
+    if (g_mm_graph_on < 0) g_mm_graph_on = getenv("LG_MM_GRAPH") ? 1 : 0;   // opt-in; default off
+    if (!g_mm_graph_on || g_chunk_verify) return 0;
+    return g_pf_cols > 128 && (g_pf_cols % 64) == 0;
+}
+
+static void mm_graph_reset_if_cols_changed(void) {
+    if (g_mm_graph_cols == g_pf_cols) return;
+    for (int i = 0; i < g_mm_graph_n; i++)
+        if (g_mm_graph[i].exec) CUDA_CHECK(cudaGraphExecDestroy(g_mm_graph[i].exec));
+    free(g_mm_graph);
+    g_mm_graph = NULL; g_mm_graph_n = g_mm_graph_cap = 0;
+    g_mm_graph_cols = g_pf_cols;
+}
+
+static void mm_graph_replay(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    mm_graph_reset_if_cols_changed();
+    cudaStream_t stream = g_launch;
+    for (int i = 0; i < g_mm_graph_n; i++)
+        if (g_mm_graph[i].t == t && g_mm_graph[i].d_out == d_out && g_mm_graph[i].stream == stream) {
+            CUDA_CHECK(cudaGraphLaunch(g_mm_graph[i].exec, stream));
+            return;
+        }
+    cudaGraph_t graph;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    matmul_q_n_launch(d_out, t, d_x, k, m);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    cudaGraphExec_t exec;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    if (g_mm_graph_n >= g_mm_graph_cap) {
+        g_mm_graph_cap = g_mm_graph_cap ? g_mm_graph_cap * 2 : 64;
+        g_mm_graph = (mm_graph_slot *)realloc(g_mm_graph, (size_t)g_mm_graph_cap * sizeof(mm_graph_slot));
+    }
+    g_mm_graph[g_mm_graph_n++] = { exec, t, d_out, stream };
+}
+
+// The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
+// own m16n8k32 / m16n8k16 tensor-core mma kernel (above); everything else falls to
+// the dp4a chunk kernel. PREFILL ONLY: decode (matmul_q) and the MTP verify
+// (matmul_q_spec) keep the byte-identical i8r kernels, so their gates are untouched.
+// LG_NO_MMA forces the dp4a path (debug / A-B).
+static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
+    rweight_init_all();
+    if (t->type < 40) g_cov[t->type] += (double)k * m;
+    if (mm_graph_wanted())
+        mm_graph_replay(d_out, t, d_x, k, m);
+    else
+        matmul_q_n_launch(d_out, t, d_x, k, m);
 }
 
 // The MTP verify matmul: LG_MTP_N query columns in one launch. Byte-identical to
@@ -1230,8 +1317,37 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
     matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
 
-// Finish lazy q3/q6 repacks before CUDA graph capture (illegal mid-capture).
-extern "C" void lg_i8_prewarm_weights(void) { rweight_init_all(); }
+// Finish lazy q3/q6 repacks + mma setup before CUDA graph capture (illegal mid-capture).
+static void lg_i8_prewarm_mma(void) {
+    if (!g_sms) {
+        cudaDeviceProp p;
+        cudaGetDeviceProperties(&p, 0);
+        g_sms = p.multiProcessorCount;
+    }
+    int pw = mma_pair_w();
+    cudaMemcpyToSymbol(c_mma_pair, &pw, sizeof(int));
+    auto carve_q4 = [](int cols) {
+        size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
+        size_t maxshm = 2 * cols * SB_COL + 2 * cols * SBX * sizeof(float2) + (size_t)8 * atile;
+        if (maxshm > 48 * 1024) {
+            if (cols == 32) cudaFuncSetAttribute(matmul_q4k_mma_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+            else            cudaFuncSetAttribute(matmul_q4k_mma_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        }
+    };
+    carve_q4(32);
+    carve_q4(64);
+    auto carve_q6 = [](int cols) {
+        size_t maxshm = 2 * cols * SB_COL + 2 * cols * SBX * sizeof(float2) + (size_t)8 * 2 * 2048;
+        if (maxshm > 48 * 1024) {
+            if (cols == 32) cudaFuncSetAttribute(matmul_q6k_mma_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+            else            cudaFuncSetAttribute(matmul_q6k_mma_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        }
+    };
+    carve_q6(32);
+    carve_q6(64);
+}
+
+extern "C" void lg_i8_prewarm_weights(void) { rweight_init_all(); lg_i8_prewarm_mma(); }
 
 // One token row: each thread owns one q4_K superblock (n_embd must be QK_K-aligned).
 __global__ static void embed_q4k_row_kernel(float *dx, const block_q4_K *emb, const int *tokens,
