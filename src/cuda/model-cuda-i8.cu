@@ -768,6 +768,20 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
     int rowL = r0 + lane; if (rowL >= m) rowL = m - 1;
     const block_q4_K *myrow = w + (size_t)rowL * nbk;
 
+    // Per-tile weight row bases — invariant across k-blocks within this row tile.
+    const block_q4_K *bp_t[2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) {
+        int ar = lane & 15;
+        int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+        bp_t[t] = w + (size_t)row * nbk;
+    }
+    // Pipeline header scales across k-blocks: prefetch blk+1 at the end of each blk.
+    uint32_t s0 = ((const uint32_t *)myrow->scales)[0];
+    uint32_t s1 = ((const uint32_t *)myrow->scales)[1];
+    uint32_t s2 = ((const uint32_t *)myrow->scales)[2];
+    float dD, dM; d_dm(&myrow->d, &dD, &dM);
+
     mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
@@ -782,32 +796,22 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
         const int8_t *sBb = sB + buf * COLS * SB_COL;
         const float2 *sBxd = sBxds + buf * COLS * SBX;
 
-        const block_q4_K *hp = myrow + blk;                        // my header row's scales + (d,dmin)
-        uint32_t s0 = ((const uint32_t *)hp->scales)[0];
-        uint32_t s1 = ((const uint32_t *)hp->scales)[1];
-        uint32_t s2 = ((const uint32_t *)hp->scales)[2];
-        float dD, dM; d_dm(&hp->d, &dD, &dM);
-
         // Software-pipeline global qs loads across sjp: issue sjp+1 reads before
         // the long mma loop on sjp so uncached host-mapped weight traffic overlaps
         // compute (sync loads only — cp.async from zero-copy qs is broken on Tegra).
         uint4 q4w[2];
         #pragma unroll
         for (int t = 0; t < 2; t++) {
-            int ar = lane & 15, hi = lane >> 4;
-            int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-            const block_q4_K *bp = w + (size_t)row * nbk + blk;
-            q4w[t] = *(const uint4 *)(bp->qs + hi * 16);
+            int hi = lane >> 4;
+            q4w[t] = *(const uint4 *)(bp_t[t][blk].qs + hi * 16);
         }
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS (shared 32 qs bytes)
             uint4 q4n[2];
             if (sjp + 1 < 4) {
                 #pragma unroll
                 for (int t = 0; t < 2; t++) {
-                    int ar = lane & 15, hi = lane >> 4;
-                    int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-                    const block_q4_K *bp = w + (size_t)row * nbk + blk;
-                    q4n[t] = *(const uint4 *)(bp->qs + (sjp + 1) * 32 + hi * 16);
+                    int hi = lane >> 4;
+                    q4n[t] = *(const uint4 *)(bp_t[t][blk].qs + (sjp + 1) * 32 + hi * 16);
                 }
             }
             #pragma unroll
@@ -836,10 +840,6 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                     mnm[t][0] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid);
                     mnm[t][1] = __shfl_sync(0xffffffffu, mnmL, t * 16 + gid + 8);
                 }
-                // A fragments depend only on (half, tile) — not on colgroup h. Hoist
-                // the shared loads out of the h loop so each fragment is read once per
-                // half and reused across all COLS/8 column groups (8x fewer LDS on
-                // COLS=64; the dominant short-scoreboard stall after the bank pads).
                 uint32_t afrag[2][4];
                 #pragma unroll
                 for (int t = 0; t < 2; t++) {
@@ -849,8 +849,6 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                     afrag[t][2] = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
                     afrag[t][3] = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
                 }
-                // Software-pipeline B fragments: prefetch column group h+1 while mma
-                // runs on group h (COLS=64 -> 8 stages; byte-identical order preserved).
                 int colb = gid;
                 uint32_t b0 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4);
                 uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
@@ -896,6 +894,13 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                 #pragma unroll
                 for (int t = 0; t < 2; t++) q4w[t] = q4n[t];
             }
+        }
+        if (blk + 1 < nbk) {
+            const block_q4_K *hp = myrow + blk + 1;
+            s0 = ((const uint32_t *)hp->scales)[0];
+            s1 = ((const uint32_t *)hp->scales)[1];
+            s2 = ((const uint32_t *)hp->scales)[2];
+            d_dm(&hp->d, &dD, &dM);
         }
     }
 

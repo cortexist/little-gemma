@@ -842,7 +842,7 @@ static void wide_chunk_init(void) {
         w = (atoi(e) / 128) * 128;                 // a whole number of 128-col tiles
     } else {
         cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-        if (p.integrated) w = 512;                 // Orin: match llama ubatch ~512 weight reuse
+        if (p.integrated) w = 768;                 // Orin: 768 sweeps best vs 512/1024 on 12B
     }
     if (w < PREFILL_B) w = PREFILL_B;
     if (w > PREFILL_MAX_B) w = PREFILL_MAX_B;
