@@ -867,17 +867,21 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                         xdn0 = sBxd[((h + 1) * 8 + tid * 2) * SBX + sj];
                         xdn1 = sBxd[((h + 1) * 8 + tid * 2 + 1) * SBX + sj];
                     }
+                    int c0[2], c1[2], c2[2], c3[2];
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
-                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        c0[t] = 0; c1[t] = 0; c2[t] = 0; c3[t] = 0;
                         asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "+r"(c0[t]), "+r"(c1[t]), "+r"(c2[t]), "+r"(c3[t])
                             : "r"(afrag[t][0]), "r"(afrag[t][1]), "r"(afrag[t][2]), "r"(afrag[t][3]), "r"(b0), "r"(b1));
-                        float p0 = xd0.x * (dsc[t][0] * (float)c0 - mnm[t][0] * xd0.y);
-                        float p1 = xd1.x * (dsc[t][0] * (float)c1 - mnm[t][0] * xd1.y);
-                        float p2 = xd0.x * (dsc[t][1] * (float)c2 - mnm[t][1] * xd0.y);
-                        float p3 = xd1.x * (dsc[t][1] * (float)c3 - mnm[t][1] * xd1.y);
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {
+                        float p0 = xd0.x * (dsc[t][0] * (float)c0[t] - mnm[t][0] * xd0.y);
+                        float p1 = xd1.x * (dsc[t][0] * (float)c1[t] - mnm[t][0] * xd1.y);
+                        float p2 = xd0.x * (dsc[t][1] * (float)c2[t] - mnm[t][1] * xd0.y);
+                        float p3 = xd1.x * (dsc[t][1] * (float)c3[t] - mnm[t][1] * xd1.y);
                         acc[t][h][0] += p0;
                         acc[t][h][1] += p1;
                         acc[t][h][2] += p2;
