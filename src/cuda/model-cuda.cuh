@@ -831,16 +831,25 @@ extern "C" void model_prefill_reserve(void) {
 // chunk path through attention/ring/buffers already exists (media spans up to
 // g_prefill_max_b); this just opens it to text and widens the buffer/ring reserve.
 // 0 = off (legacy 128-token chunking, byte-identical default).
+// On integrated GPUs (Orin) defaults to 512 when unset. q4_K device copies were
+// tried and rejected: +5.8 GB footprint regressed warm prefill ~25% on 12B/Orin.
 static int g_wide_chunk = 0;
 static void wide_chunk_init(void) {
     static int done = 0; if (done) return; done = 1;
+    int w = 0;
     const char *e = getenv("LG_WIDE_CHUNK");
-    if (!e) return;
-    int w = (atoi(e) / 128) * 128;                 // a whole number of 128-col tiles
+    if (e) {
+        w = (atoi(e) / 128) * 128;                 // a whole number of 128-col tiles
+    } else {
+        cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
+        if (p.integrated) w = 512;                 // Orin: match llama ubatch ~512 weight reuse
+    }
     if (w < PREFILL_B) w = PREFILL_B;
     if (w > PREFILL_MAX_B) w = PREFILL_MAX_B;
-    g_wide_chunk = w;
-    if (w > g_prefill_max_b) g_prefill_max_b = w;  // size float buffers + KV ring for the wide chunk
+    if (w > 0) {
+        g_wide_chunk = w;
+        if (w > g_prefill_max_b) g_prefill_max_b = w;  // size float buffers + KV ring for the wide chunk
+    }
 }
 
 // Adaptive prefill chunk width. Full chunks use PREFILL_B (128) so long prefills
@@ -1222,9 +1231,8 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
 // ONCE per chunk instead of once per token, and prefill is bandwidth-bound,
 // so that factor is most of its cost. Per layer, the whole chunk's k/v are
 // written to the cache before its queries run; causality holds because each
-// query reads only up to its own position. Runs un-captured (and without the
-// fork/join forks): a chunk already amortizes launch latency over its B tokens.
-// LG_PREFILL_PROFILE=1: per-stage wall time across a whole prefill, with a
+// query reads only up to its own position. Runs un-captured (fork/join hides
+// k+v under q and up under gate, same as decode). LG_PREFILL_PROFILE=1:
 // sync after each stage group (slows the run; for attribution only).
 static double g_pf_mm = 0, g_pf_attn = 0, g_pf_elem = 0, g_pf_ple = 0;
 static int g_pf_on = -1;
@@ -1264,17 +1272,20 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
 
         int src = kv_src_dev(m, L);
         const int has_kv = L < c->n_kv_start;
-        if (has_kv) {
+        if (has_kv) {                                   // k+v matmuls beside q (decode's fork/join win)
+            side_begin();
             mm(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
             const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
             if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
-            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, g_side));
+            side_end();
         }
         mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         pf_tick(&g_pf_mm);
         rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
         if (has_kv) {
+            side_sync();
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
             rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2, B);
@@ -1378,8 +1389,11 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
         pf_tick(&g_pf_elem);
+        side_begin();
         mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
+        side_end();
         mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        side_sync();
         pf_tick(&g_pf_mm);
         geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
         pf_tick(&g_pf_elem);
@@ -1406,6 +1420,26 @@ static int model_has_ple(struct model *m) {
            gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;
 }
 
+// Batched token embedding for prefill chunks: dequantize_into one buffer row
+// (no per-token malloc) and optional OpenMP over columns.
+static void embed_chunk_rows(struct model *m, const int *tokens, int B, float *rows) {
+    const int n_embd = m->cfg.n_embd;
+    const struct gguf_tensor *emb = wq(m, "token_embd.weight");
+    int blck = ggml_blck_size(emb->type);
+    size_t rb = (size_t)(n_embd / blck) * ggml_type_size(emb->type);
+    const unsigned char *base = (const unsigned char *)emb->data;
+    float es = sqrtf((float)n_embd);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < B; j++) {
+        float *dst = rows + (size_t)j * n_embd;
+        if (!dequantize_into(emb->type, base + (size_t)tokens[j] * rb, dst, n_embd))
+            memset(dst, 0, (size_t)n_embd * 4);
+        for (int i = 0; i < n_embd; i++) dst[i] *= es;
+    }
+}
+
 // Token form: look up and scale the chunk's embedding rows, build the PLE
 // inputs, then run the layers.
 static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens, int pos0, int cols) {
@@ -1415,12 +1449,7 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
 
     float *rows = (float *)malloc((size_t)B * n_embd * 4);
     if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
-    float es = sqrtf((float)n_embd);
-    for (int j = 0; j < B; j++) {
-        float *erow = dequantize_row(wq(m, "token_embd.weight"), tokens[j], n_embd);
-        for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
-        free(erow);
-    }
+    embed_chunk_rows(m, tokens, B, rows);
     CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
     free(rows);
 
@@ -1460,14 +1489,22 @@ static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float
 
     float *rows = (float *)malloc((size_t)B * n_embd * 4);
     if (!rows) { fprintf(stderr, "forward_chunk_mixed: out of memory\n"); exit(1); }
+    const struct gguf_tensor *emb = wq(m, "token_embd.weight");
+    int blck = ggml_blck_size(emb->type);
+    size_t rb = (size_t)(n_embd / blck) * ggml_type_size(emb->type);
+    const unsigned char *ebase = (const unsigned char *)emb->data;
     float es = sqrtf((float)n_embd);
     int toks[PREFILL_MAX_B];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int j = 0; j < B; j++) {
         if (ids[j] >= 0) {
             toks[j] = ids[j];
-            float *erow = dequantize_row(wq(m, "token_embd.weight"), ids[j], n_embd);
-            for (int i = 0; i < n_embd; i++) rows[(size_t)j * n_embd + i] = erow[i] * es;
-            free(erow);
+            float *dst = rows + (size_t)j * n_embd;
+            if (!dequantize_into(emb->type, ebase + (size_t)ids[j] * rb, dst, n_embd))
+                memset(dst, 0, (size_t)n_embd * 4);
+            for (int i = 0; i < n_embd; i++) dst[i] *= es;
         } else {
             toks[j] = 0;
             memcpy(rows + (size_t)j * n_embd, mrows + (size_t)(-ids[j] - 1) * n_embd, (size_t)n_embd * 4);
