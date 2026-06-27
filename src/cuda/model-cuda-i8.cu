@@ -726,17 +726,6 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
     }
 }
 
-__device__ static void qs_prefetch(int8_t *qbuf, int buf, const block_q4_K *w, int m, int nbk, int blk, int sjp, int lane, int r0) {
-    int ar = lane & 15, hi = lane >> 4;
-    #pragma unroll
-    for (int t = 0; t < 2; t++) {
-        int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-        const unsigned char *src = (w + (size_t)row * nbk + blk)->qs + sjp * 32 + hi * 16;
-        unsigned dst = (unsigned)__cvta_generic_to_shared(qbuf + buf * 64 + t * 32 + hi * 16);
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src));
-    }
-}
-
 // q4_K kernel proper. Minimal signature on purpose (the keep-vs-own contrast is
 // against llama's mul_mat_q, which carries a wall of always-the-same args for
 // quant-generic / MoE / stream-K work we do not have): just out, the in-place
@@ -749,7 +738,9 @@ __device__ static void qs_prefetch(int8_t *qbuf, int buf, const block_q4_K *w, i
 // superblock the four sub-block PAIRS share 32 qs bytes, so one unpack pass
 // stages both nibble halves; one mma.m16n8k32 per sub-block (K=32 == q4_K's
 // 32-element scale granule), then d*sc on the s32 acc minus dmin*m*sum, summed
-// in f32 ascending in k. Fragment mapping pinned in .scratch/mma4_test.cu:
+// in f32 ascending in k. NOTE: cp.async prefetch of qs from zero-copy host
+// weights was tried and produces garbage on Tegra (cohesion fails); sync loads only.
+// Fragment mapping pinned in .scratch/mma4_test.cu:
 //   A (4 regs): a0 row gid   k0..15, a1 row gid+8 k0..15,
 //               a2 row gid   k16..31, a3 row gid+8 k16..31
 //   B (2 regs): b0 col gid   k0..15, b1 col gid   k16..31
@@ -761,8 +752,6 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS][SB_COL]
     float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS][SBX]
     int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][2 halves][16][SA_ROW]
-    const int wpc = blockDim.x >> 5;
-    int8_t *qStage = sA + (size_t)wpc * 2 * 2 * 16 * SA_ROW;                   // [warps][2 bufs][64 B qs]
     const int nbk = k / 256;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
@@ -771,7 +760,6 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
     xds += (size_t)blockIdx.y * COLS * (k / 32);
     out += (size_t)blockIdx.y * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
-    int8_t *myQs = qStage + warp * 128;
     float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
     for (int t = 0; t < 2; t++) for (int h = 0; h < COLS / 8; h++) for (int s = 0; s < 4; s++) acc[t][h][s] = 0.0f;
@@ -800,21 +788,13 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
         uint32_t s2 = ((const uint32_t *)hp->scales)[2];
         float dD, dM; d_dm(&hp->d, &dD, &dM);
 
-        qs_prefetch(myQs, 0, w, m, nbk, blk, 0, lane, r0);
-        asm volatile("cp.async.commit_group;\n");
-
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS (shared 32 qs bytes)
-            int qbuf = sjp & 1;
-            asm volatile("cp.async.wait_group 0;\n");
-            if (sjp + 1 < 4) {
-                qs_prefetch(myQs, qbuf ^ 1, w, m, nbk, blk, sjp + 1, lane, r0);
-                asm volatile("cp.async.commit_group;\n");
-            }
-            // unpack qs from the cp.async buffer (overlapped with previous sjp's mma)
             #pragma unroll
             for (int t = 0; t < 2; t++) {
                 int ar = lane & 15, hi = lane >> 4;
-                uint4 q4 = *(const uint4 *)(myQs + qbuf * 64 + t * 32 + hi * 16);
+                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+                const block_q4_K *bp = w + (size_t)row * nbk + blk;
+                uint4 q4 = *(const uint4 *)(bp->qs + sjp * 32 + hi * 16);
                 int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
                 uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);
                 uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16);
@@ -850,13 +830,24 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                     afrag[t][2] = *(uint32_t *)(sAh + gid * SA_ROW + tid * 4 + 16);
                     afrag[t][3] = *(uint32_t *)(sAh + (gid + 8) * SA_ROW + tid * 4 + 16);
                 }
+                // Software-pipeline B fragments: prefetch column group h+1 while mma
+                // runs on group h (COLS=64 -> 8 stages; byte-identical order preserved).
+                int colb = gid;
+                uint32_t b0 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4);
+                uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
+                float2 xd0 = sBxd[(tid * 2) * SBX + sj];
+                float2 xd1 = sBxd[(tid * 2 + 1) * SBX + sj];
                 #pragma unroll
                 for (int h = 0; h < COLS / 8; h++) {
-                    int colb = h * 8 + gid;
-                    uint32_t b0 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4);
-                    uint32_t b1 = *(uint32_t *)(sBb + colb * SB_COL + sj * 32 + tid * 4 + 16);
-                    float2 xd0 = sBxd[(h * 8 + tid * 2) * SBX + sj];
-                    float2 xd1 = sBxd[(h * 8 + tid * 2 + 1) * SBX + sj];
+                    uint32_t bn0 = 0, bn1 = 0;
+                    float2 xdn0 = {}, xdn1 = {};
+                    if (h + 1 < COLS / 8) {
+                        int ncolb = (h + 1) * 8 + gid;
+                        bn0 = *(uint32_t *)(sBb + ncolb * SB_COL + sj * 32 + tid * 4);
+                        bn1 = *(uint32_t *)(sBb + ncolb * SB_COL + sj * 32 + tid * 4 + 16);
+                        xdn0 = sBxd[((h + 1) * 8 + tid * 2) * SBX + sj];
+                        xdn1 = sBxd[((h + 1) * 8 + tid * 2 + 1) * SBX + sj];
+                    }
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
                         int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
@@ -873,6 +864,8 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                         acc[t][h][2] += p2;
                         acc[t][h][3] += p3;
                     }
+                    b0 = bn0; b1 = bn1; xd0 = xdn0; xd1 = xdn1;
+                    colb = (h + 1) * 8 + gid;
                 }
             }
             __syncwarp();                                          // all reads done before re-stage
@@ -898,11 +891,10 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
     int wpc = 8;
     while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
     size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
-    size_t qtile = (size_t)128;                                    // qs cp.async ping-pong per warp
-    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * (atile + qtile);
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
     static int carve = 0;
     if (!carve) {
-        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * (atile + qtile);
+        size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
         if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
         carve = 1;
     }
