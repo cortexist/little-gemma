@@ -917,6 +917,12 @@ static void side_sync(void) {                           // main needs the side r
     CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, g_join, 0));
 }
 
+static int g_no_prefill_fork = -1;
+static int no_prefill_fork(void) {
+    if (g_no_prefill_fork < 0) g_no_prefill_fork = getenv("LG_NO_PREFILL_FORK") != NULL;
+    return g_no_prefill_fork;
+}
+
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
     const struct config *c = &m->cfg;
@@ -1281,20 +1287,27 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
 
         int src = kv_src_dev(m, L);
         const int has_kv = L < c->n_kv_start;
-        if (has_kv) {                                   // k+v matmuls beside q (decode's fork/join win)
-            side_begin();
-            mm(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
-            const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
-            else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, g_side));
-            side_end();
+        if (has_kv) {
+            if (no_prefill_fork()) {
+                mm(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
+                const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
+                if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
+                else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, g_launch));
+            } else {
+                side_begin();
+                mm(dkb, wq_layer(m, L, "attn_k.weight"), dh, n_embd, kv_dim);
+                const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
+                if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
+                else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, g_side));
+                side_end();
+            }
         }
         mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         pf_tick(&g_pf_mm);
         rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
         rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
         if (has_kv) {
-            side_sync();
+            if (!no_prefill_fork()) side_sync();
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
             rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2, B);
@@ -1398,11 +1411,16 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         const int nff = m->ffn_len[L];
         rmsnorm_kernel<<<B, NORM_THREADS(n_embd)>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd));
         pf_tick(&g_pf_elem);
-        side_begin();
-        mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
-        side_end();
-        mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
-        side_sync();
+        if (no_prefill_fork()) {
+            mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
+            mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+        } else {
+            side_begin();
+            mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
+            side_end();
+            mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
+            side_sync();
+        }
         pf_tick(&g_pf_mm);
         geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
         pf_tick(&g_pf_elem);

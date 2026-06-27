@@ -80,6 +80,7 @@ Profile split: matmul ~69%, attention ~7%, elementwise ~9%.
 | `LG_PREFILL_PROFILE` | Stage timing (slows run) |
 | `LG_MM_GRAPH` | Opt-in matmul-only CUDA graph (**broken**, see below) |
 | `LG_NO_MM_GRAPH` | Force direct matmul launches |
+| `LG_NO_PREFILL_FORK` | Sequential k/v and ffn_up on main stream (A/B: ~neutral, matmul +4% without fork) |
 
 ---
 
@@ -194,13 +195,34 @@ q4_K MAC share ~85.6%; q6_K ~14.4%.
 
 ---
 
+## Option 3: Prefill fork/join A/B (`LG_NO_PREFILL_FORK`) — NEUTRAL
+
+**Goal:** Decode hides k/v and ffn_up beside larger q/gate matmuls via side stream.
+Test whether prefill benefits similarly or whether event/sync overhead dominates.
+
+**Implementation:** `LG_NO_PREFILL_FORK=1` runs k/v and ffn_up on the main stream
+in `chunk_layers` only; decode `forward_layers` unchanged.
+
+**Result (12B Q4_K_M, warm ~910 tok, Paris ✓, decode ~8.5 tok/s):**
+
+| Mode | Warm tok/s | Matmul | Elementwise |
+|------|------------|--------|-------------|
+| Fork on (default) | ~108.0 | 4.84 s | 1.07 s |
+| `LG_NO_PREFILL_FORK=1` | ~107.6 | 5.04 s (+4%) | 0.92 s |
+
+**Conclusion:** Fork/join is **neutral to slightly positive** for prefill on 12B —
+disabling it regresses matmul (~4%) with no e2e win. **Keep fork enabled.**
+Env knob kept for future graph-capture experiments (side stream was suspect in
+Option 2).
+
+---
+
 ## Next levers (priority order)
 
-1. **Prefill fork/join A/B** — `LG_NO_PREFILL_FORK` (option 3)
-2. **Remote microbench + ncu on x86** — safe profiling (ncu on Orin caused board reset)
-3. **More mma ILP** — likely diminishing; occupancy trap documented
-4. **Matmul graph** — blocked on correctness; revisit with global capture or single-stream prefill fork-off
-5. **Attention / elementwise** — smaller share after flash; ~11% elementwise launch overhead remains
+1. **Remote microbench + ncu on x86** — safe profiling (ncu on Orin caused board reset)
+2. **More mma ILP** — diminishing returns; occupancy trap documented
+3. **Matmul graph** — blocked on correctness; revisit with global capture or fork-off A/B
+4. **Attention / elementwise** — ~11% elementwise launch overhead remains
 
 ---
 
@@ -211,5 +233,5 @@ q4_K MAC share ~85.6%; q6_K ~14.4%.
 
 ---
 
-*Last updated: 2026-06-27 — Option 1 exhausted (8-wide pairing shipped), Option 2
-matmul-only graph failed (opt-in stub), journal created for future planning.*
+*Last updated: 2026-06-27 — Options 1–3 done (8-wide pairing shipped, matmul graph
+failed opt-in stub, fork/join A/B neutral).*
