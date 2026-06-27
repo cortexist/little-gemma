@@ -125,3 +125,9 @@ static struct actq actq_for(int k) { (void)k; return AQ0; }
 static void act_quantize(const float *d_x, int k) { (void)d_x; (void)k; }
 
 extern "C" void lg_i8_prewarm_weights(void) {}
+
+extern "C" int lg_i8_embed_q4k_chunk(float *dx, const block_q4_K *emb, const int *tokens,
+                                     int *d_toks, int n_embd, int B) {
+    (void)dx; (void)emb; (void)tokens; (void)d_toks; (void)n_embd; (void)B;
+    return 0;
+}

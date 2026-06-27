@@ -1196,3 +1196,46 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
 
 // Finish lazy q3/q6 repacks before CUDA graph capture (illegal mid-capture).
 extern "C" void lg_i8_prewarm_weights(void) { rweight_init_all(); }
+
+// One token row: each thread owns one q4_K superblock (n_embd must be QK_K-aligned).
+__global__ static void embed_q4k_row_kernel(float *dx, const block_q4_K *emb, const int *tokens,
+                                            int n_embd, int B, float es) {
+    int j = blockIdx.x;
+    if (j >= B) return;
+    int nb = n_embd / QK_K;
+    int bi = threadIdx.x;
+    if (bi >= nb) return;
+    const block_q4_K *p = emb + (size_t)tokens[j] * nb + bi;
+    float d, mn; d_dm(&p->d, &d, &mn);
+    uint32_t s0 = ((const uint32_t *)p->scales)[0];
+    uint32_t s1 = ((const uint32_t *)p->scales)[1];
+    uint32_t s2 = ((const uint32_t *)p->scales)[2];
+    const uint8_t *q = p->qs;
+    float *out = dx + ((size_t)j * n_embd + (size_t)bi * QK_K);
+    int is = 0;
+    for (int jj = 0; jj < QK_K; jj += 64) {
+        uint8_t sc, mm;
+        d_gsm32r(is, s0, s1, s2, &sc, &mm);
+        float d1 = d * sc, m1 = mn * mm;
+        d_gsm32r(is + 1, s0, s1, s2, &sc, &mm);
+        float d2 = d * sc, m2 = mn * mm;
+        #pragma unroll
+        for (int l = 0; l < 32; l++) {
+            out[l]      = es * (d1 * (float)(q[l] & 0xF) - m1);
+            out[32 + l] = es * (d2 * (float)(q[l] >> 4)  - m2);
+        }
+        q += 32;
+        out += 64;
+        is += 2;
+    }
+}
+
+extern "C" int lg_i8_embed_q4k_chunk(float *dx, const block_q4_K *emb, const int *tokens,
+                                     int *d_toks, int n_embd, int B) {
+    if (n_embd % QK_K != 0 || B <= 0) return 0;
+    int nb = n_embd / QK_K;
+    CUDA_CHECK(cudaMemcpy(d_toks, tokens, (size_t)B * sizeof(int), cudaMemcpyHostToDevice));
+    float es = sqrtf((float)n_embd);
+    embed_q4k_row_kernel<<<B, nb>>>(dx, emb, d_toks, n_embd, B, es);
+    return 1;
+}

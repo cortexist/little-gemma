@@ -739,6 +739,11 @@ __global__ static void argmax_kernel(const float *x, int n, int *out) {
 
 extern "C" void lg_i8_prewarm_weights(void);
 
+// GPU q4_K token-embed lookup for prefill chunks (zero-copy weight reads on Orin).
+// Returns 1 on success; 0 => caller falls back to host dequant + H2D.
+extern "C" int lg_i8_embed_q4k_chunk(float *dx, const block_q4_K *emb, const int *tokens,
+                                     int *d_toks, int n_embd, int B);
+
 static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
 
@@ -889,6 +894,7 @@ static int *d_best_spec;                // MTP verify: argmax of each row
 static float *d_ipl, *d_tok, *d_proj;  // per-layer-input (PLE) buffers
 static int *d_pos;                      // device-resident token position (for static graph)
 static int *d_best;                     // device-side argmax result
+static int *d_toks;                     // chunk token ids for GPU embed lookup
 static int scratch_ok = 0;
 
 // Fork/join: a graph is a dependency DAG, not a tape. Independent matmuls that
@@ -932,6 +938,7 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&d_best_spec, LG_MTP_N * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_toks, (size_t)PREFILL_MAX_B * sizeof(int)));
     if (ple > 0) {
         size_t total = (size_t)ple * c->n_layer;
         CUDA_CHECK(cudaMalloc(&dpg,   B * ple * 4));
@@ -1448,12 +1455,19 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
     const struct config *c = &m->cfg;
     g_pf_cols = cols;
     const int B = cols, n_embd = c->n_embd;
+    const struct gguf_tensor *emb = wq(m, "token_embd.weight");
 
-    float *rows = (float *)malloc((size_t)B * n_embd * 4);
-    if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
-    embed_chunk_rows(m, tokens, B, rows);
-    CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
-    free(rows);
+    static int no_gpu_emb = -1;
+    if (no_gpu_emb < 0) no_gpu_emb = getenv("LG_NO_GPU_EMBED") != NULL;
+    int gpu = !no_gpu_emb && emb->type == GGML_TYPE_Q4_K &&
+              lg_i8_embed_q4k_chunk(dx, (const block_q4_K *)dev_weight(emb), tokens, d_toks, n_embd, B);
+    if (!gpu) {
+        float *rows = (float *)malloc((size_t)B * n_embd * 4);
+        if (!rows) { fprintf(stderr, "forward_chunk: out of memory\n"); exit(1); }
+        embed_chunk_rows(m, tokens, B, rows);
+        CUDA_CHECK(cudaMemcpy(dx, rows, (size_t)B * n_embd * 4, cudaMemcpyHostToDevice));
+        free(rows);
+    }
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
     build_per_layer_n(m, tokens, B, matmul_q_n);
