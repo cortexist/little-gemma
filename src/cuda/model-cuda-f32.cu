@@ -123,3 +123,5 @@ static void matmul_coverage_print(void) {}   // the readable backend keeps no bo
 // The f32 backend dots the float activation directly — no quantize epilogues.
 static struct actq actq_for(int k) { (void)k; return AQ0; }
 static void act_quantize(const float *d_x, int k) { (void)d_x; (void)k; }
+
+extern "C" void lg_i8_prewarm_weights(void) {}

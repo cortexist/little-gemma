@@ -1193,3 +1193,6 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
     int blocks = (m + 7) / 8;
     matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
+
+// Finish lazy q3/q6 repacks before CUDA graph capture (illegal mid-capture).
+extern "C" void lg_i8_prewarm_weights(void) { rweight_init_all(); }

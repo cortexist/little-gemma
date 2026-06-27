@@ -737,6 +737,8 @@ __global__ static void argmax_kernel(const float *x, int n, int *out) {
 
 // ====================  device state: weights + scratch  =====================
 
+extern "C" void lg_i8_prewarm_weights(void);
+
 static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
 
@@ -1594,6 +1596,7 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     ensure_weights(m);
     ensure_scratch(m);
     prefill_act_presize(m);
+    lg_i8_prewarm_weights();
     const int CB = g_wide_chunk ? g_wide_chunk : PREFILL_B;
     int i = 0;
     for (; n - i >= CB; i += CB)                       // wide chunks: weights read once per CB tokens
