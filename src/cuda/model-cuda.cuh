@@ -823,20 +823,22 @@ extern "C" void model_prefill_reserve(void) {
     g_prefill_max_b = w;
 }
 
-// LG_WIDE_CHUNK=<N>: prefill TEXT in N-token chunks (a multiple of 128) instead of
-// PREFILL_B=128, so each model weight streams from DRAM once per N tokens, not once
-// per 128. The fat q4_K/q6_K kernels then tile the chunk's columns across gridDim.y
-// (COLS stays 128/64 per block — no 1-CTA trap) so a row-tile's weights stay L2-hot
-// across its column-tiles, matching llama.cpp's 512-ubatch weight reuse. The wide
-// chunk path through attention/ring/buffers already exists (media spans up to
-// g_prefill_max_b); this just opens it to text and widens the buffer/ring reserve.
-// 0 = off (legacy 128-token chunking, byte-identical default).
+// LG_WIDE_CHUNK=<N>: prefill TEXT in up-to-N-token chunks (a multiple of 64)
+// instead of PREFILL_B=128. Two different wins, one per device class. Integrated
+// (Orin): weights are zero-copy host reads, so each weight streams from DRAM once
+// per chunk — wider chunk = fewer passes. Discrete (A5000): weights are VRAM-
+// resident and the cost is SM fill — a 128-col chunk launches ~30-CTA grids on a
+// 64-SM card at 1 CTA/SM, so most of the card idles; the fat kernels tile a wide
+// chunk's columns across gridDim.y and fill the machine (measured 2026-07-01:
+// 12B warm serve 533 -> ~1200 tok/s). Defaults when unset: 768 on integrated
+// (Orin sweep), 1024 on discrete (A5000 sweep; must be a multiple of 64 for the
+// single-launch path — PREFILL_MAX_B itself is not). LG_WIDE_CHUNK=128 = legacy.
 static int g_wide_chunk = 0;
 static void wide_chunk_init(void) {
     static int done = 0; if (done) return; done = 1;
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
     const char *e = getenv("LG_WIDE_CHUNK");
-    if (!e) return;
-    int w = (atoi(e) / 128) * 128;                 // a whole number of 128-col tiles
+    int w = e ? (atoi(e) / 64) * 64 : (p.integrated ? 768 : 1024);
     if (w < PREFILL_B) w = PREFILL_B;
     if (w > PREFILL_MAX_B) w = PREFILL_MAX_B;
     g_wide_chunk = w;
@@ -902,6 +904,7 @@ static void side_sync(void) {                           // main needs the side r
 
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
+    wide_chunk_init();            // g_prefill_max_b must be final before B sizes anything
     const struct config *c = &m->cfg;
     int maxhd = 0, maxkv = 0;
     for (int L = 0; L < c->n_layer; L++) {
@@ -959,6 +962,10 @@ static void act_quantize(const float *d_x, int k);
 // ====================  kv cache (device buffers)  ===========================
 
 extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
+    wide_chunk_init();          // ring spare below must cover the widest chunk this
+                                // run can launch; resolve the chunk policy FIRST
+                                // (callers with media also call model_prefill_reserve
+                                // before this, for the same reason)
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer; kv->max_seq = max_seq;
     kv->px_k = kv->px_v = NULL;
@@ -978,7 +985,16 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
         // run, and with a window-exact ring the write for the chunk's last
         // token would land on a row its first query still needs.
         int seq = max_seq;
-        const int chunk_spare = g_wide_chunk ? g_wide_chunk : PREFILL_B;  // ring must hold a whole chunk's writes
+        // The ring must hold a whole chunk's writes BEYOND the window: a chunk
+        // writes all B rows before its queries run, and rows wrap at seq — with
+        // seq = window + spare and B <= spare, the highest row a chunk clobbers
+        // belongs to a position already outside its first query's window. The
+        // spare is g_prefill_max_b, the widest chunk ANY path can launch (text
+        // wide chunks and media spans alike); a smaller spare silently corrupts
+        // SWA attention for chunks starting past seq (caught 2026-07-01 — the
+        // old g_wide_chunk-or-128 spare was also resolved before wide_chunk_init
+        // had run, so it was 128 even with LG_WIDE_CHUNK set).
+        const int chunk_spare = g_prefill_max_b;
         if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + chunk_spare < max_seq)
             seq = c->sliding_window + chunk_spare;
         kv->seq[L] = seq;
@@ -1558,38 +1574,42 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
     ensure_scratch(m);
     prefill_act_presize(m);
     const int CB = g_wide_chunk ? g_wide_chunk : PREFILL_B;
+    // Balanced chunks (see model_prefill_mixed): ceil(n/CB) near-equal chunks,
+    // each a multiple of 64 above 128 (matmul_q_n's fat single launch) or of 32
+    // below. The LAST chunk PADS to its rounded width instead of falling back to
+    // single-token forwards — a short serve turn is mostly tail, and every
+    // single costs a full decode pass. The pad repeats the last real token at
+    // the following positions; those kv rows are rewritten by whatever comes
+    // next before anything can read them (every consumer writes position p
+    // before its attention reads p, and reads stop at its own position). Real
+    // rows' math is the chunk path's: byte-identical.
     int i = 0;
-    for (; n - i >= CB; i += CB)                       // wide chunks: weights read once per CB tokens
-        forward_chunk(m, kv, tokens + i, pos0 + i, CB);
-    for (; n - i >= PREFILL_B; i += PREFILL_B)         // remainder (< CB) in legacy 128-chunks
-        forward_chunk(m, kv, tokens + i, pos0 + i, PREFILL_B);
-    // The warmup tokens exist so ensure_act's one-time cudaMallocs precede graph
-    // capture; one chunk does all of them (its activations are B× decode's), so
-    // skip straight to capture — otherwise a chunk-aligned prompt would push the
-    // two un-captured tokens and the capture itself into the generation timer.
-    if (i > 0 && g_graph_warmups < 2) g_graph_warmups = 2;
+    while (n - i >= 2) {
+        int rem = n - i, nch = (rem + CB - 1) / CB;
+        int cols = (rem + nch - 1) / nch;
+        cols = cols > 128 ? (cols + 63) / 64 * 64 : (cols + 31) / 32 * 32;
+        if (cols > CB) cols = CB;
+        int real = rem < cols ? rem : cols;
+        if (pos0 + i + cols > kv->max_seq) break;      // no room for the pad: singles below
+        if (real == cols)
+            forward_chunk(m, kv, tokens + i, pos0 + i, cols);
+        else {                                         // tail: pad with the last real token
+            int padded[PREFILL_MAX_B];
+            for (int j = 0; j < cols; j++) padded[j] = tokens[i + (j < real ? j : real - 1)];
+            forward_chunk(m, kv, padded, pos0 + i, cols);
+        }
+        i += real;
+        // The warmup tokens exist so ensure_act's one-time cudaMallocs precede
+        // graph capture; one chunk does all of them (its activations are B×
+        // decode's), so skip straight to capture — otherwise a chunk-aligned
+        // prompt would push the two un-captured tokens and the capture itself
+        // into the generation timer.
+        if (g_graph_warmups < 2) g_graph_warmups = 2;
+    }
     if (pf_on() && i > 0)
         fprintf(stderr, "prefill profile (%d chunk tokens): matmul %.2fs, attention %.2fs, elementwise %.2fs, ple %.2fs\n",
                 i, g_pf_mm, g_pf_attn, g_pf_elem, g_pf_ple);
     if (pf_on() && i > 0) matmul_coverage_print();
-    // Remainder: PAD to one more chunk instead of single-token forwards. A
-    // short serve turn (a robot camera frame, a one-line question) is MOSTLY
-    // remainder, and every single costs a full decode pass — a 71-token image
-    // turn spent more time in its ~20 stragglers than in its chunks. The pad
-    // repeats the last real token at the following positions; those kv rows
-    // are rewritten by whatever comes next (the next segment, the turn's
-    // final forward) before anything can read them — every consumer writes
-    // position p before its attention reads p, and reads stop at its own
-    // position. Real rows' math is the chunk path's: byte-identical.
-    int rem = n - i, cols = ((rem + 31) / 32) * 32;   // adaptive: round the tail up to 32, not 128
-    if (cols > PREFILL_B) cols = PREFILL_B;
-    if (rem >= 2 && pos0 + i + cols <= kv->max_seq) {
-        int padded[PREFILL_MAX_B];
-        for (int j = 0; j < cols; j++) padded[j] = tokens[i + (j < rem ? j : rem - 1)];
-        forward_chunk(m, kv, padded, pos0 + i, cols);
-        if (g_graph_warmups < 2) g_graph_warmups = 2;
-        return;
-    }
     for (; i < n; i++)                                // 0-1 tokens (or no room): singles
         forward_token(m, kv, tokens[i], pos0 + i, 0);
 }
@@ -1630,10 +1650,15 @@ extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const fl
 
 extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
                                     const int *ids, int n, int pos0) {
+    wide_chunk_init();                                // before ensure_scratch sizes buffers + ring
     ensure_weights(m);
     ensure_scratch(m);
     prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
+    // Text packing budget: LG_WIDE_CHUNK opens serve-path text to wide chunks too
+    // (same knob and buffers as model_prefill).
+    int TB = g_wide_chunk ? g_wide_chunk : PREFILL_B;
+    if (TB > g_prefill_max_b) TB = g_prefill_max_b;
 
     // Per-position media-span ids: text -> 0, a media token -> its span's start abs
     // position+1 (a unique nonzero). Uploaded once so the flash mask can attend
@@ -1673,17 +1698,30 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
             int span = e - a;
             if (span > PREFILL_B) { w = (span <= g_prefill_max_b) ? span : g_prefill_max_b; media_hi = a + w - 1; }
         }
-        if (w == 0) while (a + w < n && w < PREFILL_B) {
+        // Balanced budget: split the remaining ids into ceil(rem/TB) NEAR-EQUAL
+        // chunks instead of TB-wide chunks plus a skinny tail — a 1428-token turn
+        // becomes 2 x ~714, not 1024 + 404. Same number of weight passes, but
+        // every launch keeps the fat single-launch grid shape (and the tail
+        // chunk stops being an under-filled straggler on a 64-SM card).
+        int rem = n - i, nch = (rem + TB - 1) / TB;
+        int budget = (rem + nch - 1) / nch;
+        budget = budget > 128 ? (budget + 63) / 64 * 64 : (budget + 31) / 32 * 32;
+        if (budget > TB) budget = TB;
+        if (w == 0) while (a + w < n && w < budget) {
             if (ids[a + w] < 0) {                      // a media span: take it whole if it fits
                 int s = a + w, e = s; while (e < n && ids[e] < 0) e++;
                 int span = e - s;
                 if (span > PREFILL_B) break;           // wide span -> close chunk, it starts the next (its own wide chunk)
-                if (w + span > PREFILL_B) break;       // doesn't fit the remaining budget -> close chunk
+                if (w + span > budget) break;          // doesn't fit the remaining budget -> close chunk
                 media_hi = e - 1; w += span;
             } else w++;                                // text
         }
         if (w < 1) w = 1;
-        int cols = ((w + 31) / 32) * 32; if (cols > g_prefill_max_b) cols = g_prefill_max_b;
+        // Chunks wider than 128 round to a multiple of 64: matmul_q_n's single
+        // fat launch needs cols%64==0, and a few pad tokens beat falling back
+        // to per-64-column launches for the whole chunk.
+        int cols = w > 128 ? ((w + 63) / 64) * 64 : ((w + 31) / 32) * 32;
+        if (cols > g_prefill_max_b) cols = g_prefill_max_b;
         if (pos0 + a + cols > kv->max_seq) break;
         int padded[PREFILL_MAX_B];
         for (int j = 0; j < cols; j++) padded[j] = ids[a + (j < w ? j : w - 1)];
@@ -1696,6 +1734,9 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
         i = a + w;
     }
     g_pf_seg = NULL; g_pf_bidir_hi = 0;
+    if (pf_on() && n >= 32)                           // cumulative across turns; diff successive lines
+        fprintf(stderr, "prefill profile (mixed, +%d tokens, cum): matmul %.2fs, attention %.2fs, elementwise %.2fs, ple %.2fs\n",
+                n, g_pf_mm, g_pf_attn, g_pf_elem, g_pf_ple);
     for (; i < n; i++) {                              // 0-1 trailing positions: singles
         if (ids[i] >= 0) { forward_token(m, kv, ids[i], pos0 + i, 0); continue; }
         CUDA_CHECK(cudaMemcpy(dx, rows + (size_t)(-ids[i] - 1) * n_embd, (size_t)n_embd * 4, cudaMemcpyHostToDevice));

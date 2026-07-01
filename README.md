@@ -396,17 +396,21 @@ artifact, corrected above). On the edge device this project actually targets,
 every row is ahead, and MTP widens the lead.
 
 Those tables are **decode** — the project's strong axis. **Prefill** (prompt
-processing) is the honest weak axis: it is weight-bandwidth-bound, and
-llama.cpp prefills at batch ~512 through arch-tuned tensor-core GEMMs that no
-few-thousand-line kernel matches. The push above — the int8 `mma` chunk matmul,
-wider chunks, K/V sharing, the bank-conflict pads, and then a tensor-core flash
-attention for the prompt phase — closed most of the gap on the Jetson: E4B
-~55 → **~183** prompt tok/s, 12B ~21 → **~98** (a ~2,000-token prompt), moving
-the ratio to llama.cpp from ~10× behind to **~2.6×**. It is still their axis,
-and the wins are gated to the same output up to a late greedy tie. It rarely
-shows in interactive serving — turns are short, `-sys` removes the skills
-re-prefill, the GPU encoder removed the image one — but on long documents
-llama.cpp still wins the wait.
+processing) is the honest weak axis: llama.cpp prefills at batch ~512 through
+arch-tuned tensor-core GEMMs that no few-thousand-line kernel matches. The
+push above — the int8 `mma` chunk matmul, wider chunks, K/V sharing, the
+bank-conflict pads, and then a tensor-core flash attention for the prompt
+phase — closed most of the gap on the Jetson: E4B ~55 → **~183** prompt
+tok/s, 12B ~21 → **~98** (a ~2,000-token prompt), moving the ratio to
+llama.cpp from ~10× behind to **~2.6×**. On the A5000 the same story took a
+different lever: weights are VRAM-resident there, so the cost of narrow
+chunks is SM starvation, not weight re-streaming — routing serve turns
+through balanced wide chunks (2026-07: 12B 533 → **~1,430** warm serve
+prompt tok/s, E4B 1,020 → **~3,050**, byte-identical output) moved the ratio
+from ~4× behind to **~1.6×**. It is still their axis. It rarely shows in
+interactive serving — turns are short, `-sys` removes the skills re-prefill,
+the GPU encoder removed the image one — but on long documents llama.cpp
+still wins the wait (see `docs/prefill-performance-journal.md`).
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
