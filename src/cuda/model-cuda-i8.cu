@@ -745,18 +745,25 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 //   C (4 regs): c0/c1 row gid col tid*2/+1, c2/c3 row gid+8 same
 template<int COLS>
 __global__ static void __launch_bounds__(256)
-matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m) {
+matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m,
+                      int swapxy = 0) {
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS][SB_COL]
     float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS][SBX]
     int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][2 halves][16][SA_ROW]
     const int nbk = k / 256;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    // swapxy: the launcher put column-tiles on x and row-tiles on y. CTAs issue
+    // x-fastest, so all column-tiles of ONE row-tile run in the same wave and
+    // share its weight rows through L2 — instead of every column-tile
+    // re-streaming the whole weight matrix from DRAM (wave = one column-tile's
+    // full m-sweep in the unswapped order). Same math either way.
+    const int bxr = swapxy ? blockIdx.y : blockIdx.x, byc = swapxy ? blockIdx.x : blockIdx.y;
+    const int r0 = bxr * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
-    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
-    xds += (size_t)blockIdx.y * COLS * (k / 32);
-    out += (size_t)blockIdx.y * COLS * m;
+    xq  += (size_t)byc * COLS * k;                    // column-tile (wide chunk); tile 0 => identical
+    xds += (size_t)byc * COLS * (k / 32);
+    out += (size_t)byc * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2 * 16 * SA_ROW;
     float acc[2][COLS / 8][4];                                     // [tile][colgroup][slot]
     #pragma unroll
@@ -859,6 +866,15 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
         }
 }
 
+// One-time device-class probe for the mma launch policies below: the Orin-tuned
+// choices (warps-per-CTA shrink, x-major column tiles) stay on integrated GPUs;
+// discrete cards take the L2/latency-tuned ones. Both overridable by env for A/B.
+static int mma_integrated(void) {
+    static int integ = -1;
+    if (integ < 0) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); integ = p.integrated ? 1 : 0; }
+    return integ;
+}
+
 // q4_K mma launcher for a compile-time COLS. Mirrors launch_q6k_mmq: 32 rows/warp,
 // shrink warps-per-CTA to keep the grid over the SMs, carve out the dynamic shared
 // past 48 KB once. The A tile is 2 tiles x 2 halves x 16 rows x SA_ROW per warp.
@@ -866,7 +882,17 @@ template<int COLS>
 static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
                            int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    // The warps-per-CTA shrink keeps tiny grids over the SMs — an 8-SM Orin
+    // tuning. On a discrete card it backfires: a 128-thread CTA still occupies
+    // a whole SM (shared >50 KB caps residency at one CTA either way) with
+    // HALF the warps — more CTAs, same waves, half the latency hiding
+    // (measured: 12B warm serve +1.4% without it). Discrete skips the shrink;
+    // LG_Q4K_WPC=<n> forces n, =-1 forces the shrink (A/B).
+    static int wpc_force = -2;
+    if (wpc_force == -2) { const char *e = getenv("LG_Q4K_WPC"); wpc_force = e ? atoi(e) : 0; }
+    if (wpc_force > 0) wpc = wpc_force;
+    else if (wpc_force == -1 || mma_integrated())
+        while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
     size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
     static int carve = 0;
@@ -876,7 +902,16 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
         carve = 1;
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
+    // Column-tiles on grid x, row-tiles on y (see the kernel's swapxy note —
+    // one row-tile's weights stay L2-hot across its column-tiles; discrete
+    // only, weights aren't L2-cached on Tegra zero-copy). +6.6% 12B warm serve.
+    // LG_Q4K_SWAPXY=1/0 overrides.
+    static int swapxy = -2;
+    if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }
+    if (swapxy && ncol > 1)
+        matmul_q4k_mma_kernel<COLS><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, 1);
+    else
+        matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -904,18 +939,19 @@ __device__ static uint32_t q6w(uint32_t l, uint32_t h, int hin, int sh) {
 template<int COLS>
 __global__ static void __launch_bounds__(256)
 matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
-                      const int8_t *xq, const float2 *xds, int k, int m) {
+                      const int8_t *xq, const float2 *xds, int k, int m, int swapxy = 0) {
     extern __shared__ unsigned char sh[];
     int8_t *sB    = (int8_t *)sh;                                  // [2 bufs][COLS cols][256]
     float2 *sBxds = (float2 *)(sh + 2 * COLS * SB_COL);            // [2 bufs][COLS cols][8]
     int8_t *sA    = (int8_t *)(sh + 2 * COLS * SB_COL + 2 * COLS * SBX * 8); // [warps][2 tiles][8 sjl][16][16]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = blockIdx.x * (32 * (blockDim.x >> 5)) + warp * 32;
+    const int bxr = swapxy ? blockIdx.y : blockIdx.x, byc = swapxy ? blockIdx.x : blockIdx.y;  // see q4_K's swapxy note
+    const int r0 = bxr * (32 * (blockDim.x >> 5)) + warp * 32;
     const int gid = lane >> 2, tid = lane & 3;
     const int nbk = k / 256;
-    xq  += (size_t)blockIdx.y * COLS * k;             // gridDim.y column-tile (wide chunk); y==0 => identical
-    xds += (size_t)blockIdx.y * COLS * (k / 32);
-    out += (size_t)blockIdx.y * COLS * m;
+    xq  += (size_t)byc * COLS * k;                    // column-tile (wide chunk); tile 0 => identical
+    xds += (size_t)byc * COLS * (k / 32);
+    out += (size_t)byc * COLS * m;
     int8_t *sAw = sA + warp * 2 * 2048;
     float acc[2][COLS / 8][4];                                     // [tile][h][slot]
     #pragma unroll
@@ -1041,7 +1077,12 @@ static void matmul_coverage_print(void) {
 template<int COLS>
 static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
-    while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
+    // Same discrete/integrated policy as launch_q4k_mma (shrink + swapxy notes there).
+    static int wpc_force = -2;
+    if (wpc_force == -2) { const char *e = getenv("LG_Q4K_WPC"); wpc_force = e ? atoi(e) : 0; }
+    if (wpc_force > 0) wpc = wpc_force;
+    else if (wpc_force == -1 || mma_integrated())
+        while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
     size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
     static int carve = 0;
     if (!carve) {
@@ -1050,7 +1091,12 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
         carve = 1;
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+    static int swapxy = -2;
+    if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }  // one knob for both mma kernels
+    if (swapxy && ncol > 1)
+        matmul_q6k_mma_kernel<COLS><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m, 1);
+    else
+        matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
 }
 
 // The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
