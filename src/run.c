@@ -166,14 +166,16 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
     struct model m;
     if (model_init(&m, ctx) != 0) { tokenizer_free(tk); return; }
-    struct kvcache kv;
-    if (kvcache_init(&kv, &m, SERVE_SEQ) != 0) { model_free(&m); tokenizer_free(tk); return; }
-    // the multimodal projector (-mm): without it, media frames end the session
+    // the multimodal projector (-mm): without it, media frames end the session.
+    // Opened BEFORE the kv cache: model_prefill_reserve widens the prefill chunk
+    // ceiling, and kvcache_init sizes the SWA ring spare from that ceiling.
     struct media *md = NULL;
     if (mmproj && !(md = media_open(mmproj, m.cfg.n_embd))) {
         model_free(&m); tokenizer_free(tk); return;
     }
-    if (md) model_prefill_reserve();   // size prefill buffers for a whole image span before any forward
+    if (md) model_prefill_reserve();   // size prefill buffers + ring for a whole image span
+    struct kvcache kv;
+    if (kvcache_init(&kv, &m, SERVE_SEQ) != 0) { if (md) media_free(md); model_free(&m); tokenizer_free(tk); return; }
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
 

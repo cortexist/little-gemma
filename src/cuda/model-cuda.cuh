@@ -902,6 +902,7 @@ static void side_sync(void) {                           // main needs the side r
 
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
+    wide_chunk_init();            // g_prefill_max_b must be final before B sizes anything
     const struct config *c = &m->cfg;
     int maxhd = 0, maxkv = 0;
     for (int L = 0; L < c->n_layer; L++) {
@@ -959,6 +960,10 @@ static void act_quantize(const float *d_x, int k);
 // ====================  kv cache (device buffers)  ===========================
 
 extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
+    wide_chunk_init();          // ring spare below must cover the widest chunk this
+                                // run can launch; resolve the chunk policy FIRST
+                                // (callers with media also call model_prefill_reserve
+                                // before this, for the same reason)
     const struct config *c = &m->cfg;
     kv->n_layer = c->n_layer; kv->max_seq = max_seq;
     kv->px_k = kv->px_v = NULL;
@@ -978,7 +983,16 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
         // run, and with a window-exact ring the write for the chunk's last
         // token would land on a row its first query still needs.
         int seq = max_seq;
-        const int chunk_spare = g_wide_chunk ? g_wide_chunk : PREFILL_B;  // ring must hold a whole chunk's writes
+        // The ring must hold a whole chunk's writes BEYOND the window: a chunk
+        // writes all B rows before its queries run, and rows wrap at seq — with
+        // seq = window + spare and B <= spare, the highest row a chunk clobbers
+        // belongs to a position already outside its first query's window. The
+        // spare is g_prefill_max_b, the widest chunk ANY path can launch (text
+        // wide chunks and media spans alike); a smaller spare silently corrupts
+        // SWA attention for chunks starting past seq (caught 2026-07-01 — the
+        // old g_wide_chunk-or-128 spare was also resolved before wide_chunk_init
+        // had run, so it was 128 even with LG_WIDE_CHUNK set).
+        const int chunk_spare = g_prefill_max_b;
         if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + chunk_spare < max_seq)
             seq = c->sliding_window + chunk_spare;
         kv->seq[L] = seq;
