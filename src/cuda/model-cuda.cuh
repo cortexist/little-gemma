@@ -595,16 +595,42 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     __syncthreads();
     int pmax=pos0+qbase+qn-1, smin=(window>0 && pos0+qbase-window+1>0)?pos0+qbase-window+1:0;
     int khi = (seg && bidir_hi > pmax) ? bidir_hi : pmax;   // media chunk: reach past this tile to the span end
+    // f32 K at hd 256 (the SWA rings): stage each 32-key block into shared as
+    // f16, once, cooperatively. Reading K per-fragment from global made the
+    // f32->f16 pack the kernel's top stall by far (ncu: F2FP.PACK_AB eating
+    // the LDG latency, long_scoreboard 11.5 cyc/instr) and read every K
+    // element twice (both query sub-tiles). The stage is one coalesced sweep
+    // with 32 independent loads per thread; per-element conversion is
+    // unchanged -> byte-identical. +8 half pad per row spreads the fragment
+    // reads off the 32-bank multiple. f16 K (global layers) keeps the direct
+    // loads (no conversion to hide); the hd-512 f32 instantiations skip it
+    // too (sQ already 32 KB — sK would blow the 48 KB static-shared limit).
+    const bool KSTAGE = HD == 256 && sizeof(KT) == 4;
+    __shared__ __half sK[KSTAGE ? 32*(HD+8) : 1];
     for(int kb0=(smin/FKB)*FKB; kb0<=khi; kb0+=FKB){
+        if(KSTAGE){
+            for(int e=tix;e<32*HD;e+=256){
+                int key=kb0+e/HD, rr=RING?key%seq:key;
+                sK[(e/HD)*(HD+8)+e%HD]=__float2half(((const float*)Kc)[(size_t)rr*kv_dim+(size_t)kvh*HD+e%HD]);
+            }
+            __syncthreads();
+        }
         int qt=warp>>2, kt=warp&3;
         float s0=0,s1=0,s2=0,s3=0;
         #pragma unroll
         for(int ks=0;ks<HD;ks+=16){
             uint32_t a0=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2];
             uint32_t a2=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2+8];
-            int key=kb0+kt*8+gid, rr=RING?key%seq:key;
-            const KT *kp=Kc+(size_t)rr*kv_dim+(size_t)kvh*HD+ks;
-            fa_mma(s0,s1,s2,s3,a0,a1,a2,a3,fa_ld2<KT>(kp+tid*2),fa_ld2<KT>(kp+tid*2+8));
+            uint32_t b0, b1;
+            if(KSTAGE){
+                const __half *kh=&sK[(kt*8+gid)*(HD+8)+ks];
+                b0=*(const uint32_t*)(kh+tid*2); b1=*(const uint32_t*)(kh+tid*2+8);
+            }else{
+                int key=kb0+kt*8+gid, rr=RING?key%seq:key;
+                const KT *kp=Kc+(size_t)rr*kv_dim+(size_t)kvh*HD+ks;
+                b0=fa_ld2<KT>(kp+tid*2); b1=fa_ld2<KT>(kp+tid*2+8);
+            }
+            fa_mma(s0,s1,s2,s3,a0,a1,a2,a3,b0,b1);
         }
         sS[(qt*16+gid)*FKB+kt*8+tid*2]=s0;     sS[(qt*16+gid)*FKB+kt*8+tid*2+1]=s1;
         sS[(qt*16+gid+8)*FKB+kt*8+tid*2]=s2;   sS[(qt*16+gid+8)*FKB+kt*8+tid*2+1]=s3;
