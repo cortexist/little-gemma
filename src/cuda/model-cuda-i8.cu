@@ -776,6 +776,30 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
     mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
+    // A-staging is software-pipelined across sjp AND across superblocks: the
+    // global qs LDG for the next pair (and the next superblock's header words)
+    // issues BEFORE this pair's mma phase, whose tensor-core cycles cover the
+    // memory latency. Unpipelined, the stage consumed its load immediately and
+    // every sjp paid full L2/DRAM latency — on the A5000, ncu warp sampling put
+    // ~1.5 cycles/instr of long_scoreboard on this load's first consumer, the
+    // card's top stall by 10x. (NOT the Orin bottleneck, which is shared-read
+    // latency — device-scoped, again.) Row bases don't move across sjp or blk
+    // (qs strides by sizeof(block_q4_K)), so they hoist out of the pipeline.
+    const int ar = lane & 15, hi = lane >> 4;
+    const uint8_t *qs_t[2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) {
+        int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+        qs_t[t] = (w + (size_t)row * nbk)->qs;
+    }
+    uint4 pf[2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) pf[t] = *(const uint4 *)(qs_t[t] + hi * 16);   // blk 0, sjp 0 in flight
+    uint32_t s0 = ((const uint32_t *)myrow->scales)[0];            // blk 0 header words in flight
+    uint32_t s1 = ((const uint32_t *)myrow->scales)[1];
+    uint32_t s2 = ((const uint32_t *)myrow->scales)[2];
+    uint32_t dm = ld32(&myrow->d);
+
     for (int blk = 0; blk < nbk; blk++) {
         int buf = blk & 1;
         asm volatile("cp.async.wait_group 0;\n");
@@ -787,23 +811,18 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
         const int8_t *sBb = sB + buf * COLS * SB_COL;
         const float2 *sBxd = sBxds + buf * COLS * SBX;
 
-        const block_q4_K *hp = myrow + blk;                        // my header row's scales + (d,dmin)
-        uint32_t s0 = ((const uint32_t *)hp->scales)[0];
-        uint32_t s1 = ((const uint32_t *)hp->scales)[1];
-        uint32_t s2 = ((const uint32_t *)hp->scales)[2];
-        float dD, dM; d_dm(&hp->d, &dD, &dM);
+        float dD = d_fp16((uint16_t)dm), dM = d_fp16((uint16_t)(dm >> 16));    // this blk's (d,dmin)
+        uint32_t ns0 = 0, ns1 = 0, ns2 = 0, ndm = 0;               // next blk's header (loaded at sjp 3)
 
+        #pragma unroll
         for (int sjp = 0; sjp < 4; sjp++) {                        // sub-blocks in lo/hi PAIRS (shared 32 qs bytes)
-            // stage: lane (ar = row-in-tile, hi = which 16-B half) reads one
-            // uint4 of qs and writes both nibble halves into the sub-block-major
+            // unpack the in-flight pair: lane (ar = row-in-tile, hi = which
+            // 16-B half) writes both nibble halves into the sub-block-major
             // tile. 32-B rows aliased a bank in a [row][32] layout; SA_ROW=48
             // (12 words) spreads the gid fragment read across all 32 banks.
             #pragma unroll
             for (int t = 0; t < 2; t++) {
-                int ar = lane & 15, hi = lane >> 4;
-                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-                const block_q4_K *bp = w + (size_t)row * nbk + blk;
-                uint4 q4 = *(const uint4 *)(bp->qs + sjp * 32 + hi * 16);
+                uint4 q4 = pf[t];
                 int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
                 uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);             // half sjp*2
                 uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16); // half sjp*2+1
@@ -811,6 +830,18 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                 lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
                 hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
                 hh[2] = (uint32_t)nib4(q4.z, 1); hh[3] = (uint32_t)nib4(q4.w, 1);
+            }
+            if (sjp < 3) {                                         // next pair's qs go in flight across the mma phase
+                #pragma unroll
+                for (int t = 0; t < 2; t++) pf[t] = *(const uint4 *)(qs_t[t] + (sjp + 1) * 32 + hi * 16);
+            } else if (blk + 1 < nbk) {                            // last pair: NEXT superblock's sjp 0 + header
+                #pragma unroll
+                for (int t = 0; t < 2; t++) pf[t] = *(const uint4 *)(qs_t[t] + sizeof(block_q4_K) + hi * 16);
+                const block_q4_K *np = myrow + blk + 1;
+                ns0 = ((const uint32_t *)np->scales)[0];
+                ns1 = ((const uint32_t *)np->scales)[1];
+                ns2 = ((const uint32_t *)np->scales)[2];
+                ndm = ld32(&np->d);
             }
             __syncwarp();
             #pragma unroll
@@ -854,6 +885,8 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
             }
             __syncwarp();                                          // all reads done before re-stage
         }
+        s0 = ns0; s1 = ns1; s2 = ns2; dm = ndm;                    // rotate the prefetched header in
+        qs_t[0] += sizeof(block_q4_K); qs_t[1] += sizeof(block_q4_K);
     }
 
     #pragma unroll
@@ -964,6 +997,27 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
     mma_stage_b<COLS>(sB, sBxds, 0, xq, xds, k, 0, threadIdx.x);   // prologue: block 0 in flight
     asm volatile("cp.async.commit_group;\n");
 
+    // Same A-staging software pipeline as the q4_K kernel (see the note there):
+    // the ql/qh words for the next 128-half (or the next superblock's first
+    // half + header) go in flight before this half's mma phase. block_q6_Kr is
+    // only 4-aligned, so the in-flight fragment is 16 ld32 words per tile.
+    const int ar = lane & 15, hi = lane >> 4;
+    const uint8_t *bp_t[2];
+    #pragma unroll
+    for (int t = 0; t < 2; t++) {
+        int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
+        bp_t[t] = wbase + (size_t)row * nbk * ts;
+    }
+    uint32_t pfl[2][8], pfh[2][8];
+    #pragma unroll
+    for (int t = 0; t < 2; t++)
+        for (int c = 0; c < 2; c++)
+            for (int wi = 0; wi < 4; wi++) {                       // blk 0, ni 0 in flight
+                const block_q6_Kr *bp = (const block_q6_Kr *)bp_t[t];
+                pfl[t][c * 4 + wi] = ld32(bp->ql + hi * 32 + c * 16 + wi * 4);
+                pfh[t][c * 4 + wi] = ld32(bp->qh + c * 16 + wi * 4);   // qh: 32 shared bytes, no hi term
+            }
+
     for (int blk = 0; blk < nbk; blk++) {
         int buf = blk & 1;
         asm volatile("cp.async.wait_group 0;\n");
@@ -983,16 +1037,11 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
 
         #pragma unroll
         for (int ni = 0; ni < 2; ni++) {                           // 128-element halves
-            // stage: lane (ar, hi) unpacks 32 ql bytes + their qh bits for
-            // both nibble halves — low nibbles are sub-blocks hi*2/+1, high
-            // nibbles hi*2+4/+5 (same bytes, shifted) — into both tiles
+            // unpack the in-flight ql/qh words for both nibble halves — low
+            // nibbles are sub-blocks hi*2/+1, high nibbles hi*2+4/+5 (same
+            // bytes, shifted) — into both tiles
             #pragma unroll
             for (int t = 0; t < 2; t++) {
-                int ar = lane & 15, hi = lane >> 4;
-                int row = r0 + t * 16 + ar; if (row >= m) row = m - 1;
-                const block_q6_Kr *bp = (const block_q6_Kr *)(wbase + (size_t)row * nbk * ts) + blk;
-                const uint8_t *qlp = bp->ql + ni * 64 + hi * 32;
-                const uint8_t *qhp = bp->qh + ni * 32;
                 int8_t *sAt = sAw + t * 2048 + ar * 16;
                 int shl = hi * 2;
                 #pragma unroll
@@ -1001,9 +1050,24 @@ matmul_q6k_mma_kernel(float *out, const unsigned char *wbase, int ts,
                     uint32_t *phi = (uint32_t *)(sAt + (hi * 2 + 4 + c) * 256);
                     #pragma unroll
                     for (int wi = 0; wi < 4; wi++) {
-                        uint32_t l = ld32(qlp + c * 16 + wi * 4), q = ld32(qhp + c * 16 + wi * 4);
+                        uint32_t l = pfl[t][c * 4 + wi], q = pfh[t][c * 4 + wi];
                         plo[wi] = q6w(l, q, 0, shl);
                         phi[wi] = q6w(l, q, 1, shl + 4);
+                    }
+                }
+            }
+            {   // next 128-half (or next superblock's first) goes in flight
+                int nblk = ni == 0 ? blk : blk + 1, nni = ni == 0 ? 1 : 0;
+                if (nblk < nbk) {
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {
+                        const block_q6_Kr *bp = (const block_q6_Kr *)(bp_t[t] + (size_t)nblk * ts);
+                        #pragma unroll
+                        for (int c = 0; c < 2; c++)
+                            for (int wi = 0; wi < 4; wi++) {
+                                pfl[t][c * 4 + wi] = ld32(bp->ql + nni * 64 + hi * 32 + c * 16 + wi * 4);
+                                pfh[t][c * 4 + wi] = ld32(bp->qh + nni * 32 + c * 16 + wi * 4);
+                            }
                     }
                 }
             }
