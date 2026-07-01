@@ -126,6 +126,26 @@ Byte-identical vs the old launch order at 4096 tokens; Paris; decode
 untouched. Kernel time (nsys, ~2870-token prefill): q4k 1.139 → 1.016 s,
 q6k 0.267 → 0.250 s.
 
+### Round 3 (same day): the wiring audit — re-testing the old "neutrals"
+
+Motivated by the serve-wide-chunk discovery (a knob that measured nothing
+for weeks), the questionable prior verdicts were re-tested on the A5000
+under a new rule: **no verdict without proof the knob engaged**
+(instruction/launch-level evidence or a poison test).
+
+| prior verdict (Orin) | A5000 re-test, wiring-proven | outcome |
+|---|---|---|
+| stream-K "~neutral" | ported to current kernel (branch `prefill-a5000-streamk`); nsys shows 284 streamk + 284 fixup launches, zero plain launches | **loses**: 1486 (colmajor walk) / 1426 (rowmajor) vs 1565 plain. colmajor > rowmajor re-confirms the L2-order effect inside stream-K; but at 180–720-CTA grids there is no wave quantization left to fix, and the fixup pass is pure cost. Closed on BOTH devices. |
+| ILP-branch kernel body (qs pipelining, dual-tile interleave, 8-wide pairing; Orin matmul component 6.0→4.38 s) | built `prefill-q4k-ilp` as-is in a worktree; A/B at IDENTICAL 128-chunk launch shapes | **exactly neutral**: 402.9/401.3 vs 402.6/399.8 tok/s. The Orin component win hid Tegra's uncached zero-copy weight latency, which doesn't exist here. At 768-wide chunks that branch is 12% SLOWER than ours — entirely its chunk splitting (768+128s+pad vs balanced), not the kernel. |
+| C32 / 2-CTA occupancy "wash" | round 2 | **loses 15%** properly wired — original direction confirmed. |
+| ldmatrix "neutral" | not re-run | skipped: three-for-three confirmations above; premise check needs warp-stall ncu (still permission-blocked). |
+
+**Audit conclusion:** the old kernel-level verdicts survive verification —
+the mis-wired/mis-aimed experiments were all in the LAUNCH PLUMBING
+(serve chunking never wired, ring silently corrupting, grid-axis order,
+warp shrink), which is where this branch's ~3× came from. The kernel body
+itself is at a genuine local optimum for this architecture family.
+
 ### Next levers (A5000)
 
 1. **The deep kernel schedule** — matmul is still ~72% of prefill and the
