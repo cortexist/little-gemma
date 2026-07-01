@@ -94,17 +94,48 @@ Known pre-existing issue (NOT from this change; identical on pristine main):
 E2B Q3_K_M in `.data/` generates "]" garbage on the Paris prompt on the i8
 CUDA backend — needs its own investigation.
 
+### Round 2 (same day): launch policy + warmup — 12B → 1550, first turn → warm
+
+The "next levers" list, executed:
+
+1. **Occupancy: falsified on the A5000 too** (was already a wash on Orin).
+   `matmul_q4k_mma<32>` is 124 regs / 46.6 KB shared — a genuine 2 CTAs/SM,
+   4 warps/scheduler — and it LOSES: 1429 → 1211 (−15%). The loss is doubled
+   weight re-streaming (ncol doubles), and even with that absorbed (swapxy
+   below) it still trails 64-col at 1494 vs 1523. The kernel is
+   latency-balanced, not occupancy-starved, on BOTH device classes. Closed.
+2. **The C32 loss exposed the real lever: grid-axis order.** With grid
+   (row-tiles, col-tiles), CTAs issue x-fastest — one column-tile's whole
+   m-sweep per wave, so every column-tile re-streams the entire weight
+   matrix from DRAM (an ffn matmul paid ~15 × 33 MB). **swapxy** puts
+   column-tiles on x: all column-tiles of one row-tile run in the same wave
+   and share its ~550 KB of weights through L2. +6.6%. Discrete-only
+   default (Tegra zero-copy weight reads bypass L2). `LG_Q4K_SWAPXY=0/1`.
+3. **Warps-per-CTA shrink OFF on discrete** (+1.4%): the shrink covers the
+   8-SM Orin, but a 128-thread CTA still occupies a whole A5000 SM (shared
+   >50 KB caps residency either way) with half the warps. `LG_Q4K_WPC`.
+4. **Serve engine warmup**: without `-sys`, a 2-token throwaway prefill at
+   startup absorbs weight upload + repacks + buffer allocation. First turn
+   333 → **1525** tok/s (12B), 335 → **3155** (E4B) — warm from turn one.
+   Two tokens because run.c is backend-shared and the CPU backend pays per
+   token; the one-time costs are all-or-nothing at the first chunk.
+
+**Round-2 results (A5000, warm serve, 928-token turns):** 12B 1430 → **1550**
+(0.69× llama), E4B 3050 → **3280** (0.65×). 12B @1428 tok: 1426 → 1527.
+Byte-identical vs the old launch order at 4096 tokens; Paris; decode
+untouched. Kernel time (nsys, ~2870-token prefill): q4k 1.139 → 1.016 s,
+q6k 0.267 → 0.250 s.
+
 ### Next levers (A5000)
 
-1. **The kernel itself** — now the whole residual gap (~1.6×). At full fill
-   it runs 45.7% SM, 2 warps/scheduler, 1 CTA/SM (68.6 KB shared, >128
-   regs/thread). The Orin 2-CTA occupancy experiment (`LG_Q4K_OCC`, net wash
-   THERE) is unexplored on the A5000's different shared/L2 budget. llama's
-   same-shape kernel reaches 52% SM plus stream-K scheduling.
-2. **q6_K twin** (14.4% of MACs) — same treatment as whatever wins on q4_K.
-3. **First-turn cold cost** (12B first turn 344 vs 1430 warm — weight repack
-   + clock ramp; llama-bench discards it, serve users pay it).
-4. **Orin re-validation:** balanced chunking should be neutral-to-better
-   (equal-or-fewer weight passes) and the ring fix is a correctness must,
-   but ring memory grows (~+215 MB, 12B at spare 768) — re-run the Orin
-   suite before merging there.
+1. **The deep kernel schedule** — matmul is still ~72% of prefill and the
+   residual vs llama is their integrated instruction schedule (the June
+   "codegen, not a formula" wall, since re-confirmed from four angles).
+   New evidence would need warp-stall ncu on the A5000 (requires elevated
+   perf-counter permission on this box).
+2. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
+   share even swapped; a wpc/rows-per-CTA rebalance might buy a few %.
+3. **Orin re-validation before merging** (unchanged): the ring fix +
+   balanced chunking apply there; the new launch policies are
+   integrated-gated off, so Orin behavior should be identical-or-better,
+   but ring memory grows (~+215 MB, 12B at spare 768).

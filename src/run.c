@@ -227,6 +227,20 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         n_sys = n;
         fprintf(stderr, "system prefix: %d tokens prefilled once in %.2fs (%s)\n",
                 n_sys, now_sec() - t0, syspath);
+    } else {
+        // No -sys prefix to absorb the one-time costs, so warm the engine on a
+        // throwaway chunk before the first client connects: weight upload,
+        // repacks, and the prefill buffers all land here instead of on the
+        // first user turn (measured 2.8s -> ~0.7s for a 928-token first turn,
+        // 12B on the A5000). Two tokens suffice — the one-time costs are
+        // all-or-nothing at the first chunk — and cost the CPU backend little.
+        // The kv rows written at position 0 are rewritten by the first real
+        // turn before anything can read them (attention reads stop at a
+        // session's own positions).
+        double t0 = now_sec();
+        int warm[2] = { tokenizer_bos(tk), tokenizer_bos(tk) };
+        model_prefill(&m, &kv, warm, 2, 0);
+        fprintf(stderr, "engine warmup: %.2fs\n", now_sec() - t0);
     }
 
     sock_t ls = INVALID_SOCKET;
