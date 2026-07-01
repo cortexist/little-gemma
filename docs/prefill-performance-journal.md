@@ -135,7 +135,15 @@ q6k 0.267 → 0.250 s.
    perf-counter permission on this box).
 2. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
    share even swapped; a wpc/rows-per-CTA rebalance might buy a few %.
-3. **Orin re-validation before merging** (unchanged): the ring fix +
-   balanced chunking apply there; the new launch policies are
-   integrated-gated off, so Orin behavior should be identical-or-better,
-   but ring memory grows (~+215 MB, 12B at spare 768).
+3. ~~Orin re-validation~~ **DONE (same day, worktree `~/lg-wide` on cortex,
+   branch applied via patch series):**
+   - Byte-identity narrow-vs-default at 4096 tokens (ring wrap exercised
+     on-device): **BYTE-IDENTICAL** — the ring fix holds on the target.
+   - 12B one-shot 910 tok, interleaved ×2: narrow 102.4/102.8 vs default
+     **104.8/105.0** (+2.3%); gen 6.58 → 6.86 tok/s. No regression.
+   - E4B: narrow 192.2/192.5 vs default **216.4/216.6 (+12.6%)** — past the
+     README's ~183 record; balanced-768 cuts a 910-token turn from 8 weight
+     passes to 2, the dominant cost under zero-copy weights.
+   - Serve smoke: `engine warmup: 1.17s` at startup, first 19-token turn at
+     0.28 s, Paris. 12B loads fine with the larger rings on the 16 GB board.
+   The branch is validated on both devices.
