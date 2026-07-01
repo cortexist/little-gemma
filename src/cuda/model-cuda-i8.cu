@@ -38,6 +38,12 @@ __global__ static void quantize_act_kernel(const float *x, struct actq aq, int n
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g < ng) d_quant_group(x + (size_t)g * 32, g, aq);
 }
+// The chunk-wide form: one WARP per group (see d_quant_group_warp) — at
+// B x q_dim (a flash output) the serial form ran at 59 GB/s on the A5000.
+__global__ static void quantize_act_n_kernel(const float *x, struct actq aq, int ng) {
+    int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (gw < ng) d_quant_group_warp(x + (size_t)gw * 32, gw, aq, threadIdx.x & 31);
+}
 
 // ---- repacked block layouts (4-aligned strides; built on host, read on device) ----
 
@@ -537,6 +543,10 @@ static struct actq actq_for(int k) {
 static void act_quantize(const float *d_x, int k) {
     int ng = k / 32;
     quantize_act_kernel<<<gridn(ng), 256>>>(d_x, actq_for(k), ng);
+}
+static void act_quantize_n(const float *d_x, int k) {
+    int ng = k / 32;
+    quantize_act_n_kernel<<<(ng + 7) / 8, 256>>>(d_x, actq_for(k), ng);
 }
 // Repack/upload every quantized tensor up front: lazy per-tensor uploads would
 // otherwise happen between fork events, unordered against the side stream.

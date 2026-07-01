@@ -90,6 +90,24 @@ __device__ static void d_quant_group(const float *xb, int g, struct actq aq) {
     aq.xds[g] = make_float2(d, (float)sum);
 }
 
+// Warp-cooperative twin for the WIDE (prefill) epilogues: lane-per-element, so
+// a warp's loads coalesce into one line per step — the serial form walks 32
+// consecutive floats per THREAD, touching 32 different 128-byte lines per step
+// (12.5% sector efficiency) and idling 31/32 threads. fmax and the int sum are
+// exactly associative, so the tree reductions produce byte-identical output.
+// Decode's captured kernels keep the serial form (frozen-decode rule).
+__device__ static void d_quant_group_warp(const float *xb, int g, struct actq aq, int lane) {
+    float v = xb[lane], amax = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * id);
+    aq.xq[(size_t)g * 32 + lane] = (int8_t)q;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    if (lane == 0) aq.xds[g] = make_float2(d, (float)q);
+}
+
 // ====================  non-matmul compute kernels  =========================
 
 // RMSNorm over `rows` vectors of length n. w (length n, shared across rows) or NULL.
@@ -706,11 +724,20 @@ __global__ static void geglu_kernel(float *g, const float *u, int n, struct actq
 }
 // The chunk form: g is [rows][n] contiguous; u's rows may sit ustride apart
 // (the PLE inputs are one [n_layer*ple] record per token, so a layer's slice
-// strides by the record).
+// strides by the record). Its epilogue quantizes warp-cooperatively (all 8
+// warps busy, coalesced) — the serial d_quant_block left 31/32 threads idle
+// on the widest activation in the model (rows x n_ff); byte-identical, and
+// this kernel is prefill-only so decode's graph never sees the change.
 __global__ static void geglu_n_kernel(float *g, const float *u, int n, int rows, int ustride, struct actq aq) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n * rows) g[i] = d_gelu(g[i]) * u[(size_t)(i / n) * ustride + i % n];
-    d_quant_block(g, n * rows, aq);
+    if (!aq.xq) return;
+    __syncthreads();
+    int base = blockIdx.x * blockDim.x;
+    int left = n * rows - base, ng = (left < (int)blockDim.x ? left : (int)blockDim.x) / 32;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int t = warp; t < ng; t += blockDim.x >> 5)
+        d_quant_group_warp(g + base + t * 32, base / 32 + t, aq, lane);
 }
 __global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
@@ -958,6 +985,9 @@ static struct actq actq_for(int k);
 // act_quantize: quantize d_x explicitly — for the one activation no kernel
 //   produces (the host-uploaded embedding); no-op for f32.
 static void act_quantize(const float *d_x, int k);
+// act_quantize_n: the chunk-wide form (warp-per-group, coalesced). Same output
+//   byte-for-byte; separate so decode's captured graph keeps its own kernel.
+static void act_quantize_n(const float *d_x, int k);
 
 // ====================  kv cache (device buffers)  ===========================
 
@@ -1094,7 +1124,7 @@ static int build_per_layer_n(struct model *m, const int *tokens, int B, matmul_f
     CUDA_CHECK(cudaMemcpy(d_tok, host, (size_t)B * total * 4, cudaMemcpyHostToDevice));
     free(host);
 
-    act_quantize(dx, B * c->n_embd);                  // dx came from the host, no producer kernel
+    act_quantize_n(dx, B * c->n_embd);                // dx came from the host, no producer kernel
     mm(d_proj, wq(m, "per_layer_model_proj.weight"), dx, c->n_embd, (int)total);
     scale_const_kernel<<<gridn(B * (int)total), 256>>>(d_proj, 1.0f / sqrtf((float)c->n_embd), B * (int)total);
     rmsnorm_kernel<<<B * c->n_layer, 256>>>(d_proj, d_proj, dW(m, "per_layer_proj_norm.weight"), ple, c->rms_eps, AQ0);
@@ -1351,7 +1381,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             bool f16 = kv->f16[src], ring = (kv->seq[src] < kv->max_seq);
             if (hd == 512) launch_flash<512>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring, g_pf_seg, g_pf_bidir_hi);
             else           launch_flash<256>(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, f16, ring, g_pf_seg, g_pf_bidir_hi);
-            act_quantize(dxb, B * q_dim);
+            act_quantize_n(dxb, B * q_dim);
         } else if (share) {                                // attended K/V exceeds L2: share across queries
             const int QT = 8;                              // queries per block (one warp each)
             size_t shm = (size_t)(2 + QT) * hd * sizeof(float);   // sK + sV + sO[QT][hd]
