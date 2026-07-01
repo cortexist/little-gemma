@@ -179,18 +179,48 @@ qs-pipeline attempt (measured neutral-on-A5000 / modest-on-Orin from a
 different structure). Cumulative today: A5000 12B 533 → 1670 (**3.13×**),
 E4B 1020 → 3423 (**3.36×**); Orin 12B 102 → 120, E4B 192 → 236.
 
+### Round 5 (post-merge, same day): the elementwise + attention levers
+
+Worked the "next levers" list on merged main:
+
+1. **2-superblock-deep qs prefetch: WASH** (1682 vs 1694 — the pf/pg
+   rotation copies eat the win). 1-deep stays.
+2. **Warp-cooperative activation quantization (+3.7%/+5.2%).** The serial
+   `d_quant_group` walks 32 consecutive floats per THREAD — a warp touches
+   32 different 128-B lines per step (12.5% sector efficiency), and
+   `d_quant_block` idled 31/32 threads in the geglu epilogue. The flash-
+   output quantize (960×4096) ran at 59 GB/s / 267 µs. `d_quant_group_warp`
+   (lane-per-element, shuffle trees; fmax + int-sum exactly associative →
+   byte-identical) behind prefill-only entry points; decode's captured
+   kernels stay frozen. 12B 1694 → 1757, E4B 3423 → 3602.
+3. **Flash K-block staging (+3.2% at 4096 ctx, neutral at 928).** ncu on
+   `flash_attn_n<256,ring,f32>`: long_scoreboard 11.5 cyc/instr, all on
+   `F2FP.PACK_AB` — the f32→f16 pack consuming per-fragment global K loads
+   (each K element also read twice, once per query sub-tile). Staging each
+   32-key block into shared as f16 (one coalesced sweep, 16.9 KB, still 2
+   CTAs/SM, byte-identical) drops long_sb to 2.5 and the kernel 954→856 µs.
+   The kernel is now **mio_throttle-bound** (5.2 — the strided
+   half-at-a-time V loads): that's the next attention lever if needed.
+4. **Orin validation (branch `explore-levers` on cortex): byte-identical,
+   12B 120 → 125 (+4.2%), E4B 236 → 246 (+4.4%), decode 6.86 unchanged.**
+
+**Standing after round 5:** A5000 12B 928-turn **~1760** (0.78× llama),
+1428-turn 1724, 4096 cold 941; E4B **3602** (~0.69×). Orin 12B **125**,
+E4B **246**. Day cumulative: A5000 3.3×/3.5×, Orin 1.23×/1.28×.
+
 ### Next levers
 
-1. **The remaining kernel gap (~1.35× on A5000)** — post-pipeline stalls
-   are spread thin (long_sb 0.66, not_selected 0.51, math_pipe 0.50, wait
-   0.47): approaching the balanced-latency floor at 2 warps/scheduler.
-   Residual long_sb is L2-miss latency the mma phase can't fully cover;
-   a 2-superblock-deep qs prefetch would cost ~16 more regs — cheap to
-   try, likely small.
-2. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
+1. **Flash V path** — mio-throttle from strided `fa_rd1` single-half V
+   loads; staging V costs 16 KB more shared (→1 CTA/SM, occupancy halves),
+   so it needs a smarter layout (e.g. V staged f16 through the freed sS
+   space, or a kv_dim-major V ring). Matters more as context grows.
+2. **f16 SWA rings (PROPOSAL, numerics-changing)** — would remove the
+   f32→f16 conversion entirely, halve K/V ring bytes AND ring memory, and
+   make decode attention reads cheaper too. Precedent: the f16-KV global
+   layers step shipped with a quality gate instead of byte-identity. Needs
+   a user decision (changes decode numerics on SWA layers).
+3. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
    share even swapped; a wpc/rows-per-CTA rebalance might buy a few %.
-3. **Attention/elementwise** (~0.14 s of a 0.56 s turn now) — flash tiles
-   and the elementwise launch chain start to matter as matmul shrinks.
 3. ~~Orin re-validation~~ **DONE (same day, worktree `~/lg-wide` on cortex,
    branch applied via patch series):**
    - Byte-identity narrow-vs-default at 4096 tokens (ring wrap exercised
