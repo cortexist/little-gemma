@@ -146,15 +146,51 @@ the mis-wired/mis-aimed experiments were all in the LAUNCH PLUMBING
 warp shrink), which is where this branch's ~3× came from. The kernel body
 itself is at a genuine local optimum for this architecture family.
 
-### Next levers (A5000)
+### Round 4 (same day): warp-stall counters land — the A-staging pipeline
 
-1. **The deep kernel schedule** — matmul is still ~72% of prefill and the
-   residual vs llama is their integrated instruction schedule (the June
-   "codegen, not a formula" wall, since re-confirmed from four angles).
-   New evidence would need warp-stall ncu on the A5000 (requires elevated
-   perf-counter permission on this box).
+Perf-counter permission enabled → first REAL stall profile on the A5000,
+and it rewrote the diagnosis. Per-instruction warp sampling on the ffn
+launch: **long_scoreboard 1.47 cycles/instr** (top stall by 10×), landing
+on the first consumer of the A-staging's global qs `LDG.128` — and
+**short_scoreboard 0.09**, i.e. the Orin's shared-read bottleneck is a
+non-issue here. The June "cp.async/prefetch physically can't help"
+reasoning was Orin-scoped; on this card the global weight fetch IS the
+stall. Device-scoped verdicts, once again, in the other direction.
+
+**Fix:** software-pipeline the A-staging in both mma kernels — the next
+sub-block pair's qs words (and the next superblock's first pair + header)
+go in flight before the current pair's mma phase, whose tensor-core cycles
+cover the latency. Same loads, same order: byte-identical, verified at
+4096 tokens on both devices. No spills (q4k 238 regs, q6k 254); occupancy
+was already 1 CTA/SM so the register growth costs nothing.
+
+| | before | after |
+|---|---:|---:|
+| ncu ffn launch: long_scoreboard | 1.47 cyc/instr | **0.66** |
+| ncu ffn launch: duration | 2.11 ms | **1.78 ms** |
+| A5000 12B warm serve | 1544 | **1670** (0.74× llama) |
+| A5000 E4B warm serve | 3280 | **3423** |
+| Orin 12B one-shot 910 tok | 105 | **120 (+15%)** |
+| Orin E4B one-shot 910 tok | 216.5 | **236 (+9%)** |
+
+The Orin gains exceed the A5000's — uncached zero-copy host reads have
+even more latency to hide. This supersedes the `prefill-q4k-ilp` branch's
+qs-pipeline attempt (measured neutral-on-A5000 / modest-on-Orin from a
+different structure). Cumulative today: A5000 12B 533 → 1670 (**3.13×**),
+E4B 1020 → 3423 (**3.36×**); Orin 12B 102 → 120, E4B 192 → 236.
+
+### Next levers
+
+1. **The remaining kernel gap (~1.35× on A5000)** — post-pipeline stalls
+   are spread thin (long_sb 0.66, not_selected 0.51, math_pipe 0.50, wait
+   0.47): approaching the balanced-latency floor at 2 warps/scheduler.
+   Residual long_sb is L2-miss latency the mma phase can't fully cover;
+   a 2-superblock-deep qs prefetch would cost ~16 more regs — cheap to
+   try, likely small.
 2. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
    share even swapped; a wpc/rows-per-CTA rebalance might buy a few %.
+3. **Attention/elementwise** (~0.14 s of a 0.56 s turn now) — flash tiles
+   and the elementwise launch chain start to matter as matmul shrinks.
 3. ~~Orin re-validation~~ **DONE (same day, worktree `~/lg-wide` on cortex,
    branch applied via patch series):**
    - Byte-identity narrow-vs-default at 4096 tokens (ring wrap exercised
