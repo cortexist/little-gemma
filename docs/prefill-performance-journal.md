@@ -905,3 +905,34 @@ hours of sustained bench load: the suspect is now NVMe THERMAL throttling /
 link stall, not a failing medium. Fix is airflow or a heatsink pad on the
 SSD, and the ops rule stands: check `mount` shows rw before trusting any
 Orin run.
+
+## 2026-07-02 — the appending prompt, showcased: a simulated audio stream
+
+voicecat + a stub ASR (little-gemma-tools test/stub-whisper.sh — prompt-aware,
+timestamped segments, sleeps 0.12x realtime; no ears, no external code) ran an
+11.4s utterance into the Orin 12B two ways, timelines stamped client-side:
+
+STREAMING (commit-ms 1000):        NAIVE (one ASR pass at the end):
+  t= 2.2s  +2 words committed        (silent while "listening")
+  t= 3.4s  +2 words
+  t= 4.5s  +3 words
+  t= 5.6s  +2, window -2.5s
+  t= 7.5s  +5 words
+  t= 8.7s  +2, window -2.5s
+  t=10.6s  +5, window -2.5s,
+           turn closed               t=11.5s  turn closed (everything at once)
+  t=11.36s reply streams             t=12.01s reply streams
+
+The turn text fills WHILE the user is still speaking (the runner's appendable
+turn — 'T' frames into the open turn), the audio window trims behind the
+confirmed words, and the final ASR pass at end-of-speech covers only the
+~1.9s unconfirmed tail instead of the whole clip. The 0.65s advantage over
+naive is entirely that final-pass shrink at the stub's 0.12x-RT cost; with
+real whisper on the Orin (0.3-0.5x RT) the naive tail pass on 10s of speech
+is 3-5s and the streaming tail stays under a second — and the gap grows
+linearly with utterance length. Two voicecat fixes made the showcase honest
+(tools de365f8): --rt paces to frame deadlines so ASR passes overlap capture
+like a live mic, and whisper runs with timestamps so confirmed segments trim
+out of the window (trimmed text rides --prompt as context). Real whisper.cpp
+on the board remains the one missing production piece (external-source
+install pending user approval).
