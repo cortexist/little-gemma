@@ -134,6 +134,23 @@ static int client_reset(sock_t s) {
 #endif
 }
 
+// Is another message already queued? Peek non-blocking, without consuming.
+// Drives the media prefill decision below: an empty socket means the client
+// is between messages (decoding its next frame, or a human typing), so the
+// held span prefills NOW and its work hides under that pause; queued bytes
+// mean the dispatch will decide within microseconds anyway.
+static int sock_pending(sock_t s) {
+    char c;
+#ifdef _WIN32
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+    int k = (int)recv(s, &c, 1, MSG_PEEK);
+    nb = 0; ioctlsocket(s, FIONBIO, &nb);
+    return k == 1;
+#else
+    return recv(s, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 1;
+#endif
+}
+
 // One newline-terminated user turn (CR stripped), whose first byte `first`
 // was already consumed by the frame/text dispatch. -1 on close or error.
 static int recv_line(sock_t s, char *buf, int cap, char first) {
@@ -291,115 +308,121 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             // " 00:01 " frame ...) — then the text line. The first byte tells
             // frame from line, so a text-only client speaks the same protocol
             // it always did.
-            // Practical per-turn media-span cap (a video frame is 2 segs: its
-            // MM:SS text + the image, so this holds ~128 frames). Longer video
-            // and live streams are the application's job — split across turns and
-            // stitched as one conversation via skills, not buffered in one turn.
-            // The real token bound is the SERVE_SEQ context check below; this is
-            // just the span-collection array, so a generous cap is cheap.
-            #define MAX_SEG 256
-            struct { char kind; float *rows; int n; char *text; } seg[MAX_SEG];
-            int n_seg = 0, in_media = 0, in_text = 0;
+            // The turn is alternating text and embedding spans — text
+            // accumulates (turn opener, 'T' frames, media markers) and is
+            // encoded right before each media span; in the mixed stream
+            // ids >= 0 are text tokens, ids < 0 index the span's rows.
+            // Media prefills AS IT ARRIVES instead of waiting for the whole
+            // turn: causality only needs completed prefixes, and a span's
+            // bidirectional window never leaves the span, so its kv rows can
+            // be seated while the client is still sending — by the time the
+            // text line lands only the line and the turn close remain, and
+            // first-token latency stops paying for the media. One embedded
+            // span is HELD while its verdict is unknown: if the socket sits
+            // empty (sock_pending) the client is between messages and the
+            // span prefills now, hiding under that pause; if bytes are
+            // queued, the next dispatch decides — another frame flushes the
+            // held span ahead of itself, while the text line packs it into
+            // the tail's single call (a camera's frame+question burst costs
+            // exactly what the packed turn always did). Only the very first
+            // encode of the conversation keeps its BOS (when a -sys prefix
+            // exists, the BOS already lives there); the first turn opens
+            // plainly, later turns first close the previous model turn,
+            // whose <turn|> was never fed back.
+            int skip = (pos == 0) ? 0 : 1;               // tokenizer_encode always prepends BOS
+            int n = 0, total = 0, best;
+            double tp = 0;                               // prefill seconds, spans + tail
+            int tl = snprintf(chat, sizeof chat, pos == n_sys ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
             char c0 = 0;
-            int dead = 0;
+            int dead = 0, full = 0;
+            int *pend = NULL; float *prow = NULL;        // the held span: its mixed ids + rows
+            int pend_n = 0;
             for (;;) {
                 if (recv(c, &c0, 1, 0) != 1) { dead = 1; break; }
                 if ((unsigned char)c0 != MEDIA_FRAME_MAGIC) break;
+                if (pend) {                              // the turn continues: the held span
+                    double f0 = now_sec();               // prefills ahead of this frame
+                    model_prefill_mixed(&m, &kv, prow, pend, pend_n, pos);
+                    pos += pend_n; total += pend_n;
+                    free(pend); free(prow); pend = NULL; prow = NULL;
+                    tp += now_sec() - f0;
+                }
                 unsigned char hdr[MEDIA_FRAME_HDR - 1];
                 uint16_t w, h; uint32_t len;
                 if (recv_n(c, hdr, sizeof hdr) < 0) { dead = 1; break; }
                 memcpy(&w, hdr + 1, 2); memcpy(&h, hdr + 3, 2); memcpy(&len, hdr + 5, 4);
                 char *payload = len && len <= (32u << 20) ? malloc((size_t)len + 1) : NULL;
                 if (!payload || recv_n(c, payload, (int)len) < 0) { free(payload); dead = 1; break; }
-                if (n_seg == MAX_SEG) { fprintf(stderr, "too many frames in one turn\n"); free(payload); dead = 1; break; }
-                seg[n_seg].kind = (char)hdr[0];
-                seg[n_seg].rows = NULL;
-                seg[n_seg].text = NULL;
                 if (hdr[0] == MEDIA_FRAME_TEXT && len <= 4096) {
                     payload[len] = 0;
-                    seg[n_seg].text = payload;
-                    in_text += (int)len;
-                    n_seg++;
+                    if (tl + (int)len + 256 >= (int)sizeof chat) { free(payload); full = 1; break; }
+                    tl += snprintf(chat + tl, sizeof chat - tl, "%s", payload);
+                    free(payload);
                     continue;
                 }
                 if (!md) { fprintf(stderr, "media frame but no -mm projector\n"); free(payload); dead = 1; break; }
                 double e0 = now_sec();
+                int nr = 0;
                 float *rows = hdr[0] == MEDIA_FRAME_IMAGE && len == 3u * w * h
-                            ? media_embed_image(md, (uint8_t *)payload, w, h, &seg[n_seg].n)
+                            ? media_embed_image(md, (uint8_t *)payload, w, h, &nr)
                             : hdr[0] == MEDIA_FRAME_AUDIO
-                            ? media_embed_audio(md, (int16_t *)payload, (int)(len / 2), &seg[n_seg].n)
+                            ? media_embed_audio(md, (int16_t *)payload, (int)(len / 2), &nr)
                             : NULL;
                 free(payload);
                 if (!rows) { dead = 1; break; }
-                seg[n_seg].rows = rows;
-                in_media += seg[n_seg].n;
-                fprintf(stderr, "media: %c frame -> %d tokens in %.1fs\n", hdr[0], seg[n_seg].n, now_sec() - e0);
-                n_seg++;
+                double e1 = now_sec();
+                // budget: chars bound tokens from above, so tl never under-reserves
+                if (pos + tl + nr + 64 >= SERVE_SEQ) { free(rows); full = 1; break; }
+                tl += snprintf(chat + tl, sizeof chat - tl, "%s",
+                               hdr[0] == MEDIA_FRAME_IMAGE ? MEDIA_IMG_BEG : MEDIA_AUD_BEG);
+                n = tokenizer_encode(tk, chat, promptv, 4096);
+                pend = malloc(((size_t)n + nr) * sizeof *pend);
+                if (!pend) { free(rows); fprintf(stderr, "turn buffer: out of memory\n"); dead = 1; break; }
+                pend_n = 0;
+                for (int j = skip; j < n; j++) pend[pend_n++] = promptv[j];
+                skip = 1;
+                for (int r = 0; r < nr; r++) pend[pend_n++] = -r - 1;
+                prow = rows;
+                tl = snprintf(chat, sizeof chat, "%s",
+                              hdr[0] == MEDIA_FRAME_IMAGE ? MEDIA_IMG_END : MEDIA_AUD_END);
+                fprintf(stderr, "media: %c frame -> %d tokens in %.1fs\n", hdr[0], nr, e1 - e0);
+                if (!sock_pending(c)) {                  // client pause: prefill in the gap
+                    model_prefill_mixed(&m, &kv, prow, pend, pend_n, pos);
+                    pos += pend_n; total += pend_n;
+                    free(pend); free(prow); pend = NULL; prow = NULL;
+                    tp += now_sec() - e1;
+                }
             }
-            if (dead || recv_line(c, line, sizeof line, c0) < 0) {
-                for (int i = 0; i < n_seg; i++) { free(seg[i].rows); free(seg[i].text); }
+            if (dead || full || recv_line(c, line, sizeof line, c0) < 0) {
+                free(pend); free(prow);
+                if (full) fprintf(stderr, "context full\n");
                 break;
             }
-            // budget: chars bound tokens from above, so this never under-reserves;
-            // the chat buffer must also hold every 'T' chunk plus the line
-            if (pos + in_media + in_text + (int)strlen(line) + 64 >= SERVE_SEQ ||
-                in_text + (int)strlen(line) + 256 >= (int)sizeof chat) {
-                for (int i = 0; i < n_seg; i++) { free(seg[i].rows); free(seg[i].text); }
+            // budget: the tail still has the held span, the line and the turn close
+            if (pos + pend_n * (pend != NULL) + tl + (int)strlen(line) + 64 >= SERVE_SEQ ||
+                tl + (int)strlen(line) + 256 >= (int)sizeof chat) {
+                free(pend); free(prow);
                 fprintf(stderr, "context full\n");
                 break;
             }
             double t0 = now_sec();
-            // The turn is assembled as alternating text and embedding spans —
-            // text accumulates (turn opener, 'T' frames, media markers) and is
-            // encoded right before each media span — but the whole turn
-            // prefills as ONE mixed stream: ids >= 0 are text tokens, ids < 0
-            // index the media rows gathered alongside. Prefilled separately,
-            // every text/media seam padded its own chunk to a full weight
-            // pass; a short camera turn spent a third of its prefill on the
-            // seams. Only the very first encode of the conversation keeps its
-            // BOS (when a -sys prefix exists, the BOS already lives there);
-            // the first turn opens plainly, later turns first close the
-            // previous model turn, whose <turn|> was never fed back.
-            int skip = (pos == 0) ? 0 : 1;               // tokenizer_encode always prepends BOS
-            int n = 0, total = 0, best;
-            int idcap = in_media + in_text + (int)strlen(line) + 16 * n_seg + 192;
-            int *ids = malloc((size_t)idcap * sizeof *ids);
-            float *mrows = in_media ? malloc((size_t)in_media * m.cfg.n_embd * 4) : NULL;
-            if (!ids || (in_media && !mrows)) {
-                free(ids); free(mrows);
-                for (int i = 0; i < n_seg; i++) { free(seg[i].rows); free(seg[i].text); }
-                fprintf(stderr, "turn buffer: out of memory\n");
-                break;
-            }
-            int nid = 0, nmr = 0;
-            int tl = snprintf(chat, sizeof chat, pos == n_sys ? "<|turn>user\n" : "<turn|>\n<|turn>user\n");
-            for (int i = 0; i < n_seg; i++) {
-                if (seg[i].kind == MEDIA_FRAME_TEXT) {
-                    tl += snprintf(chat + tl, sizeof chat - tl, "%s", seg[i].text);
-                    free(seg[i].text);
-                    continue;
-                }
-                tl += snprintf(chat + tl, sizeof chat - tl, "%s",
-                               seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_BEG : MEDIA_AUD_BEG);
-                n = tokenizer_encode(tk, chat, promptv, 4096);
-                for (int j = skip; j < n; j++) ids[nid++] = promptv[j];
-                skip = 1;
-                memcpy(mrows + (size_t)nmr * m.cfg.n_embd, seg[i].rows, (size_t)seg[i].n * m.cfg.n_embd * 4);
-                for (int r = 0; r < seg[i].n; r++) ids[nid++] = -(nmr + r) - 1;
-                nmr += seg[i].n;
-                free(seg[i].rows);
-                tl = snprintf(chat, sizeof chat, "%s",
-                              seg[i].kind == MEDIA_FRAME_IMAGE ? MEDIA_IMG_END : MEDIA_AUD_END);
-            }
             snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n", line);
             n = tokenizer_encode(tk, chat, promptv, 4096);
-            for (int j = skip; j < n - 1; j++) ids[nid++] = promptv[j];
-            model_prefill_mixed(&m, &kv, mrows, ids, nid, pos);
-            pos += nid;
-            total = nid + 1;                             // + the head forward below
-            free(ids); free(mrows);
+            if (pend) {                                  // pack the held span with the tail:
+                int *ids = realloc(pend, ((size_t)pend_n + n) * sizeof *ids);
+                if (!ids) { free(pend); free(prow); fprintf(stderr, "turn buffer: out of memory\n"); break; }
+                for (int j = skip; j < n - 1; j++) ids[pend_n++] = promptv[j];
+                model_prefill_mixed(&m, &kv, prow, ids, pend_n, pos);
+                pos += pend_n; total += pend_n;
+                free(ids); free(prow); pend = NULL; prow = NULL;
+            } else {
+                model_prefill_mixed(&m, &kv, NULL, promptv + skip, n - 1 - skip, pos);
+                pos += n - 1 - skip; total += n - 1 - skip;
+            }
+            total += 1;                                  // + the head forward below
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
+            tp += t1 - t0;
             int g = 0, fail = 0;                          // g = tokens streamed this turn
             double t_draft = 0, t_verify = 0;
             int n_draft = 0, n_accept = 0;
@@ -436,10 +459,11 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 if (brk) break;
                 best = out[adv - 1];
             }
-            double dt = now_sec() - t1, dp = t1 - t0;
-            fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s)\n",
-                    total, dp, total / (dp > 0 ? dp : 1e-9),
-                    g, dt, g / (dt > 0 ? dt : 1e-9));
+            double dt = now_sec() - t1;
+            fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s), ttft %.2fs\n",
+                    total, tp, total / (tp > 0 ? tp : 1e-9),
+                    g, dt, g / (dt > 0 ? dt : 1e-9),
+                    t1 - t0);
             if (t && n_draft)
                 fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
                         n_accept, n_draft, 100.0 * n_accept / n_draft,

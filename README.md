@@ -231,6 +231,18 @@ exactly that shape. The server wraps each media span in the model's marker
 tokens, so the model sees what it was trained on:
 `<|turn>user\n<|image>` *(192-ish embedding rows)* `<image|>{text}<turn|>\n<|turn>model\n`.
 
+Media also **prefills as it arrives**: a span's kv rows are seated the moment
+its frame is decoded — causality needs only completed prefixes, and the
+bidirectional window never leaves a span — so the cache fills while the
+client is still sending, and once the question lands only the line itself is
+left to prefill. One embedded span is held while its verdict is unknown: an
+idle socket means the client is between messages (a video tool decoding its
+next frame), so the held span prefills under that pause; a queued next frame
+flushes it; the queued text line packs it into the tail's single call, so a
+camera's frame+question burst costs exactly what the packed turn always did.
+On the Orin, a six-frame video turn (12B) answers in 2.9 s instead of
+8.8 s — same reply, byte for byte.
+
 Text is optional when media frames are sent: a spoken question, or a written
 note shown to the camera, is a complete turn by itself —
 

@@ -470,3 +470,51 @@ wait for new evidence or new hardware.
    - Serve smoke: `engine warmup: 1.17s` at startup, first 19-token turn at
      0.28 s, Paris. 12B loads fine with the larger rings on the 16 GB board.
    The branch is validated on both devices.
+
+
+---
+
+## 2026-07-02 — TTFT: media prefills as it arrives (serve layer, no kernels)
+
+The prefill-rate campaign built the engine; this spends it on latency.
+serve() used to buffer the whole turn — every frame embedded on arrival but
+prefilled only after the text line — so a video turn paid its entire prefill
+inside time-to-first-token. Now each media span prefills as soon as its
+frame is decoded (causality needs only completed prefixes; the bidirectional
+window never leaves a span), with a one-span holdback ruled by a single
+non-blocking MSG_PEEK (`sock_pending`):
+
+- socket idle after embedding → the client is between messages; the held
+  span prefills now, hiding under that pause;
+- next frame already queued → the held span flushes ahead of it;
+- the text line queued → the held span packs into the tail's single mixed
+  call — a camera's frame+question burst is byte-for-byte the old packed
+  turn, so the flagship zero-gap case cannot regress.
+
+Packing only moves chunk boundaries, which the campaign's identity gates
+proved unobservable in output. Measured (ttft = line sent → first reply
+byte, client-side on the Orin, server-side `t1−t0` on the A5000; 3 turns
+each, all stable to ±0.01 s):
+
+| case | deferred | streamed | |
+|---|---:|---:|---|
+| Orin 12B, 6-frame video, 0.5 s arrival gaps | 8.79 s | **2.93 s** | 3.0×; turn wall 11.3 → 9.1 s |
+| Orin E4B, camera burst (frame+line, zero gap) | 1.820 s | 1.819 s | =, glued (packed call 0.72 s both) |
+| A5000 12B, 6-frame video (local mmcat) | 0.28 s | 0.14 s | 2.0× |
+| A5000 12B single image / audio, E4B image | 0.13 s | 0.13 s | =, glued |
+
+Gates: replies byte-identical on both devices across text / image / video /
+audio / E4B-image; MTP acceptance counts exactly equal; text serve at the
+campaign numbers (A5000 1802.8, Orin E4B 417 tok/s) — the text path is
+structurally the same single tail call. The `turn:` stat line appends a
+trailing `ttft %.2fs` field (existing bench regexes have no end anchor).
+MAX_SEG span buffering is gone; the only per-turn bound left is the context.
+
+For the ledger, two TTFT levers surfaced and left on the table:
+- the first pick after any prefill costs ~66 ms on the A5000 (~4 decode
+  steps) in BOTH builds — the tail's padded 32-wide chunk and the first
+  decode drain serially in it; graph instantiation is once-per-process
+  (nsys: 2 instantiates, 300 µs graph launches), so this is real GPU work,
+  not API overhead. Worth an ncu look before believing any single theory.
+- the legacy E4B vision encoder (~1.1 s/frame on Orin) now dominates the
+  camera-burst ttft — the model waits on the eyes, not the other way round.
