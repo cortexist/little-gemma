@@ -997,4 +997,5 @@ E4B deferred +2.23 / +3.20, E4B streaming **+0.26 / +1.24**. The E4B answers
 this prompt with NO thought channel — its post-token gap is the sentence
 alone, while the 12B's is mostly thought; template-induced thought length
 remains the biggest TTFS variable. Timing diagrams (UML lifelines, both
-models, all measured): the dictation-timing artifact.
+models, all measured): **docs/dictation-timing.html** — self-contained,
+open it in any browser.

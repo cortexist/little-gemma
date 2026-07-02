@@ -1,0 +1,417 @@
+<title>little-gemma · dictation timing</title>
+<style>
+  .viz-root {
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --muted:       #898781;
+    --grid:        #2c2c2a;
+    --baseline:    #383835;
+    --ring:        rgba(255,255,255,0.10);
+    --speech:      #3987e5;   /* lane: user speech        (slot 1, dark) */
+    --asr:         #199e70;   /* lane: transcript commits (slot 2, dark) */
+    --prefill:     #c98500;   /* lane: kv prefill         (slot 3, dark) */
+    --reply:       #9085e9;   /* lane: reply decode       (slot 5, dark) */
+    --good:        #0ca30c;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  html, body { margin: 0; background: #0d0d0d; }
+  .viz-root {
+    background: var(--page);
+    color: var(--ink-2);
+    font-family: var(--sans);
+    min-height: 100vh;
+    padding: 40px 20px 64px;
+  }
+  .frame { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+  /* ---- nameplate ---- */
+  .nameplate { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 18px; }
+  .nameplate h1 {
+    font-family: var(--mono); font-size: 15px; font-weight: 600;
+    letter-spacing: 0.14em; color: var(--ink); margin: 0; text-transform: uppercase;
+  }
+  .nameplate .sub {
+    font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 0.04em;
+  }
+  .thesis {
+    font-size: 15.5px; line-height: 1.55; color: var(--ink-2); max-width: 68ch; margin: 0;
+  }
+  .thesis b { color: var(--ink); font-weight: 600; }
+
+  /* ---- panels ---- */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--ring);
+    border-radius: 6px;
+    padding: 16px 18px 10px;
+  }
+  .panel-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+  .panel-tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+    padding: 3px 8px; border: 1px solid var(--ring); border-radius: 3px; color: var(--ink); white-space: nowrap;
+  }
+  .panel-title { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); letter-spacing: 0.03em; }
+  .panel-metric { margin-left: auto; font-family: var(--mono); font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .panel-metric b { color: var(--ink); font-weight: 600; }
+  .panel-metric .up { color: var(--good); }
+  .wavebox { position: relative; overflow-x: auto; }
+  .wavebox svg { display: block; width: 100%; height: auto; }
+
+  /* ---- tooltip ---- */
+  .tip {
+    position: fixed; z-index: 10; pointer-events: none; display: none;
+    background: #242422; border: 1px solid var(--ring); border-radius: 4px;
+    padding: 7px 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    color: var(--ink-2); max-width: 300px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+  .tip b { color: var(--ink); }
+
+  /* ---- stat tiles ---- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 12px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 6px;
+    padding: 14px 16px 12px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .tile .lbl { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em; color: var(--muted); text-transform: uppercase; }
+  .tile .val { font-family: var(--mono); font-size: 22px; color: var(--ink); font-weight: 600; }
+  .tile .val .arrow { color: var(--muted); font-weight: 400; font-size: 17px; padding: 0 2px; }
+  .tile .note { font-size: 12px; color: var(--muted); }
+  .tile .good { color: var(--good); }
+
+  /* ---- legend + notes ---- */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 14px; height: 8px; border-radius: 2px; display: inline-block; }
+  .notes { font-size: 13px; line-height: 1.65; color: var(--muted); max-width: 76ch; }
+  .notes b { color: var(--ink-2); font-weight: 600; }
+  .notes p { margin: 0 0 8px; }
+  table.method { border-collapse: collapse; font-family: var(--mono); font-size: 12px; margin-top: 4px; }
+  table.method td, table.method th {
+    border: 1px solid var(--grid); padding: 5px 10px; text-align: left;
+    font-variant-numeric: tabular-nums; color: var(--ink-2); font-weight: 400;
+  }
+  table.method th { color: var(--muted); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; }
+  a { color: var(--ink-2); }
+  :focus-visible { outline: 2px solid var(--speech); outline-offset: 2px; }
+</style>
+
+<div class="viz-root">
+  <div class="frame">
+    <div class="nameplate">
+      <h1>little-gemma · dictation timing</h1>
+      <span class="sub">Orin NX · gemma-4 12B &amp; E4B, Q4_K_M · 929-token spoken instruction · MTP block-3 decode · 2026-07-02 · commit 59479be</span>
+    </div>
+    <p class="thesis"><b>The turn is appendable, so the prompt prefills while it is being dictated.</b>
+      Confirmed transcript streams into the open turn as <b>'T'</b> commits and flushes into the kv cache
+      at word boundaries. Total prefill work is unchanged — it moves under the speaking, where nobody feels it.
+      Traces A and B are the same instruction on the 12B; the strip below runs the numbers for both models.</p>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-tag">A · 12B · DEFERRED</span>
+        <span class="panel-title">the whole turn arrives as one line — every prefill second is paid after the last word</span>
+        <span class="panel-metric">first token <b>+5.37&thinsp;s</b> after speech</span>
+      </div>
+      <div class="wavebox"><svg id="pA" aria-label="Timing diagram, deferred delivery, 12B"></svg></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-tag">B · 12B · STREAMING</span>
+        <span class="panel-title">'T' commits flush into the kv cache during speech — only the tail is paid at the end</span>
+        <span class="panel-metric">first token <b class="up">+0.55&thinsp;s</b> after speech</span>
+      </div>
+      <div class="wavebox"><svg id="pB" aria-label="Timing diagram, streaming delivery, 12B"></svg></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-tag">C · AFTER THE LAST WORD</span>
+        <span class="panel-title">both models, both deliveries — silence until the first token, then decode to the first sentence</span>
+        <span class="panel-metric">E4B streaming: sentence at <b class="up">+1.24&thinsp;s</b></span>
+      </div>
+      <div class="wavebox"><svg id="pC" aria-label="Post-utterance comparison, both models"></svg></div>
+    </div>
+
+    <div class="legend">
+      <span><span class="sw" style="background:var(--speech)"></span>user speech</span>
+      <span><span class="sw" style="background:var(--asr)"></span>transcript&nbsp;('T' commits)</span>
+      <span><span class="sw" style="background:var(--prefill)"></span>kv prefill</span>
+      <span><span class="sw" style="background:var(--reply)"></span>reply decode</span>
+      <span style="color:var(--muted)">hover for intervals · dashed rules mark cross-lane events</span>
+    </div>
+
+    <div class="tiles">
+      <div class="tile">
+        <div class="lbl">12B · first token</div>
+        <div class="val">5.37&thinsp;s <span class="arrow">→</span> <span class="good">0.55&thinsp;s</span></div>
+        <div class="note">deferred → streaming, after the last word</div>
+      </div>
+      <div class="tile">
+        <div class="lbl">12B · first sentence</div>
+        <div class="val">8.13&thinsp;s <span class="arrow">→</span> <span class="good">3.31&thinsp;s</span></div>
+        <div class="note">thought + sentence at 9.3 tok/s (MTP, 59.3% acc)</div>
+      </div>
+      <div class="tile">
+        <div class="lbl">E4B · first token</div>
+        <div class="val">2.23&thinsp;s <span class="arrow">→</span> <span class="good">0.26&thinsp;s</span></div>
+        <div class="note">plan B — 417 tok/s prefill, same machinery</div>
+      </div>
+      <div class="tile">
+        <div class="lbl">E4B · first sentence</div>
+        <div class="val">3.20&thinsp;s <span class="arrow">→</span> <span class="good">1.24&thinsp;s</span></div>
+        <div class="note">no thought channel on this prompt — pure sentence at 18.7 tok/s (MTP, 41.4% acc)</div>
+      </div>
+    </div>
+
+    <div class="notes">
+      <p><b>How to read it:</b> each lane in A/B is a UML-timing-diagram lifeline — high means active. In trace B the
+        yellow prefill lane fires in short bursts throughout the dictation (each burst seats one word-boundary
+        chunk of the transcript into the kv cache) and finishes with the 0.55&thinsp;s tail; in trace A the same
+        ~5.4&thinsp;s of GPU work stands as one solid block after the speech ends. Strip C re-zeroes the clock at
+        the last spoken word: yellow is the silence until the first token, violet is decode until the first
+        speakable sentence.</p>
+      <p><b>Why E4B's gap is shorter than its decode rate suggests:</b> on this prompt the E4B answers with no
+        thought channel — its violet segment is the 19-word sentence alone — while the 12B spends most of its
+        violet on thought tokens before the sentence begins. Template-induced thought length remains the largest
+        single TTFS variable.</p>
+      <p><b>Method:</b> the measured runs deliver the transcript at 30&nbsp;words/s ('T' frames of 5 words,
+        <span style="font-family:var(--mono)">ttft_dictate.py</span>, client-side clocks); at a natural dictation
+        pace (~2.5&nbsp;words/s) the hiding is more comfortable still. Decode runs the production configuration —
+        MTP block-3 speculative decoding; MTP does not move first-token time, only the sentence. The transcript
+        lane's commit cadence is drawn at voicecat's real-whisper rhythm (a ~0.6&thinsp;s pass every 2.5&thinsp;s).
+        Burst delivery — the whole text at once with nothing to hide behind — should use a plain line instead,
+        which is the unchanged path. Prefill ids are 930 with byte-identical replies in every delivery mode, both
+        models: word-boundary splits reproduce the exact token stream.</p>
+      <table class="method" aria-label="Measured intervals, seconds after the last spoken word">
+        <tr><th>model · delivery</th><th>first token</th><th>first sentence</th><th>decode (MTP)</th></tr>
+        <tr><td>12B · deferred</td><td>+5.37&thinsp;s</td><td>+8.13&thinsp;s</td><td>9.3 tok/s · 59.3%</td></tr>
+        <tr><td>12B · streaming</td><td>+0.55&thinsp;s</td><td>+3.31&thinsp;s</td><td>9.3 tok/s · 59.3%</td></tr>
+        <tr><td>E4B · deferred</td><td>+2.23&thinsp;s</td><td>+3.20&thinsp;s</td><td>18.7 tok/s · 41.4%</td></tr>
+        <tr><td>E4B · streaming</td><td>+0.26&thinsp;s</td><td>+1.24&thinsp;s</td><td>18.7 tok/s · 41.4%</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="tip" id="tip"></div>
+</div>
+
+<script>
+(() => {
+  const css = n => getComputedStyle(document.querySelector('.viz-root')).getPropertyValue(n).trim();
+  const C = {
+    speech: css('--speech'), asr: css('--asr'), prefill: css('--prefill'), reply: css('--reply'),
+    ink: css('--ink'), ink2: css('--ink-2'), muted: css('--muted'), grid: css('--grid'),
+    baseline: css('--baseline'), good: css('--good'),
+  };
+  const MONO = 'ui-monospace, "Cascadia Mono", Consolas, monospace';
+
+  // ---- the measured timeline (seconds) --------------------------------------
+  const T0 = 0, T1 = 42;
+  const SPEECH_END = 30.7;
+
+  const flushes = [];
+  for (let t = 2.4; t < SPEECH_END; t += 1.75) flushes.push({ s: t, e: t + 0.30 });
+  const passes = [];
+  for (let t = 2.5; t < SPEECH_END; t += 2.5) passes.push({ s: t, e: Math.min(t + 0.6, SPEECH_END) });
+
+  const PANELS = {
+    pA: {
+      lanes: [
+        { name: 'USER SPEECH', color: C.speech,
+          segs: [{ s: 0, e: SPEECH_END, tip: '<b>Dictating</b> · 0 – 30.7 s<br>929-token instruction, 30 words/s' }] },
+        { name: "TRANSCRIPT", color: C.asr, dim: true,
+          segs: [{ s: 0, e: SPEECH_END, hollow: true, tip: '<b>Held at the client</b> · 0 – 30.7 s<br>nothing reaches the server until the line closes' }],
+          events: [{ t: SPEECH_END, label: 'whole text arrives', tip: '<b>One plain line</b> · t = 30.7 s<br>the full 929-token turn lands at once' }] },
+        { name: 'KV PREFILL', color: C.prefill,
+          segs: [{ s: SPEECH_END, e: 36.07, tip: '<b>Prefill</b> · 30.7 – 36.07 s<br>5.37 s — the whole turn, paid after the last word' }],
+          brace: { s: SPEECH_END, e: 36.07, label: '5.37 s prefill' } },
+        { name: 'REPLY', color: C.reply,
+          segs: [{ s: 36.07, e: T1, open: true, tip: '<b>Decode</b> · from t = 36.07 s<br>9.3 tok/s (MTP block-3, 59.3% acceptance); first sentence at 38.83 s' }],
+          events: [{ t: 38.83, label: 'first sentence', tip: '<b>First speakable sentence</b> · t = 38.83 s<br>TTFS = 8.13 s after last word' }] },
+      ],
+      rules: [
+        { t: SPEECH_END, label: 'speech ends' },
+        { t: 36.07, label: 'first token · +5.37 s', color: C.ink },
+      ],
+    },
+    pB: {
+      lanes: [
+        { name: 'USER SPEECH', color: C.speech,
+          segs: [{ s: 0, e: SPEECH_END, tip: '<b>Dictating</b> · 0 – 30.7 s<br>same instruction, same pace' }] },
+        { name: "TRANSCRIPT", color: C.asr,
+          segs: passes.map((p, i) => ({ s: p.s, e: p.e, tip: `<b>ASR pass ${i + 1}</b> · ${p.s.toFixed(1)} – ${p.e.toFixed(1)} s<br>whisper over the trimmed window; confirmed words → 'T' commit` })),
+          note: 'commits every ~2.5 s' },
+        { name: 'KV PREFILL', color: C.prefill,
+          segs: flushes.map((f, i) => ({ s: f.s, e: f.e, tip: `<b>Flush ${i + 1}</b> · ${f.s.toFixed(1)} s<br>one word-boundary chunk seats into the kv cache` }))
+            .concat([{ s: SPEECH_END + 0.15, e: 31.25, tip: '<b>Tail flush + first pick</b> · 30.85 – 31.25 s<br>only the unflushed remainder — 0.55 s total after speech' }]),
+          brace: { s: SPEECH_END, e: 31.25, label: '0.55 s tail' },
+          note: 'prefill hides under the speech' },
+        { name: 'REPLY', color: C.reply,
+          segs: [{ s: 31.25, e: T1, open: true, tip: '<b>Decode</b> · from t = 31.25 s<br>same 9.3 tok/s MTP decode; first sentence at 34.01 s' }],
+          events: [{ t: 34.01, label: 'first sentence', tip: '<b>First speakable sentence</b> · t = 34.01 s<br>TTFS = 3.31 s after last word' }] },
+      ],
+      rules: [
+        { t: SPEECH_END, label: 'speech ends' },
+        { t: 31.25, label: 'first token · +0.55 s', color: C.good },
+      ],
+    },
+  };
+
+  // strip C: seconds AFTER the last word; yellow = wait for first token,
+  // violet = decode to the first speakable sentence
+  const STRIP = [
+    { name: '12B · DEFERRED',  ttft: 5.37, ttfs: 8.13, note: 'thought + sentence at 9.3 tok/s' },
+    { name: '12B · STREAMING', ttft: 0.55, ttfs: 3.31, good: true, note: 'thought + sentence at 9.3 tok/s' },
+    { name: 'E4B · DEFERRED',  ttft: 2.23, ttfs: 3.20, note: 'no thought — sentence at 18.7 tok/s' },
+    { name: 'E4B · STREAMING', ttft: 0.26, ttfs: 1.24, good: true, note: 'no thought — sentence at 18.7 tok/s' },
+  ];
+
+  // ---- renderers -------------------------------------------------------------
+  const NS = 'http://www.w3.org/2000/svg';
+  const GUTTER = 118, RIGHT = 14, LANE_H = 46, WAVE_H = 18, TOP = 30, RULER = 30;
+  const W = 1010;
+  const tip = document.getElementById('tip');
+
+  function el(name, attrs, parent) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function txt(x, y, s, attrs, parent) {
+    const t = el('text', Object.assign({ x, y, fill: C.muted, 'font-family': MONO, 'font-size': 11 }, attrs), parent);
+    t.textContent = s;
+    return t;
+  }
+  const bindTip = (node, html) => {
+    node.addEventListener('mousemove', ev => {
+      tip.innerHTML = html;
+      tip.style.display = 'block';
+      const pad = 14, vw = window.innerWidth;
+      let x = ev.clientX + pad, y = ev.clientY + pad;
+      if (x + 310 > vw) x = ev.clientX - 310;
+      tip.style.left = x + 'px'; tip.style.top = y + 'px';
+    });
+    node.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  };
+
+  const cursors = [];
+  function render(id) {
+    const spec = PANELS[id];
+    const svg = document.getElementById(id);
+    const H = TOP + spec.lanes.length * LANE_H + RULER;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const X = t => GUTTER + (t - T0) / (T1 - T0) * (W - GUTTER - RIGHT);
+
+    for (let t = 0; t <= 40; t += 5) {
+      el('line', { x1: X(t), y1: TOP - 8, x2: X(t), y2: H - RULER + 4, stroke: C.grid, 'stroke-width': 1 }, svg);
+      txt(X(t), H - RULER + 18, t + ' s', { 'text-anchor': 'middle', 'font-variant-numeric': 'tabular-nums' }, svg);
+    }
+    txt(W - RIGHT, H - RULER + 18, 'time →', { 'text-anchor': 'end' }, svg);
+
+    spec.lanes.forEach((lane, i) => {
+      const yBase = TOP + i * LANE_H + LANE_H - 12;
+      const yHigh = yBase - WAVE_H;
+      txt(GUTTER - 12, yBase - 4, lane.name, { 'text-anchor': 'end', fill: C.ink2, 'letter-spacing': '0.08em', 'font-size': 10.5 }, svg);
+      if (lane.note) txt(GUTTER - 12, yBase + 10, lane.note, { 'text-anchor': 'end', 'font-size': 9.5 }, svg);
+      el('line', { x1: X(T0), y1: yBase, x2: X(T1), y2: yBase, stroke: C.baseline, 'stroke-width': 1 }, svg);
+
+      (lane.segs || []).forEach(seg => {
+        const x1 = X(seg.s), x2 = X(seg.e);
+        if (seg.hollow) {
+          const r = el('rect', { x: x1, y: yHigh, width: x2 - x1, height: WAVE_H, fill: 'none',
+                                 stroke: lane.color, 'stroke-width': 1, 'stroke-dasharray': '3 4', opacity: 0.55, rx: 2 }, svg);
+          bindTip(r, seg.tip);
+          return;
+        }
+        const g = el('g', {}, svg);
+        el('rect', { x: x1, y: yHigh, width: Math.max(x2 - x1, 2), height: WAVE_H, fill: lane.color, opacity: 0.22, rx: 1.5 }, g);
+        el('path', { d: `M ${x1} ${yBase} L ${x1} ${yHigh} L ${x2} ${yHigh} ${seg.open ? '' : `L ${x2} ${yBase}`}`,
+                     stroke: lane.color, 'stroke-width': 2, fill: 'none', 'stroke-linejoin': 'round' }, g);
+        if (seg.open) txt(x2 - 4, yHigh - 4, '···', { 'text-anchor': 'end', fill: lane.color }, g);
+        const hit = el('rect', { x: x1 - 3, y: yHigh - 6, width: (x2 - x1) + 6, height: WAVE_H + 12, fill: 'transparent' }, g);
+        bindTip(hit, seg.tip);
+      });
+
+      (lane.events || []).forEach(ev => {
+        const x = X(ev.t);
+        el('line', { x1: x, y1: yBase, x2: x, y2: yHigh - 5, stroke: lane.color, 'stroke-width': 2 }, svg);
+        el('circle', { cx: x, cy: yHigh - 8, r: 3.5, fill: lane.color }, svg);
+        txt(x + 7, yHigh - 5, ev.label, { fill: C.ink2, 'font-size': 10 }, svg);
+        const hit = el('circle', { cx: x, cy: yHigh - 8, r: 10, fill: 'transparent' }, svg);
+        bindTip(hit, ev.tip);
+      });
+
+      if (lane.brace) {
+        const x1 = X(lane.brace.s), x2 = X(lane.brace.e), y = yHigh - 9;
+        el('path', { d: `M ${x1} ${y + 4} L ${x1} ${y} L ${x2} ${y} L ${x2} ${y + 4}`, stroke: C.ink2, fill: 'none', 'stroke-width': 1 }, svg);
+        txt((x1 + x2) / 2, y - 5, lane.brace.label, { 'text-anchor': 'middle', fill: C.ink, 'font-size': 10.5 }, svg);
+      }
+    });
+
+    (spec.rules || []).forEach(rule => {
+      const x = X(rule.t);
+      el('line', { x1: x, y1: TOP - 14, x2: x, y2: H - RULER + 4, stroke: rule.color || C.muted,
+                   'stroke-width': 1, 'stroke-dasharray': '4 4', opacity: 0.85 }, svg);
+      txt(Math.min(x + 5, W - 150), TOP - 18, rule.label, { fill: rule.color || C.muted, 'font-size': 10.5 }, svg);
+    });
+
+    const cursor = el('line', { x1: -10, y1: TOP - 8, x2: -10, y2: H - RULER + 4, stroke: C.ink, 'stroke-width': 1, opacity: 0 }, svg);
+    const readout = txt(0, TOP - 18, '', { fill: C.ink, 'text-anchor': 'middle', 'font-size': 10.5, opacity: 0 }, svg);
+    svg.addEventListener('mousemove', ev => {
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+      if (p.x < GUTTER || p.x > W - RIGHT) { cursor.setAttribute('opacity', 0); readout.setAttribute('opacity', 0); return; }
+      const t = T0 + (p.x - GUTTER) / (W - GUTTER - RIGHT) * (T1 - T0);
+      for (const c of cursors) {
+        c.cursor.setAttribute('x1', p.x); c.cursor.setAttribute('x2', p.x); c.cursor.setAttribute('opacity', 0.35);
+        c.readout.setAttribute('x', Math.min(Math.max(p.x, GUTTER + 30), W - 60));
+        c.readout.setAttribute('opacity', c.svg === svg ? 0.9 : 0);
+        if (c.svg === svg) c.readout.textContent = 't = ' + t.toFixed(1) + ' s';
+      }
+    });
+    svg.addEventListener('mouseleave', () => {
+      for (const c of cursors) { c.cursor.setAttribute('opacity', 0); c.readout.setAttribute('opacity', 0); }
+    });
+    cursors.push({ svg, cursor, readout });
+  }
+
+  function renderStrip() {
+    const svg = document.getElementById('pC');
+    const ROW_H = 40, S_TOP = 16, S_MAX = 9;
+    const H = S_TOP + STRIP.length * ROW_H + RULER;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const X = s => GUTTER + s / S_MAX * (W - GUTTER - RIGHT);
+
+    for (let s = 0; s <= S_MAX; s += 1) {
+      el('line', { x1: X(s), y1: S_TOP, x2: X(s), y2: H - RULER + 4, stroke: C.grid, 'stroke-width': 1 }, svg);
+      txt(X(s), H - RULER + 18, '+' + s + ' s', { 'text-anchor': 'middle', 'font-variant-numeric': 'tabular-nums' }, svg);
+    }
+    txt(W - RIGHT, H - RULER + 18, 'after the last spoken word →', { 'text-anchor': 'end' }, svg);
+
+    STRIP.forEach((row, i) => {
+      const yMid = S_TOP + i * ROW_H + ROW_H / 2 + 2;
+      const bh = 14;
+      txt(GUTTER - 12, yMid + 4, row.name, { 'text-anchor': 'end', fill: C.ink2, 'letter-spacing': '0.06em', 'font-size': 10.5 }, svg);
+      // yellow: wait for first token
+      const r1 = el('rect', { x: X(0), y: yMid - bh / 2, width: Math.max(X(row.ttft) - X(0), 2), height: bh,
+                              fill: C.prefill, opacity: 0.85, rx: 2 }, svg);
+      bindTip(r1, `<b>${row.name}</b><br>silence until first token: <b>${row.ttft.toFixed(2)} s</b>`);
+      // violet: decode to first sentence (2px surface gap between fills)
+      const r2 = el('rect', { x: X(row.ttft) + 2, y: yMid - bh / 2, width: Math.max(X(row.ttfs) - X(row.ttft) - 2, 2), height: bh,
+                              fill: C.reply, opacity: 0.85, rx: 2 }, svg);
+      bindTip(r2, `<b>${row.name}</b><br>first token → first sentence: <b>${(row.ttfs - row.ttft).toFixed(2)} s</b><br>${row.note}`);
+      // direct labels: sentence total at the bar end
+      txt(X(row.ttfs) + 8, yMid + 4, '+' + row.ttfs.toFixed(2) + ' s',
+          { fill: row.good ? C.good : C.ink, 'font-size': 11, 'font-variant-numeric': 'tabular-nums' }, svg);
+    });
+  }
+
+  render('pA');
+  render('pB');
+  renderStrip();
+})();
+</script>
