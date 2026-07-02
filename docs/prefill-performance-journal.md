@@ -801,3 +801,52 @@ Harness kept: .scratch/ttft_llama.py (also on cortex ~/). Pitfalls it
 guards: cache_prompt default drift, reasoning_content deltas, timings only
 in the final stream chunk, and the warm-up turn (first llama turn runs
 ~2-7x slow on Orin while buffers settle).
+
+## 2026-07-02 — Orin power study: full utilization at half the power budget
+
+Question: does little-gemma push the MAXN (40 W) envelope? Method: tegrastats
+at 500 ms, timestamped, phase-marked (harness kept as .scratch/power_run*.sh +
+parse_power.py, also on cortex ~/); clocks pinned except the DVFS idle cell;
+VDD_IN is total module input — what a battery sees.
+
+| phase | sec | VDD_IN avg | peak | CPU_GPU_CV | SOC | GPU% |
+|---|---:|---:|---:|---:|---:|---:|
+| idle, pinned clocks, no server | 20 | 7.26 W | 7.33 | 1.95 | 2.40 | 0 |
+| idle, 12B resident | 20 | 7.23 W | 7.37 | 1.95 | 2.36 | 0 |
+| prefill 12B (5x928-tok turns) | 30 | 19.48 W | 20.79 | 10.10 | 4.20 | 99 |
+| decode 12B (1024 tok) | 132 | 22.22 W | 23.00 | 10.75 | 5.46 | 99 |
+| camera bursts 12B (x6) | 16 | 21.34 W | 23.00 | 10.66 | 4.97 | 98 |
+| decode 12B + MTP (1024 tok) | 114 | 20.67 W | 21.14 | 10.52 | 4.70 | 99 |
+| prefill E4B (5x928) | 12 | 18.69 W | 19.38 | 9.55 | 4.08 | 97 |
+| decode E4B (1024 tok) | 65 | 20.04 W | 21.07 | 9.47 | 4.95 | 99 |
+| idle, DVFS (nvpmodel re-applied) | 20 | 6.15 W | 6.30 | 0.79 | 2.42 | 0 |
+| idle, re-pinned | 8 | 7.45 W | 7.64 | 2.08 | 2.40 | 0 |
+
+Findings:
+
+- **Peak 23.0 W against a 40 W profile, at GR3D 99%.** Full utilization at
+  ~55% of the power budget is exactly what a bandwidth-bound workload looks
+  like: the SMs are busy WAITING on LPDDR, not burning ALU power. Decode
+  (every weight streamed per token) is the hungriest phase and shows the
+  highest SOC rail (5.46 W — the memory controller); compute-denser prefill
+  is 2.7 W CHEAPER despite the same 99% utilization. Perf on this board is
+  memory-limited, never power- or thermal-limited.
+- **Energy per output token (VDD_IN x time / tokens):** 12B plain
+  **2.85 J/tok** (22.22 W, 7.8 tok/s); 12B + MTP **2.29 J/tok** (20.67 W,
+  9.0 tok/s at 45.7% prose acceptance) — speculative decoding is 16% faster
+  AND 20% cheaper per token, since accepted drafts share weight passes;
+  E4B **1.27 J/tok**. Prefill: ~113 J per 1k prompt tokens (12B),
+  ~45 J/1k (E4B). A camera burst turn (12B, 130-tok frame + short reply)
+  is ~56 J.
+- **jetson_clocks costs ~1.1 W at idle** (7.26 vs 6.15 W DVFS; CPU_GPU_CV
+  1.95 vs 0.79 W). For battery products, leave DVFS on — under sustained
+  load it reaches max clocks anyway; pinning is a BENCH discipline, not a
+  deployment setting. Idle floor is ~6.2 W even in DVFS (carrier board +
+  SOC rails; deeper sleep states untouched here).
+- CPU stays ~0% in every phase — the runner idle-waits on the GPU by
+  design. Whisper (voicecat) will claim CPU headroom without touching the
+  GPU budget.
+- Battery arithmetic for a 100 Wh pack: ~16 h idle (DVFS, model resident),
+  ~4.5 h of continuous 12B conversation, ~5 h with MTP, ~7.9 h E4B — and a
+  10%-duty camera assistant (one burst every ~10 s over DVFS idle) lands
+  around ~9 h.
