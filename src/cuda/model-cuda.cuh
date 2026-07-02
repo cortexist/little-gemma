@@ -188,7 +188,14 @@ __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos,
 // The chunk form: row r holds the chunk's r-th token, at position *d_pos + r.
 // A separate kernel (not a `rows` parameter) so the decode graph keeps the
 // division-free original — its tiny latency-bound nodes notice every cycle.
-__global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff,
+// The chunk form takes a PRECOMPUTED frequency table: the frequency depends
+// only on i — hd/2 distinct values — yet the inline form recomputed powf per
+// (row, head, i), ~2M powf per 960-row launch, measured 84% SM (saturated on
+// transcendentals) on the Orin. The table is built ON DEVICE by the same powf
+// with the same inputs, so the stored bits — and every downstream angle — are
+// identical. Decode's rope_kernel keeps its inline powf (frozen in the graph;
+// one row's worth is noise there).
+__global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_pos, const float *tab, const float *ff,
                                      int total, int rows) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total * rows) return;
@@ -196,10 +203,28 @@ __global__ static void rope_n_kernel(float *v, int half, int hd, const int *d_po
     int pos = *d_pos + row;
     int head = rem / half, i = rem % half;
     float *vh = v + (size_t)row * (total / half) * hd + (size_t)head * hd;
-    float freq = powf(base, -2.0f * (float)i / (float)hd);
-    float ang = (float)pos * freq / (ff ? ff[i] : 1.0f);
+    float ang = (float)pos * tab[i] / (ff ? ff[i] : 1.0f);
     float c = cosf(ang), s = sinf(ang), a = vh[i], b = vh[i + half];
     vh[i] = a * c - b * s; vh[i + half] = a * s + b * c;
+}
+__global__ static void rope_tab_kernel(float *tab, float base, int hd, int half) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < half) tab[i] = powf(base, -2.0f * (float)i / (float)hd);
+}
+// tiny (base, hd) -> device-table cache, built lazily on the prefill path
+// (prefill runs uncaptured, so the one-time cudaMalloc + launch are safe).
+static const float *rope_tab(float base, int hd) {
+    static struct { float base; int hd; float *tab; } slots[4];
+    for (int s = 0; s < 4; s++) {
+        if (slots[s].tab && slots[s].base == base && slots[s].hd == hd) return slots[s].tab;
+        if (!slots[s].tab) {
+            CUDA_CHECK(cudaMalloc(&slots[s].tab, (size_t)(hd / 2) * 4));
+            rope_tab_kernel<<<gridn(hd / 2), 256>>>(slots[s].tab, base, hd, hd / 2);
+            slots[s].base = base; slots[s].hd = hd;
+            return slots[s].tab;
+        }
+    }
+    return NULL;  // >4 (base, hd) combos never happens for Gemma; NULL faults loudly
 }
 
 // Attention for one query position: one block per query head. pos is device-
@@ -1345,11 +1370,11 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         pf_tick(&g_pf_mm);
         rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
-        rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, base, ff, n_head * hd / 2, B);
+        rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, rope_tab(base, hd), ff, n_head * hd / 2, B);
         if (has_kv) {
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
-            rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2, B);
+            rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, rope_tab(base, hd), ff, n_head_kv * hd / 2, B);
             if (kv->f16[L]) {                              // global layer: rows round through f16
                 kv_write_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->k[L], dkb, d_pos, kv_dim, B);
                 kv_write_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->v[L], dvb, d_pos, kv_dim, B);
