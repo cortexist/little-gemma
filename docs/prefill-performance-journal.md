@@ -230,6 +230,56 @@ instruction-count wall) and save ring memory, worth ≈ +1–3% prefill and
 DECODE (SWA layers) and touching every ring read/write path. Revisit only
 if long-context decode becomes the priority.
 
+## Session: the Orin push — Phase 0 (2026-07-02): measure before planning
+
+Goal: parity-or-better vs llama.cpp prefill ON THE ORIN. Phase 0 re-measured
+everything on pinned clocks (MAXN + `jetson_clocks`; GPU locked 918 MHz)
+before any plan — and the corrections were large.
+
+**Corrected baselines (warm serve, 929-token turns, same day/clocks):**
+
+| | little-gemma | llama.cpp (fa1, `-mmp 0`) | ratio |
+|---|---:|---:|---|
+| 12B | **162.3** (was believed 125) | 216.8 | **0.75×** |
+| E4B | **381.4** (was believed 246) | 510.3 | **0.75×** |
+
+The one-shot `-p` numbers understated by 30–55%: each process paid the q6/q3
+repack inside the prompt timer and ran on unpinned clocks. Decode stays
+ahead (12B 8.0 vs 7.55). Also: 12B llama-bench needs dropped page caches +
+`-mmp 0` on the 16 GB board or NvMap alloc fails.
+
+**Gap anatomy (12B: ours 5.72 s vs llama 4.28 s — find 1.44 s):**
+matmul 4.19 s (q4k 3.27 + q6k 0.91), attention 0.67, elementwise 0.73.
+
+**ncu ON THE ORIN IS SAFE** with single-launch, minimal-section captures
+(SpeedOfLight + WarpStateStats, ~13 passes; ncu 2024.3/JetPack current) —
+the old board resets don't reproduce. That unlocks device-truth stall data:
+
+- q4k ffn launches: **SM 53.4%** — up from June's 44.6% (the A-staging
+  pipeline transferred); llama's kernel measured 57.5% here, so the big
+  matmul is within ~8% of their efficiency now. SMALL launches still stall
+  hard on long_scoreboard (0.9–1.2): Orin's uncached zero-copy qs loads
+  outlast the 1-deep prefetch window (A5000's L2 latency did not). The
+  2-deep prefetch that WASHED on the A5000 is exactly what this wants —
+  device verdicts invert, fourth occurrence.
+- q6k: SM 38%, **lg_throttle 0.58** + long_sb — the staging is ld32-only
+  because `block_q6_Kr` is 4-byte-aligned. The repack layout is OURS: pad
+  it to 16 bytes and stage with uint4 (4× fewer LSU instructions) — the
+  June wide-loads lesson, unapplied to this kernel.
+- Re-falsified with today's kernels: `LG_NO_ZEROCOPY` device-copied weights
+  (±swapxy) are all ~2–4% WORSE on E4B — same DRAM either way, and 4 MB of
+  L2 doesn't hold the working set. The reject-list verdict holds.
+
+**Phase 1 plan (ordered by expected yield):**
+1. q6_K 16-aligned repack + uint4 staging (0.91 s at ~2.4× its BW floor).
+2. Integrated-gated deeper A-staging prefetch (2-deep, maybe 3) for the
+   small-launch long_sb.
+3. Flash + elementwise Orin captures → targeted fixes (0.67 + 0.73 s pool).
+4. Chunk-width sweep on Orin under the corrected serve harness
+   (`/tmp/bench-serve-orin.sh` methodology; port into `.scratch/`).
+Deep-read of llama.cpp's Orin-side non-matmul path (their ~0.5–0.9 s vs our
+1.55 s) is the candidate for a fan-out workflow if 1–4 fall short of parity.
+
 ### Where this leaves prefill
 
 The whole 2026-07-01/02 arc, all gates green on both devices:
