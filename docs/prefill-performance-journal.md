@@ -936,3 +936,24 @@ like a live mic, and whisper runs with timestamps so confirmed segments trim
 out of the window (trimmed text rides --prompt as context). Real whisper.cpp
 on the board remains the one missing production piece (external-source
 install pending user approval).
+**Addendum — real ears (whisper.cpp, CUDA base.en, user-installed at
+~/repos/whisper.cpp):** the full pipeline runs end-to-end on the 12B: a 30 s
+simulated stream commits 46 words live (t=5.6/10.9/16.0/19.4/26.1 s), trims
+the window four times, and closes 1.0 s after end-of-speech. Three tunings
+came out of the real measurements (tools cceae5c): mid-passes gate off once
+trailing silence accumulates; the final pass is REUSED from the last
+mid-pass when no voiced frame followed it (last_voice tracking); and the
+commit cadence rule is ≥3× one ASR invocation (default now 2500 ms —
+at 1000 ms the loop fell 12 s behind a 30 s utterance).
+
+The honest surprise: this CUDA base.en costs ~0.55 s per invocation FLAT —
+30 s of audio transcribes in barely more than 2 s of audio does, because
+process+model load dominates. So on THIS stack the naive single end-pass is
+~0.7 s faster than streaming, at any practical utterance length. Streaming
+transcripts earn their keep as UX (live partial understanding), as bounded
+memory, and as LATENCY the moment ASR slows down: CPU whisper (the
+deployment that keeps the GPU exclusively for the LLM — likely the real
+product choice), larger whisper models, or long dictation. And the
+production upgrade that flips the verdict unconditionally is a PERSISTENT
+whisper (server mode / linked libwhisper): it deletes the per-pass load
+cost that is the entire naive advantage.
