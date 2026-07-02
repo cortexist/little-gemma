@@ -417,8 +417,8 @@ request byte sent → first streamed token, warm server, first turn
 discarded, prompt caching off, same GGUFs, token parity checked
 (2026-07-02, medians of warm turns):
 
-| device | turn | little-gemma ttft / prefill | llama-server ttft / prefill | tokens (lg / llama) |
-|--------|------|----------------------------:|----------------------------:|:-------------------:|
+| device | turn | little-gemma ttft / prefill | llama-server ttft / prefill | input tokens (lg / llama) |
+|--------|------|----------------------------:|----------------------------:|:-------------------------:|
 | A5000 | 12B, 929-tok text | **0.51 s** / 1,803 | 0.53 s / 1,753 | 928 / 928 |
 | A5000 | E4B, 929-tok text | 0.25 s / 3,717 | **0.23 s** / 4,070 | 928 / 928 |
 | A5000 | 12B, image+question | **0.20 s** / 827 | 0.29 s / 715 | 150 / 157 |
@@ -431,9 +431,16 @@ discarded, prompt caching off, same GGUFs, token parity checked
 The prefill column is tok/s over the whole turn: ours from the serve stat
 (everything after the burst, media included), llama's from its own
 server-reported `prompt_n/prompt_ms` — which *excludes* its media encoder
-(visible as ttft − prompt_ms ≈ 0.25–0.43 s on the Orin image rows). Text
-turns track the known kernel ratio (ours ~0.86× in serving, a touch better
-than llama-bench's 0.80× — their server stack costs more than ours).
+(visible as ttft − prompt_ms ≈ 0.25–0.43 s on the Orin image rows). The
+last column is the **number of input (prompt) tokens** each stack processed
+for the same turn — a count, not a rate: text rows differ only by BOS
+accounting, image rows differ where preprocessing policy differs. Prefill
+rate and TTFT are related but deliberately not 1:1 — the first-decode step,
+chunk padding, encoders, and arrival overlap all live in one and not the
+other; **[docs/prefill-vs-ttft.md](docs/prefill-vs-ttft.md)** walks through
+it. Text turns track the known kernel ratio (ours ~0.86× in serving, a
+touch better than llama-bench's 0.80× — their server stack costs more than
+ours).
 **Media turns invert it**: 1.5–2.4× ahead, and the 12B image rows are
 near-token-equal (both encode natively), so that win is not a policy
 artifact. The E4B token counts differ by upstream policy — the fork
