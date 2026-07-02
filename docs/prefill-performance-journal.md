@@ -208,19 +208,47 @@ Worked the "next levers" list on merged main:
 1428-turn 1724, 4096 cold 941; E4B **3602** (~0.69×). Orin 12B **125**,
 E4B **246**. Day cumulative: A5000 3.3×/3.5×, Orin 1.23×/1.28×.
 
-### Next levers
+### Round 6 (same day): the exhaustion sweep — every remaining lever measured
 
-1. **Flash V path** — mio-throttle from strided `fa_rd1` single-half V
-   loads; staging V costs 16 KB more shared (→1 CTA/SM, occupancy halves),
-   so it needs a smarter layout (e.g. V staged f16 through the freed sS
-   space, or a kv_dim-major V ring). Matters more as context grows.
-2. **f16 SWA rings (PROPOSAL, numerics-changing)** — would remove the
-   f32→f16 conversion entirely, halve K/V ring bytes AND ring memory, and
-   make decode attention reads cheaper too. Precedent: the f16-KV global
-   layers step shipped with a quality gate instead of byte-identity. Needs
-   a user decision (changes decode numerics on SWA layers).
-3. **q6_K L2 tuning** — its 3 MB row-tiles overflow a 4-row-tile wave's L2
-   share even swapped; a wpc/rows-per-CTA rebalance might buy a few %.
+All candidates tried, every verdict wiring-verified; falsifications are
+results too:
+
+| lever | result |
+|---|---|
+| **V re-staged through the freed sK buffer** (transposed f16, PV fragment = one aligned LDS.32, zero extra shared) | **falsified**: kernel 856 → 991 µs. The stage sweep sits in a window with no work to hide behind — the direct V loads at least overlapped the mma FLOPs. long_sb went back up (2.5 → 3.6). |
+| **V fragments pipelined one n-iteration ahead** (the qs-pipeline pattern, third application) | **neutral**: 871 vs 856 µs, mio unchanged at 5.24 — the compiler already schedules those unrolled loads. mio_throttle is instruction COUNT; no pipelining fixes that. |
+| **2048-wide chunks** (PREFILL_MAX_B 2048, 4096-token prompt: 2×2048 vs 4×1024) | **neutral-to-negative**: 927 vs 937 tok/s, byte-identical. swapxy's L2 sharing already captured the weight-reuse win; 1024 stays. |
+| **2-superblock-deep qs prefetch** (round 5) | wash — rotation copies eat it. |
+| rmsnorm chunk-twin with warp-quant epilogue | not built: the real-aq prefill norms are ~4 ms per 2870 tokens; ceiling ≈ +0.25% for a duplicated kernel. |
+| q6_K wpc rebalance for L2 | not isolated (the wpc knob is shared with q4_K); ceiling ≈ +1% on the 15%-of-matmul q6_K share. |
+
+**f16 SWA rings — assessed, recommended AGAINST (for now).** On inspection
+the payoff shrank: the K-stage already removed the f32→f16 conversion from
+the hot path; f16 rings would halve K/V ring bytes (latency, not the mio
+instruction-count wall) and save ring memory, worth ≈ +1–3% prefill and
++2–3% decode at long context — against breaking the byte-identity gate on
+DECODE (SWA layers) and touching every ring read/write path. Revisit only
+if long-context decode becomes the priority.
+
+### Where this leaves prefill
+
+The whole 2026-07-01/02 arc, all gates green on both devices:
+
+| | day start | now | vs llama.cpp |
+|---|---:|---:|---|
+| A5000 12B warm serve | 533 | **~1760** | 0.24× → **0.78×** |
+| A5000 E4B warm serve | 1020 | **3602** | 0.21× → **~0.69×** |
+| Orin 12B / E4B | 102 / 192 | **125 / 246** | — (records) |
+
+Post-sweep, every stall class in the two dominant kernels is either fixed
+or measured at its structural floor: the mma kernel is balanced-stalled at
+2 warps/scheduler (the "codegen, not a formula" wall, now confirmed with
+counters from five angles), and the flash kernel is mio-instruction-count
+bound on strided V. The residual vs llama.cpp is their ground-up MMQ
+schedule; closing it means writing that kernel, which the stream-K
+experiment already priced (docs/stream-k-experiment.md) and the project
+declined. This design family is exhausted — further prefill work should
+wait for new evidence or new hardware.
 3. ~~Orin re-validation~~ **DONE (same day, worktree `~/lg-wide` on cortex,
    branch applied via patch series):**
    - Byte-identity narrow-vs-default at 4096 tokens (ring wrap exercised
