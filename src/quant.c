@@ -80,6 +80,12 @@ typedef struct {                 // Q8_0: 34 bytes
     int8_t    qs[32];
 } block_q8_0;
 
+typedef struct {                 // Q4_0: 18 bytes — the QAT release format
+    ggml_half d;
+    uint8_t   qs[16];            // element j in the low nibble, j+16 in the high
+} block_q4_0;
+
+_Static_assert(sizeof(block_q4_0) ==  18, "block_q4_0 layout");
 _Static_assert(sizeof(block_q3_K) == 110, "block_q3_K layout");
 _Static_assert(sizeof(block_q4_K) == 144, "block_q4_K layout");
 _Static_assert(sizeof(block_q5_K) == 176, "block_q5_K layout");
@@ -92,6 +98,7 @@ const char *ggml_type_name(uint32_t type) {
     switch (type) {
         case GGML_TYPE_F32:  return "f32";
         case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_Q4_0: return "q4_0";
         case GGML_TYPE_Q8_0: return "q8_0";
         case GGML_TYPE_Q2_K: return "q2_K";
         case GGML_TYPE_Q3_K: return "q3_K";
@@ -108,6 +115,7 @@ int ggml_blck_size(uint32_t type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16: return 1;
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0: return 32;
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -122,6 +130,7 @@ size_t ggml_type_size(uint32_t type) {
         case GGML_TYPE_F32:  return 4;
         case GGML_TYPE_F16:  return 2;
         case GGML_TYPE_BF16: return 2;
+        case GGML_TYPE_Q4_0: return sizeof(block_q4_0);
         case GGML_TYPE_Q8_0: return sizeof(block_q8_0);
         case GGML_TYPE_Q3_K: return sizeof(block_q3_K);
         case GGML_TYPE_Q4_K: return sizeof(block_q4_K);
@@ -264,6 +273,17 @@ static void dequant_q8_0(const block_q8_0 *x, float *y, int nb) {
     }
 }
 
+static void dequant_q4_0(const block_q4_0 *x, float *y, int nb) {
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);
+        for (int l = 0; l < 16; ++l) {
+            y[l]      = d * (int)((x[i].qs[l] & 0xF) - 8);
+            y[l + 16] = d * (int)((x[i].qs[l] >>  4) - 8);
+        }
+        y += 32;
+    }
+}
+
 // Dequantize `n` elements of `type` from `src` into `y`. `n` must be a whole
 // number of blocks. Returns false for an unsupported type.
 static bool deq_n(uint32_t type, const void *src, float *y, int64_t n) {
@@ -282,6 +302,7 @@ static bool deq_n(uint32_t type, const void *src, float *y, int64_t n) {
             for (int64_t i = 0; i < n; i++) y[i] = bf16_to_fp32(h[i]);
             break;
         }
+        case GGML_TYPE_Q4_0: dequant_q4_0(src, y, nb); break;
         case GGML_TYPE_Q8_0: dequant_q8_0(src, y, nb); break;
         case GGML_TYPE_Q3_K: dequant_q3_K(src, y, nb); break;
         case GGML_TYPE_Q4_K: dequant_q4_K(src, y, nb); break;

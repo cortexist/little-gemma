@@ -172,12 +172,21 @@ int model_init(struct model *m, const struct gguf_context *ctx) {
         const struct gguf_tensor *q = gguf_find_tensor(ctx, name);
         snprintf(name, sizeof name, "blk.%d.attn_k.weight", L);
         const struct gguf_tensor *k = gguf_find_tensor(ctx, name);
-        if (!q || !k || m->cfg.n_head == 0) {
+        if (!q || m->cfg.n_head == 0 || (!k && L < m->cfg.n_kv_start)) {
             fprintf(stderr, "model: missing attn_q/attn_k for layer %d\n", L);
             return -1;
         }
-        m->head_dim[L]  = (int)(q->dims[1] / (uint64_t)m->cfg.n_head);
-        m->n_head_kv[L] = (int)(k->dims[1] / (uint64_t)m->head_dim[L]);
+        m->head_dim[L] = (int)(q->dims[1] / (uint64_t)m->cfg.n_head);
+        if (k) {
+            m->n_head_kv[L] = (int)(k->dims[1] / (uint64_t)m->head_dim[L]);
+        } else {
+            // A kv-shared layer with no attn_k: QAT exports prune the dead
+            // k/v projections there (the layer only reads its source layer's
+            // cache, and the forwards never compute k/v past n_kv_start).
+            // It inherits the source layer's geometry — sources all precede
+            // n_kv_start, so theirs is already derived.
+            m->n_head_kv[L] = m->n_head_kv[m->cfg.n_kv_start - (m->is_local[L] ? 2 : 1)];
+        }
     }
 
     // scratch for the MTP draft head's h_prev (filled by the backend's forward)

@@ -47,6 +47,7 @@ typedef struct { uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; 
 typedef struct { ggml_half d, dmin; uint8_t scales[12]; uint8_t qh[QK_K/8]; uint8_t qs[QK_K/2]; } block_q5_K;
 typedef struct { uint8_t ql[QK_K/2]; uint8_t qh[QK_K/4]; int8_t scales[QK_K/16]; ggml_half d; } block_q6_K;
 typedef struct { ggml_half d; int8_t qs[32]; } block_q8_0;
+typedef struct { ggml_half d; uint8_t qs[16]; } block_q4_0;   // elem j low nibble, j+16 high
 
 __device__ static float d_fp16(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu, bits;

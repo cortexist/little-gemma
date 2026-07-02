@@ -70,6 +70,13 @@ __device__ static void dot_block_q8_0(const block_q8_0 *p, int lane, const float
     float d = d_fp16(p->d);
     for (int e = lane; e < 32; e += 32) s += (d * p->qs[e]) * xb[e];
 }
+__device__ static void dot_block_q4_0(const block_q4_0 *p, int lane, const float *xb, float &s) {
+    float d = d_fp16(p->d);
+    for (int e = lane; e < 32; e += 32) {
+        int q = e < 16 ? (p->qs[e] & 0xF) : (p->qs[e - 16] >> 4);
+        s += (d * (q - 8)) * xb[e];
+    }
+}
 
 // out[i] = W[i,:] . x : one warp per output row; the whole warp cooperates on each
 // block and reduces with a shuffle.
@@ -90,6 +97,7 @@ __global__ static void matmul_q_kernel(float *out, const unsigned char *wbase,
             case GGML_TYPE_Q5_K: dot_block_q5_K((const block_q5_K *)blk, lane, xb, s); break;
             case GGML_TYPE_Q6_K: dot_block_q6_K((const block_q6_K *)blk, lane, xb, s); break;
             case GGML_TYPE_Q8_0: dot_block_q8_0((const block_q8_0 *)blk, lane, xb, s); break;
+            case GGML_TYPE_Q4_0: dot_block_q4_0((const block_q4_0 *)blk, lane, xb, s); break;
             case GGML_TYPE_F32:  if (lane == 0) s += (*(const float *)blk) * xb[0]; break;
             case GGML_TYPE_BF16: if (lane == 0) s += d_bf16(*(const uint16_t *)blk) * xb[0]; break;
             case GGML_TYPE_F16:  if (lane == 0) s += d_fp16(*(const uint16_t *)blk) * xb[0]; break;

@@ -13,6 +13,7 @@
 enum ggml_type {
     GGML_TYPE_F32  = 0,
     GGML_TYPE_F16  = 1,
+    GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q8_0 = 8,
     GGML_TYPE_Q2_K = 10,
     GGML_TYPE_Q3_K = 11,
