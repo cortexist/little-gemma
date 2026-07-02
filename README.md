@@ -464,7 +464,7 @@ prose-shaped questions so the first sentence is a real one:
 | Orin | 12B, 929-tok text | 9.23 s | **8.47 s** | 29 tok, same words |
 | Orin | E4B, 929-tok text | 3.43 s | **3.21 s** | 19 tok, same words |
 | Orin | 12B, image+question | **5.22 s** | 98.6 s | thought: short vs 717 tok |
-| Orin | E4B, image+question | **1.98 s** | ≈18 s† | † cell lost to a board fs incident; A5000 thought length × Orin decode |
+| Orin | E4B, image+question | **1.98 s** | 35.8 s | thought: ~0 vs 481 tok |
 
 Text rows are the clean kernel story: identical prompt bytes produce the
 identical first sentence on both stacks, so TTFS = TTFT + the same tokens

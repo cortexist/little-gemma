@@ -895,3 +895,13 @@ Full table in the README; the shape:
   read-only event of the day (mid-run, last cell); estimated from the
   A5000 thought length at Orin decode rate. The recurrence strengthens
   the suspect-the-NVMe-medium note in the ops ledger.
+**Addendum (same day, post power-cycle):** the lost Orin llama-E4B-image
+cell measured 35.8 s (481-token thought — the ≈18 s estimate was 2×
+optimistic), vs ours 1.98 s. And the read-only mystery moved: smartmontools
+(now installed on the board) reports ZERO media/data-integrity errors and an
+empty error log — but 73 °C on the NVMe near-idle, with heavy accumulated
+thermal-transition time. The two same-day read-only events both followed
+hours of sustained bench load: the suspect is now NVMe THERMAL throttling /
+link stall, not a failing medium. Fix is airflow or a heatsink pad on the
+SSD, and the ops rule stands: check `mount` shows rw before trusting any
+Orin run.
