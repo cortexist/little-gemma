@@ -850,3 +850,48 @@ Findings:
   ~4.5 h of continuous 12B conversation, ~5 h with MTP, ~7.9 h E4B — and a
   10%-duty camera assistant (one burst every ~10 s over DVFS idle) lands
   around ~9 h.
+
+## 2026-07-02 — TTFS: time to the first speakable sentence
+
+Voice-to-voice products (TTS on the output) do not feel TTFT; they feel the
+moment the first complete sentence exists, because that is when a
+sentence-chunking TTS can start speaking — the industry calls the
+end-to-end version voice-to-voice latency / time-to-first-audio, and the
+LLM-side component first-sentence latency. TTFS = TTFT + (first-sentence
+tokens at decode rate) + (the WHOLE thought channel first, if the model
+thinks — thought is not speakable). Both harnesses now measure it
+(.scratch/ttft_send.py, .scratch/ttft_llama.py): a scanner fires at the
+first [.!?] followed by whitespace/closer in the SPEAKABLE stream, with
+<|channel>…<channel|> spans and special tokens stripped; unterminated
+thought spans correctly suppress it. llama-server needs --reasoning-format
+none so its stream is byte-symmetric with our wire (its default parser
+routes these models' entire replies into delta.reasoning_content).
+Questions were made prose-shaped ("…explain in two or three sentences…" /
+"Describe this image in two sentences.") so the first sentence is real.
+Full table in the README; the shape:
+
+- TEXT is the clean kernel comparison: identical prompt bytes → the
+  identical greedy first sentence on both stacks (29 tok on the 12B, 19 on
+  the E4B), so TTFS differences are pure TTFT + decode-rate. On the A5000
+  our decode edge erases llama's TTFT lead within one sentence (1.27 vs
+  1.28 s); on the Orin their prefill lead survives but shrinks (E4B: 0.32 s
+  of TTFT gap becomes 0.22 s of TTFS gap).
+- IMAGE inverts by an order of magnitude: ours 0.78/0.25 s (A5000
+  12B/E4B) and 5.22/1.98 s (Orin) vs llama 8.9/4.7 s and 98.6/≈18 s. Two
+  compounding causes: the media-TTFT levers, and the fork's chat template
+  eliciting a 466–717-token thinking process before the first speakable
+  word (~92 of llama's 98.6 s on the Orin 12B is thought at 7.4 tok/s).
+  Our serve template gets a terse thought from the same weights. Even
+  with their thought subtracted entirely, our media TTFS leads — but the
+  headline lesson is that TEMPLATE-INDUCED THOUGHT LENGTH dwarfs every
+  kernel in the stack for voice latency. Keeping thinking terse via -sys
+  is a first-class voice optimization; MTP (which chews thought ~1.2–2×
+  faster) is another.
+- Ours-A5000 TTFS cells are composed (client AF_UNIX python is unavailable
+  on Windows): ttft-stat + decode-time × char-fraction to the fire point in
+  the captured reply — decode is constant-rate, so the composition is
+  sound. Orin cells are direct client-side clocks.
+- The Orin llama-E4B-image cell was lost to the board's SECOND NVMe
+  read-only event of the day (mid-run, last cell); estimated from the
+  A5000 thought length at Orin decode rate. The recurrence strengthens
+  the suspect-the-NVMe-medium note in the ops ledger.

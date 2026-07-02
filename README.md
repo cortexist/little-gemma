@@ -450,6 +450,35 @@ the clip streams) has no llama-server counterpart at all — those numbers
 (Orin 12B six-frame video ttft 8.79 → 2.34 s) are measured against our own
 deferred baseline.
 
+**TTFS** (time to first *speakable* sentence — when a sentence-chunking TTS
+can start talking, the metric a voice product feels; thought channels are
+not speakable and delay it at decode rate). Same clocks and discipline,
+prose-shaped questions so the first sentence is a real one:
+
+| device | turn | little-gemma ttfs | llama-server ttfs | first sentence |
+|--------|------|------------------:|------------------:|:--------------:|
+| A5000 | 12B, 929-tok text | **1.27 s** | 1.28 s | 29 tok, same words |
+| A5000 | E4B, 929-tok text | **0.51 s** | 0.54 s | 19 tok, same words |
+| A5000 | 12B, image+question | **0.78 s** | 8.9 s | thought: ~0 vs 528 tok |
+| A5000 | E4B, image+question | **0.25 s** | 4.7 s | thought: ~0 vs 466 tok |
+| Orin | 12B, 929-tok text | 9.23 s | **8.47 s** | 29 tok, same words |
+| Orin | E4B, 929-tok text | 3.43 s | **3.21 s** | 19 tok, same words |
+| Orin | 12B, image+question | **5.22 s** | 98.6 s | thought: short vs 717 tok |
+| Orin | E4B, image+question | **1.98 s** | ≈18 s† | † cell lost to a board fs incident; A5000 thought length × Orin decode |
+
+Text rows are the clean kernel story: identical prompt bytes produce the
+identical first sentence on both stacks, so TTFS = TTFT + the same tokens
+at each stack's decode rate — on the A5000 our decode edge erases llama's
+TTFT lead by the end of the sentence (1.27 vs 1.28 s), on the Orin their
+prefill lead survives but shrinks. The image rows are the product story,
+and two effects compound: the media-TTFT levers above, and **the thought
+channel** — llama-server's chat template elicits a 466–717-token "thinking
+process" from these models before the first speakable word, paid at decode
+rate; our serve template gets a terse thought from the same weights. Even
+subtracting their thought entirely, our media TTFS still leads — but the
+lesson generalizes: for voice, the prompt template's effect on thought
+length dwarfs every kernel in the stack (see `-sys`).
+
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
 Both **no CUDA, no SIMD intrinsics, 12 threads**, single-token generation:
