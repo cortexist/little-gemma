@@ -598,25 +598,38 @@ __device__ __forceinline__ void fa_mma(float &c0,float &c1,float &c2,float &c3,
 // decode, verify). For a media chunk the key loop extends to bidir_hi (the span's
 // last position, which can sit past a query's own position) and same-span keys are
 // unmasked regardless of causal/window — that is the frame attending to itself.
-template<int HD, bool RING, typename KT>
-__global__ static void __launch_bounds__(256)
+// G packs the G query-heads of one KV group into a single CTA (G=2 on gemma's
+// gqa-2 SWA layers): a 32*G-row Q tile over the same 32 query positions, so
+// each staged K block and each strided V fragment is fetched ONCE for all G
+// heads — the kernel is mio-instruction-count bound (Orin SM 25.8%, mio 4.7;
+// A5000 mio 5.2), and G=2 halves that count. Rows [0,32) are head head0's 32
+// queries, rows [32,64) head0+1's; a row's mask depends only on its query
+// POSITION, so row b and b^32 mask identically. G=1 is byte-for-byte the old
+// kernel (every loop collapses to the old bounds). Shared memory is dynamic
+// (G=2 at hd 256 needs ~62 KB, past the 48 KB static limit).
+template<int HD, bool RING, typename KT, int G>
+__global__ static void __launch_bounds__(256, 2)
 flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
                     int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
                     const int *seg, int bidir_hi){
-    const int FKB = 32, FHDW = HD/8;                       // keys/block; PV hd-slice per warp
-    __shared__ __half sQ[32*HD];
-    __shared__ float  sS[32*FKB];
-    __shared__ __half sP[32*FKB];
-    __shared__ float  sm[32], sl[32], sc[32];
-    const int head=blockIdx.x, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
-    const int gid=lane>>2, tid=lane&3, kvh=head/gqa, pos0=*d_pos;
+    const int FKB = 32, FHDW = HD/8, ROWS = 32*G;          // keys/block; PV hd-slice per warp
+    const bool KSTAGE = HD == 256 && sizeof(KT) == 4;      // see the K-stage note below
+    extern __shared__ unsigned char fsh[];
+    __half *sQ = (__half*)fsh;                                            // [ROWS*HD]
+    float  *sS = (float*)(fsh + (size_t)ROWS*HD*2);                       // [ROWS*FKB]
+    __half *sP = (__half*)(fsh + (size_t)ROWS*HD*2 + ROWS*FKB*4);         // [ROWS*FKB]
+    float  *sm = (float*)(fsh + (size_t)ROWS*HD*2 + ROWS*FKB*6);          // [ROWS] x3
+    float  *sl = sm + ROWS, *sc = sl + ROWS;
+    __half *sK = (__half*)(sc + ROWS);                                    // [KSTAGE ? 32*(HD+8) : 0]
+    const int head0=blockIdx.x*G, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
+    const int gid=lane>>2, tid=lane&3, kvh=head0/gqa, pos0=*d_pos;
     const int qbase=blockIdx.y*32, qn=(B-qbase<32)?(B-qbase):32;   // this CTA's 32-query tile (blockIdx.y); B>32 tiles over y
-    float acc[2][FHDW/8][4];
+    float acc[2*G][FHDW/8][4];
     #pragma unroll
-    for(int m=0;m<2;m++)for(int n=0;n<FHDW/8;n++)for(int c=0;c<4;c++)acc[m][n][c]=0.0f;
-    for(int Q=tix;Q<32;Q+=256){ sm[Q]=-1e30f; sl[Q]=0.0f; }
-    for(int t=tix;t<32*HD;t+=256){ int b=t/HD,i=t%HD;
-        sQ[t]=(b<qn)?__float2half(q[(size_t)(qbase+b)*n_head*HD + (size_t)head*HD + i]):(__half)0; }
+    for(int m=0;m<2*G;m++)for(int n=0;n<FHDW/8;n++)for(int c=0;c<4;c++)acc[m][n][c]=0.0f;
+    for(int Q=tix;Q<ROWS;Q+=256){ sm[Q]=-1e30f; sl[Q]=0.0f; }
+    for(int t=tix;t<ROWS*HD;t+=256){ int b=t/HD,i=t%HD;
+        sQ[t]=((b&31)<qn)?__float2half(q[(size_t)(qbase+(b&31))*n_head*HD + (size_t)(head0+(b>>5))*HD + i]):(__half)0; }
     __syncthreads();
     int pmax=pos0+qbase+qn-1, smin=(window>0 && pos0+qbase-window+1>0)?pos0+qbase-window+1:0;
     int khi = (seg && bidir_hi > pmax) ? bidir_hi : pmax;   // media chunk: reach past this tile to the span end
@@ -629,9 +642,7 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     // unchanged -> byte-identical. +8 half pad per row spreads the fragment
     // reads off the 32-bank multiple. f16 K (global layers) keeps the direct
     // loads (no conversion to hide); the hd-512 f32 instantiations skip it
-    // too (sQ already 32 KB — sK would blow the 48 KB static-shared limit).
-    const bool KSTAGE = HD == 256 && sizeof(KT) == 4;
-    __shared__ __half sK[KSTAGE ? 32*(HD+8) : 1];
+    // too (their sQ alone is 32 KB).
     for(int kb0=(smin/FKB)*FKB; kb0<=khi; kb0+=FKB){
         if(KSTAGE){
             for(int e=tix;e<32*HD;e+=256){
@@ -641,11 +652,11 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
             __syncthreads();
         }
         int qt=warp>>2, kt=warp&3;
-        float s0=0,s1=0,s2=0,s3=0;
+        float s[G][4];
+        #pragma unroll
+        for(int g2=0;g2<G;g2++){ s[g2][0]=0; s[g2][1]=0; s[g2][2]=0; s[g2][3]=0; }
         #pragma unroll
         for(int ks=0;ks<HD;ks+=16){
-            uint32_t a0=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2];
-            uint32_t a2=*(uint32_t*)&sQ[(qt*16+gid)*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(qt*16+gid+8)*HD+ks+tid*2+8];
             uint32_t b0, b1;
             if(KSTAGE){
                 const __half *kh=&sK[(kt*8+gid)*(HD+8)+ks];
@@ -655,35 +666,45 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
                 const KT *kp=Kc+(size_t)rr*kv_dim+(size_t)kvh*HD+ks;
                 b0=fa_ld2<KT>(kp+tid*2); b1=fa_ld2<KT>(kp+tid*2+8);
             }
-            fa_mma(s0,s1,s2,s3,a0,a1,a2,a3,b0,b1);
+            #pragma unroll
+            for(int g2=0;g2<G;g2++){                       // one K fragment feeds all G heads' q-subtiles
+                int qs=qt+2*g2;
+                uint32_t a0=*(uint32_t*)&sQ[(qs*16+gid)*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(qs*16+gid+8)*HD+ks+tid*2];
+                uint32_t a2=*(uint32_t*)&sQ[(qs*16+gid)*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(qs*16+gid+8)*HD+ks+tid*2+8];
+                fa_mma(s[g2][0],s[g2][1],s[g2][2],s[g2][3],a0,a1,a2,a3,b0,b1);
+            }
         }
-        sS[(qt*16+gid)*FKB+kt*8+tid*2]=s0;     sS[(qt*16+gid)*FKB+kt*8+tid*2+1]=s1;
-        sS[(qt*16+gid+8)*FKB+kt*8+tid*2]=s2;   sS[(qt*16+gid+8)*FKB+kt*8+tid*2+1]=s3;
+        #pragma unroll
+        for(int g2=0;g2<G;g2++){
+            int qs=qt+2*g2;
+            sS[(qs*16+gid)*FKB+kt*8+tid*2]=s[g2][0];     sS[(qs*16+gid)*FKB+kt*8+tid*2+1]=s[g2][1];
+            sS[(qs*16+gid+8)*FKB+kt*8+tid*2]=s[g2][2];   sS[(qs*16+gid+8)*FKB+kt*8+tid*2+1]=s[g2][3];
+        }
         __syncthreads();
         #pragma unroll
-        for(int r=0;r<4;r++){
-            int b=warp*4+r, pos=pos0+qbase+b, start=(window>0&&pos-window+1>0)?pos-window+1:0;
-            int kabs=kb0+lane; bool ok=(lane<FKB)&&(b<qn)&&(kabs>=start)&&(kabs<=pos);
-            if(seg && !ok && lane<FKB && b<qn && kabs<=bidir_hi){   // same media span: bidirectional (bypasses causal+window)
+        for(int r=0;r<4*G;r++){
+            int b=warp*4*G+r, pos=pos0+qbase+(b&31), start=(window>0&&pos-window+1>0)?pos-window+1:0;
+            int kabs=kb0+lane; bool ok=(lane<FKB)&&((b&31)<qn)&&(kabs>=start)&&(kabs<=pos);
+            if(seg && !ok && lane<FKB && (b&31)<qn && kabs<=bidir_hi){   // same media span: bidirectional (bypasses causal+window)
                 int sq=seg[pos]; ok=(sq!=0)&&(sq==seg[kabs]); }
-            float s=ok?sS[b*FKB+lane]:-1e30f, rmax=s;
+            float s2=ok?sS[b*FKB+lane]:-1e30f, rmax=s2;
             for(int o=16;o>0;o>>=1) rmax=fmaxf(rmax,__shfl_xor_sync(~0u,rmax,o));
-            float mn=fmaxf(sm[b],rmax), corr=__expf(sm[b]-mn), p=ok?__expf(s-mn):0.0f, rsum=p;
+            float mn=fmaxf(sm[b],rmax), corr=__expf(sm[b]-mn), p=ok?__expf(s2-mn):0.0f, rsum=p;
             for(int o=16;o>0;o>>=1) rsum+=__shfl_xor_sync(~0u,rsum,o);
             if(lane<FKB) sP[b*FKB+lane]=__float2half(p);
             if(lane==0){ sl[b]=sl[b]*corr+rsum; sm[b]=mn; sc[b]=corr; }
         }
         __syncthreads();
         #pragma unroll
-        for(int m=0;m<2;m++){ float cA=sc[m*16+gid], cB=sc[m*16+gid+8];
+        for(int m=0;m<2*G;m++){ float cA=sc[m*16+gid], cB=sc[m*16+gid+8];
             for(int n=0;n<FHDW/8;n++){ acc[m][n][0]*=cA; acc[m][n][1]*=cA; acc[m][n][2]*=cB; acc[m][n][3]*=cB; } }
-        // PV: V is query-INDEPENDENT, so read each V fragment ONCE and feed both
-        // query-tiles (m) — halves the (uncoalesced, column-strided) V global reads.
+        // PV: V is query-INDEPENDENT, so read each V fragment ONCE and feed all
+        // 2*G query-tiles (m) — the strided V traffic per head halves at G=2.
         #pragma unroll
         for(int ks2=0;ks2<FKB;ks2+=16){
-            uint32_t pa[2][4];
+            uint32_t pa[2*G][4];
             #pragma unroll
-            for(int m=0;m<2;m++){
+            for(int m=0;m<2*G;m++){
                 pa[m][0]=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2];   pa[m][1]=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2];
                 pa[m][2]=*(uint32_t*)&sP[(m*16+gid)*FKB+ks2+tid*2+8]; pa[m][3]=*(uint32_t*)&sP[(m*16+gid+8)*FKB+ks2+tid*2+8];
             }
@@ -695,29 +716,73 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
                 uint32_t b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
                 uint32_t b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim));
                 #pragma unroll
-                for(int m=0;m<2;m++)
+                for(int m=0;m<2*G;m++)
                     fa_mma(acc[m][n][0],acc[m][n][1],acc[m][n][2],acc[m][n][3],pa[m][0],pa[m][1],pa[m][2],pa[m][3],b0,b1);
             }
         }
         __syncthreads();
     }
     #pragma unroll
-    for(int m=0;m<2;m++) for(int n=0;n<FHDW/8;n++){
-        int qA=m*16+gid, qB=m*16+gid+8, hdc=warp*FHDW+n*8+tid*2;
-        if(qA<qn){ xb[((size_t)(qbase+qA)*n_head+head)*HD+hdc]=acc[m][n][0]/sl[qA]; xb[((size_t)(qbase+qA)*n_head+head)*HD+hdc+1]=acc[m][n][1]/sl[qA]; }
-        if(qB<qn){ xb[((size_t)(qbase+qB)*n_head+head)*HD+hdc]=acc[m][n][2]/sl[qB]; xb[((size_t)(qbase+qB)*n_head+head)*HD+hdc+1]=acc[m][n][3]/sl[qB]; }
+    for(int m=0;m<2*G;m++) for(int n=0;n<FHDW/8;n++){
+        int rA=m*16+gid, rB=m*16+gid+8, hdc=warp*FHDW+n*8+tid*2;
+        int hA=head0+(rA>>5), qA=rA&31, qB=rB&31;          // rA and rB sit in the same 32-row head half
+        if(qA<qn){ xb[((size_t)(qbase+qA)*n_head+hA)*HD+hdc]=acc[m][n][0]/sl[rA]; xb[((size_t)(qbase+qA)*n_head+hA)*HD+hdc+1]=acc[m][n][1]/sl[rA]; }
+        if(qB<qn){ xb[((size_t)(qbase+qB)*n_head+hA)*HD+hdc]=acc[m][n][2]/sl[rB]; xb[((size_t)(qbase+qB)*n_head+hA)*HD+hdc+1]=acc[m][n][3]/sl[rB]; }
     }
 }
+// dynamic-shared footprint of one flash CTA (must match the carve-up above)
+static size_t flash_shm(int hd, int G, bool kstage) {
+    return (size_t)32*G*hd*2 + (size_t)32*G*32*6 + (size_t)32*G*12 + (kstage ? (size_t)32*(hd+8)*2 : 0);
+}
+// The G=2 launches live in a specialization so the hd-512 packed instantiation
+// (128 acc floats/thread — it would spill, and nothing ever launches it) never
+// exists in the binary.
+template<int HD> struct flash_packed {
+    static bool go(float*, const float*, const void*, const void*, int, int, const int*, int, int, int, int,
+                   bool, bool, const int*, int) { return false; }
+};
+template<> struct flash_packed<256> {
+    static bool go(float *dxb, const float *dq, const void *Kc, const void *Vc,
+                   int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
+                   bool f16, bool ring, const int *seg, int bidir_hi) {
+        dim3 g(n_head/2, (B + 31) / 32);
+        size_t shm = flash_shm(256, 2, !f16);
+        static int carve = 0;
+        if (!carve) {                                       // ~62 KB > the 48 KB default
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,false,__half,2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,false));
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,true, float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,false,float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
+            carve = 1;
+        }
+        if (f16)      flash_attn_n_kernel<256,false,__half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else if (ring) flash_attn_n_kernel<256,true, float, 2><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else          flash_attn_n_kernel<256,false,float, 2><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        return true;
+    }
+};
 // hd is a compile-time template (256 SWA / 512 global); pick KT/RING like the
-// per-query dispatch: f16 -> global (no ring), f32+seq<max -> SWA ring, else full f32.
+// per-query dispatch: f16 -> global (no ring), f32+seq<max -> SWA ring, else
+// full f32. GQA packing (G=2, hd 256, gqa 2) defaults ON for integrated GPUs —
+// it halves the K/V instruction stream the Orin is throttled on, but costs the
+// A5000 a CTA of occupancy; LG_FLASH_GQA=0/1 overrides.
 template<int HD>
 static void launch_flash(float *dxb, const float *dq, const void *Kc, const void *Vc,
                          int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
                          bool f16, bool ring, const int *seg, int bidir_hi) {
+    static int pack_pol = -2;
+    if (pack_pol == -2) {
+        const char *e = getenv("LG_FLASH_GQA");
+        if (e) pack_pol = atoi(e);
+        else { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); pack_pol = p.integrated ? 1 : 0; }
+    }
+    if (pack_pol && HD == 256 && gqa == 2 && (n_head & 1) == 0 &&
+        flash_packed<HD>::go(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, seq, B, n_head, f16, ring, seg, bidir_hi))
+        return;
     dim3 g(n_head, (B + 31) / 32);                         // y = 32-query tiles (B>32 prefill chunks)
-    if (f16)      flash_attn_n_kernel<HD,false,__half><<<g,256>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
-    else if (ring) flash_attn_n_kernel<HD,true, float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
-    else          flash_attn_n_kernel<HD,false,float ><<<g,256>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    size_t shm = flash_shm(HD, 1, HD == 256 && !f16);
+    if (f16)      flash_attn_n_kernel<HD,false,__half,1><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    else if (ring) flash_attn_n_kernel<HD,true, float ,1><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    else          flash_attn_n_kernel<HD,false,float ,1><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
 }
 
 // Write one row (length n) into the kv cache at the device-resident position. Replaces
