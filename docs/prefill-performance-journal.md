@@ -765,3 +765,39 @@ Remaining for production voice: install whisper.cpp on the Orin (model
 size sets the commit cadence), AEC/headset assumption for open-air mics,
 and the TTS side of barge (stop speaking when barged — downstream of
 voicecat's stdout).
+
+## 2026-07-02 — TTFT vs llama-server, apples to apples
+
+The campaign's prefill ratios came from llama-bench, a kernel-level rate.
+TTFT is a SERVING number, so the fair reference is llama-server, measured
+with the same client-side definition both stacks use: last request byte →
+first streamed token (ttft_llama.py: /completion & /v1/chat/completions,
+stream on, cache_prompt OFF — the fork streams Gemma thought-channel tokens
+as delta.reasoning_content, and prompt caching would silently zero repeated
+prompts). Same GGUFs, warm servers, first turn discarded, pinned clocks,
+drop_caches + --no-mmap for the Orin 12B. Token parity on text confirmed by
+prompt_n (928 vs our 929 — BOS accounting). The full table lives in the
+README (TTFT section); the shape of it:
+
+- TEXT tracks the known ratio, slightly kinder to us: ours ~0.86× in
+  serving (A5000 12B actually WINS, 0.51 vs 0.53 s) vs 0.80× at the kernel
+  level — llama-server's stack costs more per turn than our socket loop.
+- MEDIA inverts it: image+question bursts run 1.5–2.4× FASTER here (Orin
+  E4B 0.69 vs 1.65 s, Orin 12B 1.15 vs 2.11 s). The 12B rows are
+  near-token-equal (157 vs 150 — the fork's gemma4uv also encodes
+  natively), so that one is kernel-for-kernel honest: the TC encoder + span
+  packing + one-launch turns is the margin. The E4B rows differ by POLICY
+  (the fork upscales to a 252-token minimum → 293 tokens vs our native
+  130) — report both numbers, never hide the asymmetry.
+- llama's server-reported prompt_ms EXCLUDES its media encoder: ttft −
+  prompt_ms ≈ 0.25 s (E4B) / 0.43 s (12B) on the Orin image rows is their
+  encode+pick. Our prefill stat includes everything after the burst.
+- Paced arrival (video streamed over a socket) has NO llama-server
+  counterpart — one POST carries the whole request — so the streaming-
+  prefill wins (video ttft 8.79 → 2.34 s) are vs our own deferred baseline
+  and are reported that way.
+
+Harness kept: .scratch/ttft_llama.py (also on cortex ~/). Pitfalls it
+guards: cache_prompt default drift, reasoning_content deltas, timings only
+in the final stream chunk, and the warm-up turn (first llama turn runs
+~2-7x slow on Orin while buffers settle).

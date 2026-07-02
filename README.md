@@ -411,6 +411,38 @@ shows — turns are short, `-sys` removes the skills re-prefill, the GPU
 encoder removed the image one — but on very long documents llama.cpp still
 wins the wait.
 
+**TTFT** (time to first token, the metric a user feels) — measured against
+`llama-server` with the same client-side definition on both stacks: last
+request byte sent → first streamed token, warm server, first turn
+discarded, prompt caching off, same GGUFs, token parity checked
+(2026-07-02, medians of warm turns):
+
+| device | turn | little-gemma ttft / prefill | llama-server ttft / prefill | tokens (lg / llama) |
+|--------|------|----------------------------:|----------------------------:|:-------------------:|
+| A5000 | 12B, 929-tok text | **0.51 s** / 1,803 | 0.53 s / 1,753 | 928 / 928 |
+| A5000 | E4B, 929-tok text | 0.25 s / 3,717 | **0.23 s** / 4,070 | 928 / 928 |
+| A5000 | 12B, image+question | **0.20 s** / 827 | 0.29 s / 715 | 150 / 157 |
+| A5000 | E4B, image+question | **0.13 s** / 1,317 | 0.30 s / 1,229 | 150 / 293 |
+| Orin | 12B, 929-tok text | 5.37 s / 173 | **4.64 s** / 200 | 929 / 928 |
+| Orin | E4B, 929-tok text | 2.23 s / 417 | **1.91 s** / 488 | 929 / 928 |
+| Orin | 12B, image+question | **1.15 s** / 132 | 2.11 s / 92 | 150 / 157 |
+| Orin | E4B, image+question | **0.69 s** / 308 | 1.65 s / 210 | 150 / 293 |
+
+The prefill column is tok/s over the whole turn: ours from the serve stat
+(everything after the burst, media included), llama's from its own
+server-reported `prompt_n/prompt_ms` — which *excludes* its media encoder
+(visible as ttft − prompt_ms ≈ 0.25–0.43 s on the Orin image rows). Text
+turns track the known kernel ratio (ours ~0.86× in serving, a touch better
+than llama-bench's 0.80× — their server stack costs more than ours).
+**Media turns invert it**: 1.5–2.4× ahead, and the 12B image rows are
+near-token-equal (both encode natively), so that win is not a policy
+artifact. The E4B token counts differ by upstream policy — the fork
+upscales every image to a 252-token minimum; mmcat sends 624×480 natively
+as 130. Paced arrival (video frames over a socket, spans prefilled while
+the clip streams) has no llama-server counterpart at all — those numbers
+(Orin 12B six-frame video ttft 8.79 → 2.34 s) are measured against our own
+deferred baseline.
+
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
 Both **no CUDA, no SIMD intrinsics, 12 threads**, single-token generation:
