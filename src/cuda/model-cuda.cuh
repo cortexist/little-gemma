@@ -1940,23 +1940,17 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
         free(hseg);
     }
 
-    // Segment-aware chunking: pack greedily to PREFILL_B, but never split a media
-    // span across chunks (a frame's patches must coexist in one attention pass for
-    // bidirectional-within-frame). A span larger than a chunk falls back to causal
-    // sub-chunks (Stage 2 will widen the chunk for it). Text-only chunks pass
+    // Segment-aware chunking: pack text and WHOLE media spans greedily to the
+    // balanced budget — a span never splits across chunks (a frame's patches
+    // must coexist in one attention pass for bidirectional-within-frame), but
+    // it packs WITH its neighbours: a camera turn's opener, its 130-row frame
+    // and the question ride one chunk. (The old rule gave any span wider than
+    // PREFILL_B its own chunk, so that same turn paid three padded launches —
+    // 32+192+32 columns for ~157 real positions.) Text-only chunks pass
     // seg=NULL -> byte-identical causal; chunking matches the old 128 path for text.
     int i = 0;
     while (n - i >= 2) {
         int a = i, w = 0, media_hi = -1;
-        // A whole image span prefills as ONE chunk so its patches attend
-        // bidirectionally. If the span exceeds PREFILL_B it becomes its OWN wide
-        // chunk (up to g_prefill_max_b, the buffer width); otherwise pack text +
-        // small spans greedily to PREFILL_B (causal text, bidirectional frames).
-        if (ids[a] < 0) {
-            int e = a; while (e < n && ids[e] < 0) e++;
-            int span = e - a;
-            if (span > PREFILL_B) { w = (span <= g_prefill_max_b) ? span : g_prefill_max_b; media_hi = a + w - 1; }
-        }
         // Balanced budget: split the remaining ids into ceil(rem/TB) NEAR-EQUAL
         // chunks instead of TB-wide chunks plus a skinny tail — a 1428-token turn
         // becomes 2 x ~714, not 1024 + 404. Same number of weight passes, but
@@ -1966,14 +1960,22 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
         int budget = (rem + nch - 1) / nch;
         budget = budget > 128 ? (budget + 63) / 64 * 64 : (budget + 31) / 32 * 32;
         if (budget > TB) budget = TB;
-        if (w == 0) while (a + w < n && w < budget) {
+        while (a + w < n && w < budget) {
             if (ids[a + w] < 0) {                      // a media span: take it whole if it fits
                 int s = a + w, e = s; while (e < n && ids[e] < 0) e++;
                 int span = e - s;
-                if (span > PREFILL_B) break;           // wide span -> close chunk, it starts the next (its own wide chunk)
-                if (w + span > budget) break;          // doesn't fit the remaining budget -> close chunk
+                if (w + span > budget) break;          // doesn't fit what's left -> close chunk
                 media_hi = e - 1; w += span;
             } else w++;                                // text
+        }
+        // A span wider than the whole budget still prefills as ONE chunk,
+        // stretched up to g_prefill_max_b (the buffer width); wider still and
+        // it falls back to causal sub-chunks (Stage 2 widens the chunk for it).
+        if (w == 0 && ids[a] < 0) {
+            int e = a; while (e < n && ids[e] < 0) e++;
+            int span = e - a;
+            w = span <= g_prefill_max_b ? span : g_prefill_max_b;
+            media_hi = a + w - 1;
         }
         if (w < 1) w = 1;
         // Chunks wider than 128 round to a multiple of 64: matmul_q_n's single

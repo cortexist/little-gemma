@@ -570,3 +570,40 @@ Left on the table, in order of current ttft share:
   q4k kernel got);
 - encoder work on its own stream could overlap span prefill on the A5000
   (stream-serialized today; less relevant on the 8-SM Orin).
+
+## 2026-07-02 — TTFT lever 3: media spans pack with their text
+
+The packer in model_prefill_mixed gave any media span wider than PREFILL_B
+(128) its own %64-rounded wide chunk, orphaning the text around it: a camera
+turn (opener + 130-row frame + question, ~157 real positions) prefilled as
+three padded launches — 32 + 192 + 32 = 256 columns. But the balanced budget
+for that turn is 192, and a whole span packs inside it next to its text; the
+special case predated wide chunks and init-sized buffers, which already
+guarantee any chunk up to g_prefill_max_b fits every buffer and the SWA ring
+spare. The fix DELETES the special case: spans pack greedily with text to
+the balanced budget like small spans always did, and only a span wider than
+the whole budget still stretches its own chunk (up to g_prefill_max_b;
+beyond that the old causal sub-chunk fallback stands). The packer got
+shorter.
+
+| Orin E4B camera burst | before | after |
+|---|---:|---:|
+| packed prefill call | 0.72 s (256 cols) | **0.49 s (192 cols)** |
+| client ttft | 0.92 s | **0.685 s** |
+
+Session ledger for that turn: 1.82 s at dawn (f32 encoder + 3-launch
+prefill) → 0.92 s (tensor-core encoder) → **0.685 s** (span packing) — 2.7×.
+
+Gates: all five A5000 battery replies byte-identical (chunk boundaries are
+output-invisible, re-proven end to end); MTP acceptance counts exactly
+equal (76/76, 16/24, 28/60, 118/210 — the B=3 tripwire); text serve at
+campaign numbers on both devices (A5000 12B 1812 avg, Orin E4B 417.4,
+Paris OK — the text path takes the same branches as before); Orin camera
+reply identical, 6-frame video coherent.
+
+Still open, smaller: encoder k_gemm ~2x residual (cp.async), the %64 wide-
+chunk rounding (192-for-157 keeps ~35 pad columns; a %32 wide launch path
+would save ~0.07 s but complicates the fat-launch contract), the ~66 ms
+A5000 first-pick, and encoder-stream overlap for bursts. The camera turn now
+spends 0.2 s seeing and 0.49 s reading — both terms at structural-ish floors
+without new kernel families.
