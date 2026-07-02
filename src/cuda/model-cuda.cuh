@@ -219,6 +219,22 @@ __global__ static void rmsnorm_add_w_n_kernel(float *acc, const float *x, const 
         for (int g = 0; g < n / 32; g++) d_quant_group_warp(accr + g * 32, row * (n / 32) + g, aq, lane);
     }
 }
+// Chunk-norm dispatch. The warp forms win when rows fill the schedulers; a
+// TINY chunk — above all the B=3 MTP verify — must keep the block-per-row
+// forms, for two reasons: a 1-block warp-form grid serializes on one SM
+// (measured +20% on the verify pass), and the verify's argmax must match
+// plain decode's BY CONSTRUCTION, which requires the verify chunk to run
+// decode's exact norm reduction order. B >= 16 is chunks only; every
+// verify/remainder stays on the decode-identical path.
+static void norm_n(float *out, const float *x, const float *w, int n, float eps, struct actq aq, int B) {
+    if (B >= 16) rmsnorm_w_n_kernel<<<(B + 7) / 8, 256>>>(out, x, w, n, eps, aq, B);
+    else         rmsnorm_kernel<<<B, NORM_THREADS(n)>>>(out, x, w, n, eps, aq);
+}
+static void norm_add_n(float *acc, const float *x, const float *w, int n, float eps,
+                       const float *os, struct actq aq, int B) {
+    if (B >= 16) rmsnorm_add_w_n_kernel<<<(B + 7) / 8, 256>>>(acc, x, w, n, eps, os, aq, B);
+    else         rmsnorm_add_n_kernel<<<B, NORM_THREADS(n)>>>(acc, x, w, n, eps, os, aq);
+}
 
 // GPT-NeoX RoPE: `total` = n_head * (hd/2) elements; v is [n_head][hd].
 __global__ static void rope_kernel(float *v, int half, int hd, const int *d_pos, float base, const float *ff, int total) {
@@ -1506,7 +1522,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         const float *os = dW_layer(m, L, "layer_output_scale.weight");
 
         // ---- attention ----
-        rmsnorm_w_n_kernel<<<(B + 7) / 8, 256>>>(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(B * n_embd), B);
+        norm_n(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(B * n_embd), B);
         pf_tick(&g_pf_elem);
 
         int src = kv_src_dev(m, L);
@@ -1631,11 +1647,11 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         pf_tick(&g_pf_attn);
         mm(dout, wq_layer(m, L, "attn_output.weight"), dxb, q_dim, n_embd);
         pf_tick(&g_pf_mm);
-        rmsnorm_add_w_n_kernel<<<(B + 7) / 8, 256>>>(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0, B);
+        norm_add_n(dx, dout, dW_layer(m, L, "post_attention_norm.weight"), n_embd, eps, NULL, AQ0, B);
 
         // ---- feed-forward (GeGLU) ----
         const int nff = m->ffn_len[L];
-        rmsnorm_w_n_kernel<<<(B + 7) / 8, 256>>>(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd), B);
+        norm_n(dh, dx, dW_layer(m, L, "ffn_norm.weight"), n_embd, eps, actq_for(B * n_embd), B);
         pf_tick(&g_pf_elem);
         mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
         mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
@@ -1644,8 +1660,8 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         pf_tick(&g_pf_elem);
         mm(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         pf_tick(&g_pf_mm);
-        rmsnorm_add_w_n_kernel<<<(B + 7) / 8, 256>>>(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
-                                       has_ple ? NULL : os, has_ple ? actq_for(B * n_embd) : AQ0, B);
+        norm_add_n(dx, dout, dW_layer(m, L, "post_ffw_norm.weight"), n_embd, eps,
+                   has_ple ? NULL : os, has_ple ? actq_for(B * n_embd) : AQ0, B);
         pf_tick(&g_pf_elem);
 
         // ---- per-layer input (PLE) ----
@@ -1654,7 +1670,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             mm(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
             geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
             mm(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
-            rmsnorm_add_w_n_kernel<<<(B + 7) / 8, 256>>>(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0, B);
+            norm_add_n(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0, B);
             pf_tick(&g_pf_ple);
         }
     }
