@@ -345,6 +345,10 @@ __global__ static void attn_swa_kernel(float *xb, const float *q, const float *K
                                        int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
     d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, seq, aq);
 }
+__global__ static void attn_swa_h_kernel(float *xb, const float *q, const __half *Kc, const __half *Vc,
+                                         int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
+    d_attn<true, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos, 0, window, seq, aq);
+}
 // Chunk forms: grid (n_head, chunk) — query blockIdx.y sits at *d_pos + blockIdx.y,
 // so a batched chunk is causal by construction: every query reads only positions
 // at or before its own, even though the whole chunk's k/v were written before the
@@ -364,6 +368,11 @@ __global__ static void attn_swa_n_kernel(float *xb, const float *q, const float 
                                          int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
     d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
                         (size_t)blockIdx.y * gridDim.x * hd, window, seq, aq);
+}
+__global__ static void attn_swa_h_n_kernel(float *xb, const float *q, const __half *Kc, const __half *Vc,
+                                           int hd, int kv_dim, int gqa, const int *d_pos, int window, int seq, struct actq aq) {
+    d_attn<true, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, *d_pos + blockIdx.y,
+                         (size_t)blockIdx.y * gridDim.x * hd, window, seq, aq);
 }
 
 // ==== SPLIT-K (FlashDecoding) decode attention ==============================
@@ -750,11 +759,13 @@ template<> struct flash_packed<256> {
         static int carve = 0;
         if (!carve) {                                       // ~62 KB > the 48 KB default
             cudaFuncSetAttribute(flash_attn_n_kernel<256,false,__half,2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,false));
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,true, __half,2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,false));
             cudaFuncSetAttribute(flash_attn_n_kernel<256,true, float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
             cudaFuncSetAttribute(flash_attn_n_kernel<256,false,float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
             carve = 1;
         }
-        if (f16)      flash_attn_n_kernel<256,false,__half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        if (f16 && ring) flash_attn_n_kernel<256,true, __half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else if (f16)  flash_attn_n_kernel<256,false,__half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
         else if (ring) flash_attn_n_kernel<256,true, float, 2><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
         else          flash_attn_n_kernel<256,false,float, 2><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
         return true;
@@ -780,7 +791,8 @@ static void launch_flash(float *dxb, const float *dq, const void *Kc, const void
         return;
     dim3 g(n_head, (B + 31) / 32);                         // y = 32-query tiles (B>32 prefill chunks)
     size_t shm = flash_shm(HD, 1, HD == 256 && !f16);
-    if (f16)      flash_attn_n_kernel<HD,false,__half,1><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    if (f16 && ring) flash_attn_n_kernel<HD,true,__half,1><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+    else if (f16) flash_attn_n_kernel<HD,false,__half,1><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
     else if (ring) flash_attn_n_kernel<HD,true, float ,1><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
     else          flash_attn_n_kernel<HD,false,float ,1><<<g,256,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
 }
@@ -807,9 +819,10 @@ __global__ static void kv_write_ring_n_kernel(float *dst, const float *src, cons
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n * rows) dst[(size_t)((*d_pos + i / n) % seq) * n + i % n] = src[i];
 }
-// f16 forms, for global layers: the row rounds through half once here — the
-// single numerics-changing step in the pipeline (round-to-nearest, matching
-// the CPU backend's f16_of bit for bit). Global layers never ring.
+// f16 forms: the row rounds through half once here — the numerics-changing
+// step (round-to-nearest, matching the CPU backend's f16_of bit for bit).
+// Originally global layers only; since the f16-SWA-rings step the ring forms
+// below cover the sliding-window layers too (same rounding, plus the modulo).
 __global__ static void kv_write_h_kernel(__half *dst, const float *src, const int *d_pos, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[(size_t)(*d_pos) * n + i] = __float2half_rn(src[i]);
@@ -817,6 +830,14 @@ __global__ static void kv_write_h_kernel(__half *dst, const float *src, const in
 __global__ static void kv_write_h_n_kernel(__half *dst, const float *src, const int *d_pos, int n, int rows) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n * rows) dst[(size_t)(*d_pos + i / n) * n + i % n] = __float2half_rn(src[i]);
+}
+__global__ static void kv_write_ring_h_kernel(__half *dst, const float *src, const int *d_pos, int n, int seq) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[(size_t)(*d_pos % seq) * n + i] = __float2half_rn(src[i]);
+}
+__global__ static void kv_write_ring_h_n_kernel(__half *dst, const float *src, const int *d_pos, int n, int seq, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * rows) dst[(size_t)((*d_pos + i / n) % seq) * n + i % n] = __float2half_rn(src[i]);
 }
 
 __device__ static float d_gelu(float x) {
@@ -1144,7 +1165,16 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
         if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + chunk_spare < max_seq)
             seq = c->sliding_window + chunk_spare;
         kv->seq[L] = seq;
-        kv->f16[L] = !m->is_local[L];         // global rows are f16 (see model.h)
+        // f16 rows everywhere since the f16-SWA-rings step (2026-07): the SWA
+        // rings were the last f32 K/V, and they fed the prefill flash 2x the
+        // bytes plus an f32->f16 pack per fragment — llama's whole-prefill
+        // attention measured 8x ours on the Orin with f16 KV as one of the
+        // structural reasons. Numerics-gated like the original f16 global
+        // step (determinism + quality, not byte-identity vs f32).
+        // LG_SWA_F32=1 restores f32 rings for A/B.
+        static int swa_f32 = -1;
+        if (swa_f32 < 0) swa_f32 = getenv("LG_SWA_F32") != NULL;
+        kv->f16[L] = swa_f32 ? !m->is_local[L] : 1;
         size_t bytes = (size_t)seq * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
         CUDA_CHECK(cudaMalloc(&kv->k[L], bytes)); CUDA_CHECK(cudaMemset(kv->k[L], 0, bytes));
         CUDA_CHECK(cudaMalloc(&kv->v[L], bytes)); CUDA_CHECK(cudaMemset(kv->v[L], 0, bytes));
@@ -1290,10 +1320,13 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
             rmsnorm_kernel<<<n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);  // plain V norm
             rope_kernel<<<gridn(n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, base, ff, n_head_kv * hd / 2);
-            if (kv->f16[L]) {                              // global layer: rows round through f16
+            if (kv->f16[L] && kv->seq[L] < kv->max_seq) {  // f16 ring (SWA layer)
+                kv_write_ring_h_kernel<<<gridn(kv_dim), 256>>>((__half *)kv->k[L], dkb, d_pos, kv_dim, kv->seq[L]);
+                kv_write_ring_h_kernel<<<gridn(kv_dim), 256>>>((__half *)kv->v[L], dvb, d_pos, kv_dim, kv->seq[L]);
+            } else if (kv->f16[L]) {                       // f16 full-length: row = position
                 kv_write_h_kernel<<<gridn(kv_dim), 256>>>((__half *)kv->k[L], dkb, d_pos, kv_dim);
                 kv_write_h_kernel<<<gridn(kv_dim), 256>>>((__half *)kv->v[L], dvb, d_pos, kv_dim);
-            } else if (kv->seq[L] < kv->max_seq) {         // ring (sliding-window layer)
+            } else if (kv->seq[L] < kv->max_seq) {         // f32 ring (LG_SWA_F32)
                 kv_write_ring_kernel<<<gridn(kv_dim), 256>>>((float *)kv->k[L], dkb, d_pos, kv_dim, kv->seq[L]);
                 kv_write_ring_kernel<<<gridn(kv_dim), 256>>>((float *)kv->v[L], dvb, d_pos, kv_dim, kv->seq[L]);
             } else {                                       // full-length f32: row = position
@@ -1315,14 +1348,19 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
             ensure_split(n_head);
             struct actq aq = actq_for(q_dim);
             dim3 gs(n_head, MAXSPLIT);                      // z=1: qi=0, single query
-            if (kv->f16[src])
+            int ring = kv->seq[src] < kv->max_seq;
+            if (kv->f16[src] && ring)
+                split_attn_kernel<true, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
+            else if (kv->f16[src])
                 split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
-            else if (kv->seq[src] < kv->max_seq)
+            else if (ring)
                 split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
             else
                 split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
             combine_attn_kernel<<<n_head, 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq, n_head);
-        } else if (kv->f16[src])
+        } else if (kv->f16[src] && kv->seq[src] < kv->max_seq)
+            attn_swa_h_kernel<<<n_head, 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(q_dim));
+        else if (kv->f16[src])
             attn_h_kernel<<<n_head, 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(q_dim));
         else if (kv->seq[src] < kv->max_seq)
             attn_swa_kernel<<<n_head, 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(q_dim));
@@ -1440,10 +1478,13 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
             rope_n_kernel<<<gridn(B * n_head_kv * hd / 2), 256>>>(dkb, hd / 2, hd, d_pos, rope_tab(base, hd), ff, n_head_kv * hd / 2, B);
-            if (kv->f16[L]) {                              // global layer: rows round through f16
+            if (kv->f16[L] && kv->seq[L] < kv->max_seq) {  // f16 ring (SWA layer)
+                kv_write_ring_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->k[L], dkb, d_pos, kv_dim, kv->seq[L], B);
+                kv_write_ring_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->v[L], dvb, d_pos, kv_dim, kv->seq[L], B);
+            } else if (kv->f16[L]) {                       // f16 full-length: row = position
                 kv_write_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->k[L], dkb, d_pos, kv_dim, B);
                 kv_write_h_n_kernel<<<gridn(B * kv_dim), 256>>>((__half *)kv->v[L], dvb, d_pos, kv_dim, B);
-            } else if (kv->seq[L] < kv->max_seq) {         // ring (sliding-window layer)
+            } else if (kv->seq[L] < kv->max_seq) {         // f32 ring (LG_SWA_F32)
                 kv_write_ring_n_kernel<<<gridn(B * kv_dim), 256>>>((float *)kv->k[L], dkb, d_pos, kv_dim, kv->seq[L], B);
                 kv_write_ring_n_kernel<<<gridn(B * kv_dim), 256>>>((float *)kv->v[L], dvb, d_pos, kv_dim, kv->seq[L], B);
             } else {                                       // full-length f32: row = position
@@ -1503,29 +1544,38 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             size_t shm = (size_t)(2 + QT) * hd * sizeof(float);   // sK + sV + sO[QT][hd]
             dim3 g(n_head, (B + QT - 1) / QT);
             struct actq aq = actq_for(B * q_dim);
-            if (kv->f16[src])                              // full layer, f16 global cache
+            int ring = kv->seq[src] < kv->max_seq;
+            if (kv->f16[src] && ring)                      // f16 ring (SWA layer)
+                attn_kvshare_n_kernel<QT, true, __half><<<g, QT * 32, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, aq);
+            else if (kv->f16[src])                         // f16 full-length
                 attn_kvshare_n_kernel<QT, false, __half><<<g, QT * 32, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
-            else if (kv->seq[src] < kv->max_seq)           // SWA layer, ring cache (e.g. 12B's wide windows)
+            else if (ring)                                 // f32 ring (LG_SWA_F32)
                 attn_kvshare_n_kernel<QT, true, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, aq);
-            else                                           // full layer, full-length float cache
+            else                                           // full-length float cache
                 attn_kvshare_n_kernel<QT, false, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
         } else if (splitk) {                               // B<=2 MTP verify: decode's split-K kernel, z=B queries
             ensure_split(B * n_head);                       // no-op (ensure_weights pre-allocated 2*n_head pre-capture)
             size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
             dim3 gs(n_head, MAXSPLIT, B);
             struct actq aq = actq_for(B * q_dim);
-            if (kv->f16[src])
+            int ring = kv->seq[src] < kv->max_seq;
+            if (kv->f16[src] && ring)
+                split_attn_kernel<true, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
+            else if (kv->f16[src])
                 split_attn_kernel<false, __half><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
-            else if (kv->seq[src] < kv->max_seq)
+            else if (ring)
                 split_attn_kernel<true, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], n_head);
             else
                 split_attn_kernel<false, float><<<gs, 256, shm>>>(g_pacc, g_pml, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, n_head);
             combine_attn_kernel<<<dim3(n_head, 1, B), 256>>>(dxb, g_pacc, g_pml, hd, d_pos, window, aq, n_head);
         } else {
             size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
-            if (kv->f16[src])
+            int ring = kv->seq[src] < kv->max_seq;
+            if (kv->f16[src] && ring)
+                attn_swa_h_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(B * q_dim));
+            else if (kv->f16[src])
                 attn_h_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const __half *)Kc, (const __half *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
-            else if (kv->seq[src] < kv->max_seq)
+            else if (ring)
                 attn_swa_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], actq_for(B * q_dim));
             else
                 attn_n_kernel<<<dim3(n_head, B), 256, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, actq_for(B * q_dim));
@@ -2052,6 +2102,10 @@ __global__ static void mtp_attn_swa(float *xb, const float *q, const float *Kc, 
                                     int hd, int kv_dim, int gqa, const int *dp, int window, int seq, struct actq aq) {
     d_attn<true, float>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, window, seq, aq);
 }
+__global__ static void mtp_attn_swa_h(float *xb, const float *q, const __half *Kc, const __half *Vc,
+                                      int hd, int kv_dim, int gqa, const int *dp, int window, int seq, struct actq aq) {
+    d_attn<true, __half>(xb, q, Kc, Vc, hd, kv_dim, gqa, *dp - 1, 0, window, seq, aq);
+}
 
 struct mtp_ld {
     float *attn_norm, *q_norm, *post_attn, *ffn_norm, *post_ffw;   // f32, device
@@ -2164,7 +2218,12 @@ static void mtp_draft_launches(struct mtp *t, const struct model *m, const struc
         mtp_rope<<<gridn(t->n_head * (hd / 2)), 256>>>(mc->q, hd / 2, hd, mc->d_dpos,
                                                        bl->local ? t->base_swa : t->base_full,
                                                        t->n_head * (hd / 2));
-        if (bl->local)
+        if (bl->local && kv->f16[src])                     // f16 ring (SWA layer)
+            mtp_attn_swa_h<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
+                    (const __half *)kv->k[src], (const __half *)kv->v[src],
+                    hd, kv->kv_dim[src], gqa, mc->d_dpos,
+                    c->sliding_window > 0 ? c->sliding_window - 1 : 0, kv->seq[src], AQ0);
+        else if (bl->local)                                // f32 ring (LG_SWA_F32)
             mtp_attn_swa<<<t->n_head, 256, 8 * hd * 4>>>(mc->xb, mc->q,
                     (const float *)kv->k[src], (const float *)kv->v[src],
                     hd, kv->kv_dim[src], gqa, mc->d_dpos,
