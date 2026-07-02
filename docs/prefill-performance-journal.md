@@ -406,6 +406,39 @@ instructions via `ldmatrix.x4` — fragment ECONOMY, not data placement, is
 the remaining flash lever (the June ldmatrix falsification was on the
 matmul A-path, a different site with a different diagnosis).
 
+## Orin push — Phase 2 close-out (2026-07-02)
+
+Final two rounds under the open numerics gate:
+
+- **ldmatrix fragment economy: FALSIFIED** (166.3 vs 168.3) — even 4× fewer
+  fragment instructions (64 LDSM replacing the fragment LDS traffic,
+  byte-identical) moved nothing on the staging base. With staging
+  (placement) and ldmatrix (instruction count) both dead, the flash
+  kernel's floor is structural — barrier cadence + softmax serialization —
+  and llama's 8× is their whole architecture, not a transplantable slice
+  beyond the GQA packing already taken.
+- **Warp-per-row chunk norms: KEPT (2615300)** — the block-per-row norms
+  ran one row per SM (24% SM); a warp per row feeds every scheduler.
+  Orin 12B +2.9%, **E4B +7.7%** (PLE norms compound); numerics-gated,
+  all checks green, MTP 93.8% preserved.
+
+**Final scoreboard (warm serve, 929-token turns, pinned clocks):**
+
+| | Orin prefill | vs llama | Orin decode | A5000 prefill |
+|---|---:|---|---:|---:|
+| 12B | **173.2** | **0.80×** (216.8) | **8.7** (llama 7.55) | **1811** |
+| E4B | **417.5** | **0.82×** (510.3) | **30.0** | **3718** |
+
+Option (b) delivered +4.5% / +9.0% prefill on top of Phase 1b plus ~+8%
+decode (the f16-ring sleeper). Campaign total from the 2026-07-01 start:
+A5000 3.4× / 3.6×; Orin 12B 102 → 173 and E4B 192 → 417 against the same
+llama build. Every identified lever is now measured-and-kept or
+measured-and-falsified; the remaining 0.2× is llama's mmq instruction
+schedule (~0.27 s) and their flash architecture (~0.35 s) — both priced,
+both requiring their kernels wholesale, both declined. Loose ends parked:
+E4B G=4 GQA pack (needs a row restructure), mmcat frame-decode failure on
+ffmpeg 4.4 (tools repo), the pre-existing E2B Q3_K garbage bug.
+
 ### Where this leaves prefill
 
 The whole 2026-07-01/02 arc, all gates green on both devices:
