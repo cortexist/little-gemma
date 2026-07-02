@@ -988,3 +988,13 @@ not assumed); text bench at campaign numbers (A5000 1824, Paris OK); MTP
 automatically. With true streaming ASR (persistent whisper) this completes
 the chain: speech -> transcript -> kv cache, all concurrent, and the answer
 starts a beat after the user stops.
+**Addendum — production decode config + plan B (measured, deterministic):**
+with MTP block-3 the dictation scenario's decode runs 9.3 tok/s on the 12B
+(59.3% acceptance on this reply) and 18.7 tok/s on the E4B (41.4%); first
+token is untouched by MTP. Full matrix, seconds after the last spoken word:
+12B deferred +5.37 token / +8.13 sentence, 12B streaming +0.55 / +3.31;
+E4B deferred +2.23 / +3.20, E4B streaming **+0.26 / +1.24**. The E4B answers
+this prompt with NO thought channel — its post-token gap is the sentence
+alone, while the 12B's is mostly thought; template-induced thought length
+remains the biggest TTFS variable. Timing diagrams (UML lifelines, both
+models, all measured): the dictation-timing artifact.
