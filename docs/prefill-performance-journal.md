@@ -683,3 +683,48 @@ default stays whole-utterance. Remaining open on audio: the combined A+V
 template order (mp4 soundtrack + frames, parked in little-gemma-tools), and
 for a voice product the loop is now bounded by DECODE (7.7 tok/s Orin 12B),
 not input.
+
+## 2026-07-02 — combined audio+video: verified, and the answer is a boundary
+
+The parked question was which ORDER a video and its soundtrack should take
+in the turn. The answer, after seven arrangements on the 12B unified path
+(Orin, greedy, testcard frames + a known spoken clip; each modality alone
+answers correctly): NONE of them work —
+
+| arrangement | audio comprehension |
+|---|---|
+| audio alone — question before OR after the span | hears the sentence |
+| frames then audio (mmcat today) | confabulates from the visuals |
+| audio then frames | confabulates |
+| interleaved (frames / half the audio / frames / rest) | confabulates |
+| frames, question, audio (the model card recommendation) | confabulates |
+| a "soundtrack:" framing tag before the span | confabulates |
+| BLACK frames + audio | confabulates ("I am going to be a doctor") |
+| video turn, then audio turn (separate turns) | confabulates |
+| camera turn, then voice turn | denies having ears outright |
+
+Vision survives audio presence; audio does not survive vision — an
+asymmetric capture, and it is CONTEXT-scoped, not turn-scoped (an earlier
+camera turn silences a later voice turn: the model answers "I am a
+text-based AI and cannot hear"). No reference implementation exists to
+disagree — the fork cannot even load a unified A+V mmproj (clip.cpp "TODO:
+support both audio and video"), and the model card's placement advice
+covers separate tasks. Conclusion: a capability boundary of this
+checkpoint, not a template bug.
+
+Consequences, shipped in little-gemma-tools (b82d853): mmcat's audio policy
+is now TURN-scoped — audio-only turns keep the model's native ears
+(unchanged); when any file in the turn has video, the soundtrack's speech
+fuses onto the question as a whisper transcript (whisper_caption now
+returns the words), and without whisper the span is DROPPED with a loud
+warning, because a poisoned span helps nobody. Drop leg verified end to end
+(A+V mp4: video described, zero confabulation; wav-only unchanged); the
+whisper leg is coded on the proven note_caption pattern, untested here (no
+whisper-cli on this box).
+
+Production guidance for the voice+camera Orin product: within one session
+the model's own ears work only while the context is vision-free. A session
+that mixes camera and voice needs whisper for ALL speech input (native
+hearing reserved for audio-only sessions), or separate sessions per
+modality. Harnesses: ~/ttft_av.py (arrangements), ~/ttft_2t.py (split
+turns) on cortex; scratchpad copies kept with the campaign files.
