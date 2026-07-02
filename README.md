@@ -417,16 +417,16 @@ request byte sent → first streamed token, warm server, first turn
 discarded, prompt caching off, same GGUFs, token parity checked
 (2026-07-02, medians of warm turns):
 
-| device | model | turn | little-gemma ttft / prefill | llama-server ttft / prefill | input tokens (lg / llama) |
+| device | model | turn | little-gemma ttft (s) / prefill (tok/s) | llama-server ttft (s) / prefill (tok/s) | input tokens (lg / llama) |
 |--------|-----|------|----------------------------:|----------------------------:|:-------------------------:|
-| A5000 | 12B | 929-tok text | **0.51 s** / 1,803 | 0.53 s / 1,753 | 928 / 928 |
-| A5000 | E4B | 929-tok text | 0.25 s / 3,717 | **0.23 s** / 4,070 | 928 / 928 |
-| A5000 | 12B | image+question | **0.20 s** / 827 | 0.29 s / 715 | 150 / 157 |
-| A5000 | E4B | image+question | **0.13 s** / 1,317 | 0.30 s / 1,229 | 150 / 293 |
-| Orin | 12B | 929-tok text | 5.37 s / 173 | **4.64 s** / 200 | 929 / 928 |
-| Orin | E4B | 929-tok text | 2.23 s / 417 | **1.91 s** / 488 | 929 / 928 |
-| Orin | 12B | image+question | **1.15 s** / 132 | 2.11 s / 92 | 150 / 157 |
-| Orin | E4B | image+question | **0.69 s** / 308 | 1.65 s / 210 | 150 / 293 |
+| A5000 | 12B | 929-tok text | **0.51** / 1,803 | 0.53 / 1,753 | 928 / 928 |
+| A5000 | E4B | 929-tok text | 0.25 / 3,717 | **0.23** / 4,070 | 928 / 928 |
+| A5000 | 12B | image+question | **0.20** / 827 | 0.29 / 715 | 150 / 157 |
+| A5000 | E4B | image+question | **0.13** / 1,317 | 0.30 / 1,229 | 150 / 293 |
+| Orin | 12B | 929-tok text | 5.37 / 173 | **4.64** / 200 | 929 / 928 |
+| Orin | E4B | 929-tok text | 2.23 / 417 | **1.91** / 488 | 929 / 928 |
+| Orin | 12B | image+question | **1.15** / 132 | 2.11 / 92 | 150 / 157 |
+| Orin | E4B | image+question | **0.69** / 308 | 1.65 / 210 | 150 / 293 |
 
 The prefill column is tok/s over the whole turn: ours from the serve stat
 (everything after the burst, media included), llama's from its own
