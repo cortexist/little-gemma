@@ -728,3 +728,40 @@ that mixes camera and voice needs whisper for ALL speech input (native
 hearing reserved for audio-only sessions), or separate sessions per
 modality. Harnesses: ~/ttft_av.py (arrangements), ~/ttft_2t.py (split
 turns) on cortex; scratchpad copies kept with the campaign files.
+
+## 2026-07-02 — live voice: streaming transcripts and barge-in
+
+The whisper-everywhere consequence of the A+V exclusion raised the obvious
+objection: a 10 s utterance must not mean 10 s of listening followed by one
+monolithic whisper pass while everything waits. Two pieces close it:
+
+**The prompt was already appendable.** A turn stays open until its newline
+line; T frames append text to it at any time. So a voice client streams the
+transcript INTO THE OPEN TURN while the user is still talking: whisper runs
+over the growing utterance every ~1 s, and words two consecutive passes
+agree on (LocalAgreement-2 — a confirmed prefix never changes) are
+committed as T frames. By end-of-speech only the unstable tail is left:
+post-utterance cost is one whisper pass over the last chunk, not the clip.
+This is voicecat in little-gemma-tools (424ed72) — mic via ffmpeg, energy
+VAD, single-threaded and mic-clocked, native-audio-span fallback for
+vision-free sessions, --stdin-pcm/--rt for deterministic testing (a stub
+whisper exercised the whole pipeline before a real one existed).
+
+**Barge-in is one byte.** MEDIA_BARGE (0x02, cd479d3): sent while a reply
+streams, the per-token peek the serve loop already did (client_signal, same
+syscall pattern — decode untouched: A5000 1783 text / MTP 156/156 @ 131,
+Orin 417.5, Paris OK) consumes it, closes the turn on the wire with
+<turn|>, and falls through to the next turn. The cut-off reply STAYS in
+the context — the model knows what it didn't get to say — and remembering
+"I was interrupted" belongs to the client: voicecat opens the next turn
+with a note. Measured on the Orin: "history of Rome in detail" barged at
+32 tokens, then "(interrupting) short version please" answered with a
+one-sentence Rome summary — context retained, interruption honored.
+
+Also fixed along the way: a latent cmd.exe quoting bug in the whisper
+invocation shared by mmcat/voicecat (a popen /c string that starts with a
+quoted path gets its outer quotes stripped; wrapped in an extra pair).
+Remaining for production voice: install whisper.cpp on the Orin (model
+size sets the commit cadence), AEC/headset assumption for open-air mics,
+and the TTS side of barge (stop speaking when barged — downstream of
+voicecat's stdout).
