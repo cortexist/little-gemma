@@ -649,3 +649,37 @@ greedy sensitivity to ~3e-3 embedding drift — quality-equivalent class);
 both deterministic across repeated runs; Orin camera reply identical, video
 reply reads the counter; E4B legacy battery reply IDENTICAL after the
 dispatch refactor; CPU `run` target still builds (stubs extended).
+
+## 2026-07-02 — 12B audio input: two experiments close the question
+
+Post-lever-4 the audio input path is at its floor server-side (embed ~0, one
+batched GEMM, span packs with the text, GPU rows bit-identical across
+devices). Two experiments probed what is left:
+
+**Causal audio: FALSIFIED with proof.** If audio tokens tolerated a causal
+mask, a live microphone could prefill DURING speech (each 40 ms token is a
+pure function of its own frame — no receptive field to recompute). They do
+not: LG_NO_IMG_BIDIR on three clips degrades every one (12B, A5000 —
+"the road never comes to an end" -> "When will the fall never come to an
+end?", a speech clip heard as "a beep or chirp", plus channel-token
+stutter). Bidirectional attention within an audio span is load-bearing,
+same as vision — an utterance span can only prefill WHOLE, after it ends.
+
+**Chunked utterance spans: a latency/quality DIAL, measured.** The protocol
+already takes several 'A' frames per turn; each becomes its own bidir span
+and prefills on arrival (the lever-1 holdback). Orin 12B, the 3.1 s alice
+clip, live-capture shape:
+
+| chunking | post-utterance ttft | heard |
+|---|---:|---|
+| whole (1 span) | 0.86 s | "the farm never come to an end" (baseline garble) |
+| 2 x ~1.5 s | **0.48 s** | "the poem never came to an end" — gist intact, noun drifts |
+| 4 x ~0.8 s | 1.09 s (burst) | "what's coming, what's coming" — collapsed, ran to the GEN cap |
+
+So ~1.5-2 s chunks buy roughly half the post-utterance latency at a mild,
+real comprehension cost that will accumulate with utterance length; finer
+chunks destroy the percept. Client-side policy, zero server work — the safe
+default stays whole-utterance. Remaining open on audio: the combined A+V
+template order (mp4 soundtrack + frames, parked in little-gemma-tools), and
+for a voice product the loop is now bounded by DECODE (7.7 tok/s Orin 12B),
+not input.
