@@ -271,14 +271,20 @@ token. Verification is greedy, which buys the strongest property speculative
 decoding can have: **the output is byte-identical to plain greedy decoding,
 always** (the split-K verify makes it byte-identical *by construction*) — the
 only things that move are tokens/s and the acceptance rate the stats line
-reports. Acceptance is content-driven — ~100% on counting, ~68–83% on code,
-~55–74% on prose — and on every target measured, MTP pays. In the **socket
-server**, steady-state:
+reports. What MTP is worth is **sharply content-dependent**: at block-3, a
+fully-accepted round emits three tokens for ~one decode pass, so structured
+output (counting, lists, tables) roughly **doubles**; free prose lives or
+dies on the draft head's acceptance rate — the 12B's 1024-wide head lands
+~49% of prose drafts, E4B's 256-wide head only ~30%. Measured in the
+**socket server**, steady-state (2026-07):
 
-| model | counting (~100%) | code (~68–83%) | prose (~55–74%) |
-|-------|-----------------:|---------------:|----------------:|
-| E4B (A5000 / Orin) | 1.58× / 1.50× | 1.39× / 1.26× | 1.23× / 1.16× |
-| 12B (A5000 / Orin) | 1.63× / 1.43× | 1.48× / 1.30× | 1.42× / 1.22× |
+| model | counting (100% acc) | prose |
+|-------|--------------------:|------:|
+| E4B (A5000 / Orin) | **2.08×** / — | 1.10× / 1.12× |
+| 12B (A5000 / Orin) | **2.16×** / **1.85×** | 1.35× / — |
+
+(A5000: 12B 61.6 → 133 tok/s counting, 49.9 → 66.9 prose. The missing Orin
+cells await a board repair; the measured ones bracket the same story.)
 
 **A measurement trap worth recording:** the draft head pays a one-time ~3.6 s
 CUDA-graph warmup on its *first* call, and a one-shot `run -p` charges all of
@@ -338,15 +344,15 @@ bisections included, are **[docs/performance-journal.md](docs/performance-journa
 and **[docs/prefill-performance-journal.md](docs/prefill-performance-journal.md)**.
 
 Where things stand — same day, same machine, same prompt (little-gemma =
-`run-cuda-i8`, warm; llama.cpp = `llama-bench`). **Plain decode**; MTP is a
-further 1.2–1.6× on top (the table above):
+`run-cuda-i8`, 256 generated tokens, warm; llama.cpp = `llama-bench` tg32,
+best of fa0/fa1). **Plain decode**; MTP multiplies on top (the table above):
 
-**RTX A5000 (Windows):**
+**RTX A5000 (Windows), re-measured 2026-07:**
 
 | model | size | params | little-gemma | llama.cpp CUDA | ratio |
 |-------|-----:|-------:|-------------:|---------------:|------:|
-| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.7 | 116.3 ± 1.3 | 0.99× |
-| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.5 |  64.3 ± 0.3 | 0.94× |
+| E4B Q4_K_M  | 4.95 GiB |  7.52 B | 118.8 | 117.4 ± 1.5 | **1.01×** |
+| 12B Q4_K_M  | 6.86 GiB | 11.91 B |  62.3 |  66.2 ± 0.2 | 0.94× |
 
 **Jetson Orin NX 16GB (Linux, integrated GPU, zero-copy weights):**
 
@@ -360,27 +366,32 @@ more decode speed is about everything *around* the matmul — launch overhead,
 sync round-trips, norms, the PLE path — which a few thousand readable lines
 can do leanly. The bigger the model, the more it reduces to sustained DRAM
 bandwidth through the quantized matmul, where llama.cpp's arch-tuned kernels
-still hold a few percent on desktop. On the edge device this project actually
-targets, every row is ahead, and MTP widens the lead.
+still hold a few percent on desktop (the 12B's 0.94×). The E4B crossed into
+a win when the f16 SWA rings landed; on the edge device this project
+actually targets, every row is ahead, and MTP widens the lead.
 
 **Prefill** (prompt processing) was long the honest weak axis — llama.cpp
 prefills through arch-tuned tensor-core GEMMs at large batch — and the
-2026-07 overhaul closed most of it. Warm serve prefill, ~930-token turns,
-byte-identical output throughout:
+2026-07 pushes closed most of it on BOTH devices. Warm serve prefill,
+~930-token turns, same-day llama.cpp:
 
 | device | model | prompt tok/s | vs llama.cpp |
 |--------|-------|-------------:|--------------|
-| A5000 | 12B | 533 → **~1,760** | 0.78× (was 0.24×) |
-| A5000 | E4B | 1,020 → **~3,600** | ~0.69× (was 0.21×) |
-| Orin  | 12B | ~102 → **~125** | ~0.6× |
-| Orin  | E4B | ~192 → **~246** | ~0.5× |
+| A5000 | 12B | 533 → **~1,820** | 0.81× (was 0.24×) |
+| A5000 | E4B | 1,020 → **~3,720** | ~0.70× (was 0.21×) |
+| Orin  | 12B | ~102 → **~173** | **0.80×** |
+| Orin  | E4B | ~192 → **~417** | **0.82×** |
 
-The residual is llama.cpp's ground-up MMQ instruction schedule — measured to
-its floor with warp-stall counters and deliberately not vendored back (the
-why is a story of its own: `docs/stream-k-experiment.md`). In interactive
-serving it rarely shows — turns are short, `-sys` removes the skills
-re-prefill, the GPU encoder removed the image one — but on very long
-documents llama.cpp still wins the wait.
+Most steps were gated byte-identical; the f16 SWA rings and warp-row norms
+ship under the same determinism + quality gate as the original f16-KV step
+(and bought decode ~+8% on the Jetson as a side effect). The residual is
+llama.cpp's ground-up MMQ instruction schedule and flash-attention
+architecture — measured to their floors with warp-stall counters and
+deliberately not vendored back (`docs/stream-k-experiment.md`,
+`docs/prefill-performance-journal.md`). In interactive serving it rarely
+shows — turns are short, `-sys` removes the skills re-prefill, the GPU
+encoder removed the image one — but on very long documents llama.cpp still
+wins the wait.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
