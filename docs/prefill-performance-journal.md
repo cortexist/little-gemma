@@ -957,3 +957,34 @@ product choice), larger whisper models, or long dictation. And the
 production upgrade that flips the verdict unconditionally is a PERSISTENT
 whisper (server mode / linked libwhisper): it deletes the per-pass load
 cost that is the entire naive advantage.
+
+## 2026-07-02 — dictation: the appendable turn prefills while the user speaks
+
+The last unhidden latency was the LONG spoken instruction: a 929-token turn
+costs 5.37 s of prefill on the Orin 12B, all of it after the user stops
+talking. The turn was already appendable ('T' frames) and voicecat already
+streams confirmed transcript into it — the server just let that text SIT in
+the chat buffer until the closing line. Now it flushes: accumulated 'T'
+text past SERVE_TEXT_FLUSH (256 chars) prefills incrementally, split at the
+last SPACE with the space kept in the remainder. That split is EXACT, not
+approximate: SentencePiece pieces never cross a space, so the fragmented
+token stream is byte-identical to tokenizing the whole turn at once —
+proven directly (930 ids in every mode, replies byte-identical).
+
+Orin 12B, the 929-token instruction (ttft_dictate.py, client-side clocks):
+
+| delivery | ttft after last word | note |
+|---|---:|---|
+| single line (baseline) | 5.37 s | all prefill post-utterance |
+| burst of 'T' frames | 6.72 s | nothing to hide behind + small-chunk pads (burst clients should send a line) |
+| paced at 30 words/s | **0.55 s** | prefill fully hidden under the 30.7 s of speaking |
+
+At a real dictation pace (~2.5 words/s) the hiding is even more
+comfortable. TTFS follows: 9.23 -> 4.41 s, the remainder being thought +
+first sentence at decode rate. Gates: replies byte-identical across all
+three deliveries with EQUAL id counts (the tokenization invariant, observed
+not assumed); text bench at campaign numbers (A5000 1824, Paris OK); MTP
+156/156. voicecat needed NO change — its commits now trigger the flushes
+automatically. With true streaming ASR (persistent whisper) this completes
+the chain: speech -> transcript -> kv cache, all concurrent, and the answer
+starts a beat after the user stops.

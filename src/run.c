@@ -89,6 +89,9 @@ static void print_piece(const char *s) {
 // is the unit of work that cannot be interrupted, and never needs to be.
 
 #define SERVE_SEQ 8192   // context budget per conversation
+#define SERVE_TEXT_FLUSH 256   // accumulated 'T' text (chars) that triggers an
+                               // incremental prefill of the open turn — long
+                               // dictation prefills while the user speaks
 #define SERVE_GEN 1024   // output cap per turn: greedy decode has no sampler and
                          // no repeat penalty, so a degenerate loop would otherwise
                          // spin until the context fills (observed: 8,098 tokens,
@@ -365,6 +368,29 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     if (tl + (int)len + 256 >= (int)sizeof chat) { free(payload); full = 1; break; }
                     tl += snprintf(chat + tl, sizeof chat - tl, "%s", payload);
                     free(payload);
+                    // DICTATION: a long instruction streams in as 'T' commits
+                    // (voicecat's confirmed transcript), so prefill the text as
+                    // it accumulates and the prefill HIDES under the speaking —
+                    // a 929-token spoken instruction answers in the tail time,
+                    // not 5+ seconds after the user stops. Split at the last
+                    // SPACE and keep it with the remainder: SentencePiece
+                    // pieces never cross a space, so the split token stream is
+                    // byte-identical to tokenizing the whole turn at once.
+                    if (tl >= SERVE_TEXT_FLUSH && pos + tl + 64 < SERVE_SEQ) {
+                        int split = tl - 1;
+                        while (split > 0 && chat[split] != ' ') split--;
+                        if (split > 0) {
+                            chat[split] = 0;
+                            n = tokenizer_encode(tk, chat, promptv, 4096);
+                            double f0 = now_sec();
+                            model_prefill_mixed(&m, &kv, NULL, promptv + skip, n - skip, pos);
+                            pos += n - skip; total += n - skip; skip = 1;
+                            tp += now_sec() - f0;
+                            chat[split] = ' ';
+                            memmove(chat, chat + split, (size_t)(tl - split) + 1);
+                            tl -= split;
+                        }
+                    }
                     continue;
                 }
                 if (!md) { fprintf(stderr, "media frame but no -mm projector\n"); free(payload); dead = 1; break; }

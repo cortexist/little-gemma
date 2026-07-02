@@ -235,6 +235,16 @@ exactly that shape. The server wraps each media span in the model's marker
 tokens, so the model sees what it was trained on:
 `<|turn>user\n<|image>` *(192-ish embedding rows)* `<image|>{text}<turn|>\n<|turn>model\n`.
 
+Text does too — the turn is appendable, and it **prefills while it is still
+being dictated**: streamed `'T'` text (voicecat's confirmed transcript, or
+any client's) flushes into the kv cache in word-boundary chunks as it
+accumulates, which is exact because SentencePiece pieces never cross a
+space — the split token stream is byte-identical to tokenizing the whole
+turn at once (verified: identical replies, identical id counts). A spoken
+929-token instruction on the Orin 12B answers **0.55 s** after the last
+word instead of 5.4 s; the prefill didn't get faster, it got *hidden under
+the speaking*.
+
 Media also **prefills as it arrives**: a span's kv rows are seated the moment
 its frame is decoded — causality needs only completed prefixes, and the
 bidirectional window never leaves a span — so the cache fills while the
