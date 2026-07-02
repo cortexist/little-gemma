@@ -280,6 +280,52 @@ the old board resets don't reproduce. That unlocks device-truth stall data:
 Deep-read of llama.cpp's Orin-side non-matmul path (their ~0.5–0.9 s vs our
 1.55 s) is the candidate for a fan-out workflow if 1–4 fall short of parity.
 
+## Orin push — Phase 1a (2026-07-02): two falsifications, a deep-read, and the real plan
+
+**Falsified on-device (both would have shipped on paper):**
+- **2-deep A-staging prefetch:** dead neutral on BOTH devices (Orin 162.4 vs
+  162.3; E4B 380.9 vs 381.4; A5000 1759 — the earlier −0.7% was noise). The
+  "deeper window covers uncached latency" hypothesis fails: at 2
+  warps/scheduler there is nothing to fill the wait with, however early the
+  load issues.
+- **q6_K 16-aligned repack + uint4 staging:** e2e flat and the q6k kernel
+  measured SLOWER (0.912 → 0.938 s) — the 4× LSU-instruction cut was repaid
+  with interest by +6.7% bytes. lg_throttle was real but the kernel sits at
+  bandwidth-balance; conservation of misery. Reverted.
+
+**The board-reset mystery is solved:** ncu + the 12B on the 16 GB board =
+NvMap OOM → watchdog reboot (reproduced; the board reset during a 12B flash
+capture, and a post-reboot retry failed gracefully with NvMap error 12).
+Every E4B capture runs clean. **Rule: Orin ncu captures use E4B only.**
+
+**llama.cpp deep-read (33-agent fan-out, adversarially verified, 14
+confirmed mechanisms).** Negative knowledge first — all verified in source:
+their mmq has NO cp.async (the journal's old "cp.async depth" hypothesis is
+retired); prefill never runs under CUDA graphs; there is no elementwise
+fusion advantage (≈12 launches/layer vs our ≈14, and our
+quantize-in-producer fusion is ahead of their separate q8_1 kernels); the
+fork's turboquant CUDA is decode-only — we are losing to stock upstream
+mmq/fattn maturity, nothing exotic. Surviving transplant candidates:
+
+1. **Wide-N mma restructure** (~0.3–0.6 s): llama auto-sizes column tiles to
+   128 and streams the weight matrix 8× per 929-token turn; we stream it 15×
+   (COLS=64) over uncached zero-copy weights. COLS=128 needs llama's tile
+   shape — ONE 16-row tile per warp (acc stays 64 f/thread), half-buffered B,
+   >48 KB shared opt-in — not a template bump (which would spill). Orin-gated;
+   byte-identity preserved (same per-element k-order).
+2. **Flash GQA packing** (~0.15–0.25 s): serve both Q-heads of a KV group per
+   CTA (llama's ncols2=2), halving K-stage sweeps and strided V loads. Orin
+   flash capture (E4B): SM 25.8%, mio_throttle 4.7 — the same
+   instruction-count wall GQA packing halves. Media/bidir mask carries over;
+   media smoke required.
+3. **Elementwise per-kernel bandwidth pass** (~0.2–0.35 s pool): ~25 GB of
+   traffic at ~35 GB/s effective; float4/one-pass fixes guided by E4B
+   captures. Fusion-hunting explicitly excluded (see negative knowledge).
+
+Mid-points sum to ~1.0–1.2 s against the 1.44 s parity gap — reachable if
+most land, with llama's remaining per-pass codegen edge (57.5 vs 53.4% SM)
+explicitly NOT chased.
+
 ### Where this leaves prefill
 
 The whole 2026-07-01/02 arc, all gates green on both devices:
