@@ -326,6 +326,51 @@ Mid-points sum to ~1.0–1.2 s against the 1.44 s parity gap — reachable if
 most land, with llama's remaining per-pass codegen edge (57.5 vs 53.4% SM)
 explicitly NOT chased.
 
+## Orin push — Phase 1b (2026-07-02): the transplant verdicts + the real decomposition
+
+**The decisive measurement of the phase: nsys on llama-bench itself** (both
+models, same board/clocks/token-count as our benches). Per 929-token 12B
+prefill, kernel-time decomposition, ours vs theirs:
+
+| component | ours | llama | gap |
+|---|---:|---:|---:|
+| q4_K matmul | 3.27 s | 3.00 s | 0.27 s |
+| q6_K matmul | 0.91 s | 0.57 s | 0.34 s |
+| **attention** | **0.67 s** | **0.08 s** | **0.59 s** |
+| elementwise (incl. their separate q8_1 quantizes) | 0.73 s | ~0.55 s | ~0.18 s |
+
+Three surprises: the week's pipeline work already closed the q4_K "codegen
+wall" to **9%**; elementwise is near-parity as the deep-read predicted; and
+**their flash attention is 8× ours** — f16 KV cache + cp.async/ldmatrix
+pipeline + GQA packing. Attention is 41% of the whole gap.
+
+**Lever verdicts (all wiring-proven):**
+- **Wide-N restructure (deep-read #3): FALSIFIED on the Orin it targeted** —
+  12B 163.0 → 147.1 (−9.8%), E4B −8.3% (and −13.5% on A5000). Losing the
+  2-tile B-fragment reuse costs more than the 15→8 weight-pass cut saves;
+  consistent with the device-copy falsification — weight traffic is NOT the
+  binding constraint. (Fork-implemented, all correctness gates passed;
+  preserved in the session record, not in the tree.)
+- **rope frequency table: KEPT, +0.4% both models** (e8d9418) — the chunk
+  rope was 84%-SM-saturated recomputing ~2M powf per launch; table built by
+  the same powf → byte-identical.
+- **Flash GQA packing (deep-read #4): KEPT, 12B +1.7%** (4299013) —
+  163.0 → 165.8. Structurally the first slice of llama's 8× flash edge;
+  E4B is gqa-4 (unpacked for now).
+
+**Scoreboard after Phase 1b (Orin, warm serve, pinned clocks):**
+12B **165.8** vs llama 216.8 (**0.76×**); E4B **382.9** vs 510.3 (0.75×).
+A5000 unchanged at ~1770 / ~3600.
+
+**What parity now requires — the honest ledger.** Byte-identity-preserving
+levers still open: their q6_K edge (0.34 s, mechanism not yet isolated) and
+scraps. Numerics-gated levers: f16 SWA rings + an async flash rewrite
+(attention 0.57 → ~0.2–0.3 s; changes decode numerics), rmsnorm_add_n
+reduction restructure (~0.1 s). Sum of EVERYTHING lands ~4.7 s ≈ 197 tok/s ≈
+0.91× — true parity additionally needs the last 0.27 s of q4_K (their mmq
+instruction schedule, priced and declined) or new ideas. The strategy
+decision above this line belongs to the user.
+
 ### Where this leaves prefill
 
 The whole 2026-07-01/02 arc, all gates green on both devices:
