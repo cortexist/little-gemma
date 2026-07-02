@@ -280,11 +280,11 @@ dies on the draft head's acceptance rate — the 12B's 1024-wide head lands
 
 | model | counting (100% acc) | prose |
 |-------|--------------------:|------:|
-| E4B (A5000 / Orin) | **2.08×** / — | 1.10× / 1.12× |
-| 12B (A5000 / Orin) | **2.16×** / **1.85×** | 1.35× / — |
+| E4B (A5000 / Orin) | **2.08×** / **1.83×** | 1.10× / 1.12× |
+| 12B (A5000 / Orin) | **2.16×** / **1.85×** | 1.35× / 1.19× |
 
-(A5000: 12B 61.6 → 133 tok/s counting, 49.9 → 66.9 prose. The missing Orin
-cells await a board repair; the measured ones bracket the same story.)
+(A5000 12B: 61.6 → 133 tok/s counting, 49.9 → 66.9 prose; Orin 12B:
+8.4 → 15.5 counting, 7.8 → 9.3 prose.)
 
 **A measurement trap worth recording:** the draft head pays a one-time ~3.6 s
 CUDA-graph warmup on its *first* call, and a one-shot `run -p` charges all of
