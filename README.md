@@ -111,12 +111,10 @@ run -c <socket>
 - `-mtp` → also load a gemma4-assistant draft head and decode speculatively;
   see "Speculative decoding" below. Output is identical, only speed changes.
 - `-sys <file>` → prefill the file as a system turn ONCE at server start;
-  every `-s` session then begins with it already in context. This is the
-  skills-in-context pattern without the TTFT tax: a client that reconnects
-  per exchange (a robot, an agent pipeline) stops re-paying the skills
-  prefill on every connection — the saved cache rows are restored at session
-  start (a long previous session can wrap the sliding-window rings over
-  them), so each conversation starts byte-identically fresh.
+  every `-s` session then begins with it already in context — the
+  skills-in-context pattern without the TTFT tax. The saved cache rows are
+  restored at session start, so each conversation begins byte-identically
+  fresh no matter what a previous session did to the rings.
 
 ```
 > run -m model.gguf -p "The capital of France is"
@@ -136,11 +134,9 @@ run-cuda-i8 -m model.gguf -s /tmp/lg.sock        # Ctrl-C to stop
 echo "What is the capital of France?" | nc -N -U /tmp/lg.sock
 ```
 
-(The `-N` matters: it half-closes the socket when stdin ends, which is how the
-server learns the conversation is over. Without it, plain `nc` holds its write
-side open, the server politely waits for your next turn, and both sides sit
-there forever. Don't use `-q 0` instead — that one quits on a timer and can
-cut the answer off mid-stream.)
+(The `-N` matters: it half-closes the socket at stdin EOF, which is how the
+server learns the conversation is over — without it both sides wait forever;
+`-q 0` instead quits on a timer and can cut the answer off mid-stream.)
 
 The protocol is the simplest thing that works, designed so raw media frames can
 join it later without breaking anything:
@@ -170,18 +166,14 @@ join it later without breaking anything:
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.
 
 **Don't read benchmark numbers out of one-question sessions.** The per-turn
-tok/s will swing wildly for the same question — 13, then 61, then 134, then 60
-tok/s — and that is the GPU, not the server. The first session after load pays
-one-time warmup (weight repack and upload, CUDA graph capture). After that the
-variance is clock ramping: an idle GPU parks at its floor (210 of 2100 MHz on
-the A5000 here), and a one-question session is only ~25–35 forwards — ~0.2 s
-of work at full clock — so the whole session can fit inside the ramp, and the
-reported rate is just where in the ramp it landed. Run sessions back-to-back
-fast enough and some catch the previous session's still-raised clocks, hence
-the up-and-down. The numbers in the tables below are steady state: pipeline
-several turns into one connection and the rate reaches the table's value by
-the second turn (or pin the clocks while measuring with
-`nvidia-smi --lock-gpu-clocks`, which needs an elevated shell).
+tok/s swings wildly for the same question — 13, then 61, then 134 — and that
+is the GPU, not the server: an idle GPU parks at its clock floor (210 of
+2100 MHz on the A5000 here), and a one-question session is only ~25–35
+forwards, so the whole session fits inside the clock ramp. (The one-time
+weight repack/upload is no longer part of this: the server absorbs it in a
+2-token warmup before it starts listening, so even the first turn runs warm.)
+The numbers in the tables below are steady state: pipeline several turns into
+one connection, or pin the clocks with `nvidia-smi --lock-gpu-clocks`.
 
 AF_UNIX works on Windows 10+ with the same code (`afunix.h`); the socket path's
 directory must exist (`/tmp/...` is a Linux path — on Windows use e.g.
@@ -234,14 +226,10 @@ frames that land between them — then the usual newline-terminated text line;
 a text-only client speaks the same protocol it always did. The interleaved
 text is what makes a multi-image turn legible to the model: given two bare
 images it answers "there is only one image", but with timestamp text between
-them it counts both frames and compares them correctly. A video tool emits
-exactly that shape. The server wraps each media span in the model's marker tokens, so
-the model sees what it was trained on:
+them it counts both frames and compares them correctly — a video tool emits
+exactly that shape. The server wraps each media span in the model's marker
+tokens, so the model sees what it was trained on:
 `<|turn>user\n<|image>` *(192-ish embedding rows)* `<image|>{text}<turn|>\n<|turn>model\n`.
-The runner validates geometry, not content — junk pixels are junk whether or
-not a valid JPEG wrapped them, and decoding junk is the tool's job anyway.
-At ~2 MB per maximal image, a local socket moves a frame in about a
-millisecond; the prefill it triggers costs hundreds of times more.
 
 Text is optional when media frames are sent: a spoken question, or a written
 note shown to the camera, is a complete turn by itself —
@@ -277,37 +265,26 @@ the target's last hidden state. `mtp.c` implements it; `-mtp` turns it on:
 run-cuda-i8 -m gemma-4-E4B-it-Q4_K_M.gguf -mtp gemma-e4b-assistant-mtp.gguf -p "..."
 ```
 
-Each round drafts one token and verifies `[token, draft]` as a single
-two-position batch — the weights cross memory once for the pair, so an
-accepted draft is nearly a free token (spec blocks deeper than 2 measured as
-regressions, so one draft per round it is). Verification is greedy, which
-buys the strongest property speculative decoding can have: **the output is
-byte-identical to plain greedy decoding, always** — the only things that move
-are tokens/s and the acceptance rate the stats line reports. Acceptance is
-content-driven: ~100% on counting, ~68–83% on code, ~55–74% on prose — the
-harder the next token is to guess, the lower it falls.
-
-Whether MTP *pays* comes down to acceptance × verify cost, and on every target
-measured it pays. A B=2 verify costs nearly one decode pass, so a held draft is
-almost a free token. Measured in the **socket server** — steady-state, the way
-it actually runs (a one-shot `-p` mismeasures it; see the trap below) — both
-models speed up on **both** the A5000 and the Jetson:
+Each round drafts and then verifies the block as one small batch — the
+weights cross memory once for it, so an accepted draft is nearly a free
+token. Verification is greedy, which buys the strongest property speculative
+decoding can have: **the output is byte-identical to plain greedy decoding,
+always** (the split-K verify makes it byte-identical *by construction*) — the
+only things that move are tokens/s and the acceptance rate the stats line
+reports. Acceptance is content-driven — ~100% on counting, ~68–83% on code,
+~55–74% on prose — and on every target measured, MTP pays. In the **socket
+server**, steady-state:
 
 | model | counting (~100%) | code (~68–83%) | prose (~55–74%) |
 |-------|-----------------:|---------------:|----------------:|
 | E4B (A5000 / Orin) | 1.58× / 1.50× | 1.39× / 1.26× | 1.23× / 1.16× |
 | 12B (A5000 / Orin) | 1.63× / 1.43× | 1.48× / 1.30× | 1.42× / 1.22× |
 
-The 12B's wider draft head (1024 vs E4B's 256) accepts more on hard content, so
-it gains the most. **A measurement trap worth recording:** the draft head pays
-a one-time **~3.6 s CUDA-graph warmup on its *first* call**, mid-generation — and
-a one-shot `run -p` charges all of it to that single short run, which makes MTP
-look like a regression. An earlier version of these tables did exactly that and
-wrongly concluded *"MTP loses on Windows."* In the server the warmup is paid
-once, at the first turn, and amortizes to nothing — so MTP must be benchmarked
-in serve mode with the first turn discarded. Greedy verification keeps the
-output **byte-identical to plain decoding**, and the split-K verify makes
-`-mtp == plain` byte-identical *by construction* — the full story, including the
+**A measurement trap worth recording:** the draft head pays a one-time ~3.6 s
+CUDA-graph warmup on its *first* call, and a one-shot `run -p` charges all of
+it to that single short run — an earlier version of these tables did exactly
+that and wrongly concluded *"MTP loses on Windows."* Benchmark MTP in serve
+mode with the first turn discarded. The full story, including the
 uncached-zero-copy bug the verify exposed in the chunk matmul, is in the
 [performance journal](docs/performance-journal.md).
 
@@ -347,33 +324,27 @@ GPU backends, so each is a thin file that includes the header and defines just
 `matmul_q`. Diff `model-cuda-f32.cu` against `model-cuda-i8.cu` to see exactly
 where the speed comes from.
 
-Getting the speed was a journey of two dozen gated steps: two profiling-led
-rewrites that *failed* (and earned their write-ups), a CUDA graph against WDDM
-launch latency, wide weight loads, a long tail of wins mostly *outside* the
-matmul everyone stares at — E2B from 7.9 to 182.5 tok/s — then a long-context
-roadmap (online-softmax attention, batched prefill, a kv cache at ~5% of its
-old footprint), GPU media encoders, and speculative decoding, which flushed
-out an uncached-zero-copy bug whose fix alone bought +49% prefill on desktop
-and ~2× on Jetson. Then a tensor-core prefill push — an int8 `mma` chunk
-matmul (q4_K then q6_K), wider 32-token chunks, and an L2-aware K/V-sharing
-attention — roughly doubled Jetson prefill again, and a **tensor-core flash
-attention** for the prompt phase added +44% on top (E4B prefill ~183 tok/s,
-12B ~98). The decode side gained a **split-K (FlashDecoding)** attention for
-long context, and speculative decoding finally reached the **socket server**
-(it had been quietly running plain) — where, on the short structured outputs
-the edge target produces, it speeds decode up to ~1.6×. The full log, dead ends
-and bisections included, is **[docs/performance-journal.md](docs/performance-journal.md)**.
+Getting the speed was a journey of gated steps — profiling-led rewrites that
+*failed* and earned their write-ups, a CUDA graph against WDDM launch
+latency, wide weight loads, a long-context roadmap (online-softmax attention,
+batched prefill, a kv cache at ~5% of its old footprint), GPU media encoders,
+speculative decoding, a tensor-core prefill push (an own int8 `mma` chunk
+matmul, flash attention for the prompt phase, split-K decode for long
+context) — and then a prefill overhaul that took both devices to their
+structural floor: balanced wide serve chunks, an L2-aware launch order,
+software-pipelined weight staging, and warp-cooperative activation
+quantization, every step gated byte-identical. The full logs, dead ends and
+bisections included, are **[docs/performance-journal.md](docs/performance-journal.md)**
+and **[docs/prefill-performance-journal.md](docs/prefill-performance-journal.md)**.
 
-Where things stand — both sides re-measured the same day on the same machine,
-same prompt (little-gemma = `run-cuda-i8`, 256 generated tokens, warm;
-llama.cpp = `llama-bench tg32`). These rows are **plain decode**; MTP is a
-further 1.2–1.6× on top of them (the table above):
+Where things stand — same day, same machine, same prompt (little-gemma =
+`run-cuda-i8`, warm; llama.cpp = `llama-bench`). **Plain decode**; MTP is a
+further 1.2–1.6× on top (the table above):
 
 **RTX A5000 (Windows):**
 
 | model | size | params | little-gemma | llama.cpp CUDA | ratio |
 |-------|-----:|-------:|-------------:|---------------:|------:|
-| E2B Q3_K_M  | 2.35 GiB |  4.65 B | 182.3 | 148.4 ± 6.6 | **1.23×** |
 | E4B Q4_K_M  | 4.95 GiB |  7.52 B | 114.7 | 116.3 ± 1.3 | 0.99× |
 | 12B Q4_K_M  | 6.86 GiB | 11.91 B |  60.5 |  64.3 ± 0.3 | 0.94× |
 
@@ -386,31 +357,30 @@ further 1.2–1.6× on top of them (the table above):
 
 The pattern is the project's thesis in two tables. The smaller the model, the
 more decode speed is about everything *around* the matmul — launch overhead,
-sync round-trips, norms, the PLE path — which a few thousand readable lines can
-do leanly. The bigger the model, the more it reduces to sustained DRAM
+sync round-trips, norms, the PLE path — which a few thousand readable lines
+can do leanly. The bigger the model, the more it reduces to sustained DRAM
 bandwidth through the quantized matmul, where llama.cpp's arch-tuned kernels
-still hold a few percent on desktop. On top of plain decode, MTP adds a further
-1.2–1.6× — serve-mode, byte-identical output — on **both** the desktop and the
-Jetson (the earlier "loses on Windows" reading was a one-shot-`-p` warmup
-artifact, corrected above). On the edge device this project actually targets,
-every row is ahead, and MTP widens the lead.
+still hold a few percent on desktop. On the edge device this project actually
+targets, every row is ahead, and MTP widens the lead.
 
-Those tables are **decode** — the project's strong axis. **Prefill** (prompt
-processing) is the honest weak axis: llama.cpp prefills at batch ~512 through
-arch-tuned tensor-core GEMMs that no few-thousand-line kernel matches. The
-push above — the int8 `mma` chunk matmul, wider chunks, K/V sharing, the
-bank-conflict pads, and then a tensor-core flash attention for the prompt
-phase — closed most of the gap on the Jetson: E4B ~55 → **~183** prompt
-tok/s, 12B ~21 → **~98** (a ~2,000-token prompt), moving the ratio to
-llama.cpp from ~10× behind to **~2.6×**. On the A5000 the same story took a
-different lever: weights are VRAM-resident there, so the cost of narrow
-chunks is SM starvation, not weight re-streaming — routing serve turns
-through balanced wide chunks (2026-07: 12B 533 → **~1,430** warm serve
-prompt tok/s, E4B 1,020 → **~3,050**, byte-identical output) moved the ratio
-from ~4× behind to **~1.6×**. It is still their axis. It rarely shows in
-interactive serving — turns are short, `-sys` removes the skills re-prefill,
-the GPU encoder removed the image one — but on long documents llama.cpp
-still wins the wait (see `docs/prefill-performance-journal.md`).
+**Prefill** (prompt processing) was long the honest weak axis — llama.cpp
+prefills through arch-tuned tensor-core GEMMs at large batch — and the
+2026-07 overhaul closed most of it. Warm serve prefill, ~930-token turns,
+byte-identical output throughout:
+
+| device | model | prompt tok/s | vs llama.cpp |
+|--------|-------|-------------:|--------------|
+| A5000 | 12B | 533 → **~1,760** | 0.78× (was 0.24×) |
+| A5000 | E4B | 1,020 → **~3,600** | ~0.69× (was 0.21×) |
+| Orin  | 12B | ~102 → **~125** | ~0.6× |
+| Orin  | E4B | ~192 → **~246** | ~0.5× |
+
+The residual is llama.cpp's ground-up MMQ instruction schedule — measured to
+its floor with warp-stall counters and deliberately not vendored back (the
+why is a story of its own: `docs/stream-k-experiment.md`). In interactive
+serving it rarely shows — turns are short, `-sys` removes the skills
+re-prefill, the GPU encoder removed the image one — but on very long
+documents llama.cpp still wins the wait.
 
 ## Performance vs llama.cpp (CPU, apples-to-apples)
 
@@ -432,31 +402,30 @@ is for.
 
 | directory | files | code  |
 |-----------|-------|------:|
-| src       | 15    | 5,807 |
+| src       | 16    | 5,948 |
 | include   | 6     |   254 |
 
-~6,060 lines of code in the repository (the original 3,000 exploring ceiling was
-retired when the sandbox phase began; `tools/` is not counted). The core now
-vendors **nothing** — pure C/CUDA — since media-file decoding moved to `mmcat` in
-the sibling little-gemma-tools repo (the old `vendor/stb_image.h` went with it).
-The backends are mutually exclusive, so no single program is anywhere near that.
-Each binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
-multimodal embedders, the MTP draft head, CLI + socket server — 2,657 lines)
-plus exactly one backend:
+~6,200 lines of code in the repository (`tools/` not counted). The core
+vendors **nothing** — pure C/CUDA; media-file decoding lives in `mmcat` in
+the sibling little-gemma-tools repo. The backends are mutually exclusive, so
+no single program is anywhere near that. Each binary is the shared pipeline
+(GGUF parse, dequant, tokenizer, config, multimodal embedders, the MTP draft
+head, CLI + socket server — 2,658 lines) plus exactly one backend:
 
-| binary        | backend on top of the shared 2,657                       | code lines |
+| binary        | backend on top of the shared 2,658                       | code lines |
 |---------------|----------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                            |      3,025 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,645 |
-| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      5,405 |
+| `run`         | `model-cpu.c`                                            |      3,032 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,697 |
+| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      5,539 |
 
-(`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by `graph_test`
-only.) So the program that out-decodes llama.cpp CUDA on the Jetson on every
-model it runs — multi-turn socket serving, batched prefill, a ring-buffered
-f16 KV cache, tensor-core flash-attention prefill, split-K decode, image and
-audio understanding, a GPU vision encoder, an own m16n8k32 tensor-core q4_K
-prefill kernel, and byte-identical speculative decoding included — is **about
-5,400 lines of C end to end**, tokenizer and all, with no vendored dependency.
+(`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by
+`graph_test` only.) So the program that out-decodes llama.cpp CUDA on the
+Jetson on every model it runs — multi-turn socket serving, batched wide-chunk
+prefill, a ring-buffered f16 KV cache, tensor-core flash-attention prefill,
+split-K decode, image and audio understanding, a GPU vision encoder, an own
+m16n8k32 tensor-core q4_K prefill kernel, and byte-identical speculative
+decoding included — is **about 5,500 lines of C end to end**, tokenizer and
+all, with no vendored dependency.
 
 ## Validation
 
