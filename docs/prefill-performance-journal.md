@@ -392,8 +392,19 @@ dispatch follows kv->f16); MTP==plain preserved at 93.8%.
 | E4B | 382.9 → **387.6** | 27.8 → **30.0 (+7.9%)** | 3602 → **3683** |
 
 The decode win is the sleeper: rings were the decode-bandwidth path.
-Stage 2 (in flight): K/V shared staging inside the packed f16 flash —
-pure copies now, so byte-identity applies again.
+
+**Stage 2 — K/V shared staging in the packed f16 flash: FALSIFIED, and it
+finally names the flash wall.** Fork-implemented (byte-identical, both legs
+toggleable), Orin A/B: K+V staging 166.0 (−1.4%), K-only 168.0 (neutral)
+vs 168.3 baseline. The V-restage physics failed a second time, and the
+K-stage neutrality closes the re-read/latency theory. The real reason
+staging cannot work here: **it swaps LDG for LDS one-for-one, and
+mio_throttle counts both** — the kernel is memory-INSTRUCTION-count bound,
+which is why GQA packing (fewer instructions) paid and staging (same
+instructions + a sweep) cannot. llama's flash spends ~4× fewer fragment
+instructions via `ldmatrix.x4` — fragment ECONOMY, not data placement, is
+the remaining flash lever (the June ldmatrix falsification was on the
+matmul A-path, a different site with a different diagnosis).
 
 ### Where this leaves prefill
 
