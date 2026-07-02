@@ -999,3 +999,50 @@ alone, while the 12B's is mostly thought; template-induced thought length
 remains the biggest TTFS variable. Timing diagrams (UML lifelines, both
 models, all measured): **docs/dictation-timing.html** — self-contained,
 open it in any browser.
+## 2026-07-02 — QAT E2B: q4_0 support, and the prefill that launched nothing
+
+Google released a QAT build of the E2B and the loader refused it:
+`model: missing attn_q/attn_k for layer 15`. Two file-level surprises, one
+real bug of ours.
+
+**The file.** Despite the `Q4_K_XL` name, every quantized tensor is plain
+**q4_0** (ggml type 2) — QAT trains *around* a simulated quantizer, and the
+simplest scheme (symmetric, one f16 scale per 32) is the one you simulate
+exactly; the release checkpoint IS the quantized weights, so q4_K's
+sub-block scale/min machinery would buy nothing. Same 4.5 bits/weight.
+And the 20 kv-shared layers (n_kv_start=15) are **pruned** of
+attn_k/attn_v/attn_k_norm — they only read their source layer's cache, so
+the dead projections are simply absent. Support was mechanical: q4_0 in
+quant.c (+f32/i8 kernel subs), and the geometry loop inherits the source
+layer's n_head_kv when a shared layer has no attn_k (the forwards already
+never compute k/v past n_kv_start).
+
+**The bug.** With q4_0 wired, the i8 backend still generated garbage —
+while the f32 backend answered *Paris* on the same file. The bisect that
+closed it: `LG_NO_MMA=1` made the i8 backend correct too. `matmul_q_n`'s
+comment promised "everything else falls to the dp4a chunk kernel", but the
+dp4a loop only ran under LG_NO_MMA — a type with no mma route (q4_0, q8_0,
+q3/q5_K, untwinned floats) fell off the end of the function and launched
+**nothing**. Stale d_out, garbage KV; decode is correct, so the model
+confidently continues from trash. Prefill-only corruption is the
+signature. This retroactively explains the parked "E2B Q3_K garbage" —
+q3_K has no mma route either; that was never a quant-quality problem. The
+fallthrough is now unconditional (and LG_NO_MMA just skips the mma gates).
+
+**q4_0 done properly.** The first scalar subs decoded at 7 tok/s: 18-byte
+blocks can't take 4-byte loads, and the Orin reads the in-place blob
+uncached. q4_0 now joins the q3_K/q6_K repack club — 20-byte 4-aligned
+`block_q4_0r` on device memory, dp4a subs (`__vsub4` with 0x08 bias, the
+q6 pattern). Integer dots are order-exact, so decode/verify byte-identity
+holds by construction.
+
+**Orin, pinned clocks, warm.** E2B QAT: decode 26.3 tok/s plain (1.6x the
+E4B's 16.2, as its size predicts), 31.5 tok/s on MTP prose at 78%
+acceptance (the release's own mtp head loads and drafts). The user-facing
+serve line works end to end: mmproj answers a red frame with "Red" (100
+tokens, 0.3s encode), text turns coherent. E4B regression 271 tok/s
+prefill, A5000 3722 — both at campaign numbers, Paris OK. **Open lever:**
+q4_0 has no mma prefill route, so E2B prefills at 48 tok/s on the dp4a
+fallback vs the E4B's 271 — an own m16n8k32 q4_0 kernel (simpler epilogue
+than q4_K: no mins, no super-block) is the priced next step if QAT E2B
+graduates toward production.
