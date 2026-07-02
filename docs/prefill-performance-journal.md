@@ -607,3 +607,45 @@ would save ~0.07 s but complicates the fat-launch contract), the ~66 ms
 A5000 first-pick, and encoder-stream overlap for bursts. The camera turn now
 spends 0.2 s seeing and 0.49 s reading — both terms at structural-ish floors
 without new kernel families.
+
+## 2026-07-02 — TTFT lever 4: the 12B unified media path on GPU
+
+The unified (gemma4uv/gemma4ua) path — the likely production path — still
+encoded on the HOST: an image was ~11 GFLOP of OpenMP matmats (~0.4 s/frame
+on the Orin CPU), audio a frame-at-a-time matvec loop, both serial in front
+of every span prefill. There is no transformer to port: image = LayerNorm of
+the raw 48x48 patch → [6912→3840] linear → bias/LN/pos/LN/rms → [3840→3840]
+projection; audio = rms of a raw 40 ms frame → one [640→3840] linear. On the
+tensor-core k_gemm from lever 2 that is two launches and change per image,
+and the audio loop becomes ONE batched GEMM (all shapes %64-clean). Both
+embedders now try the GPU first with the host kept as oracle/fallback, same
+seam as legacy; im2col got range parameters ([0,1] unified vs [-1,1] legacy,
+host op order preserved).
+
+| Orin 12B | before | after |
+|---|---:|---:|
+| image embed (130 tok) | ~0.4-0.5 s (host) | **~0.02 s** |
+| camera-burst ttft | ~1.7 s | **1.14 s** |
+| 6-frame paced video ttft | 2.93 s | **2.34 s** |
+| 6-frame paced video wall | 9.07 s | **6.65 s** |
+
+The video pipeline is now GPU-saturated: per-frame "embed" logs read ~1.0 s
+because the blocking D2H drains the PREVIOUS span's in-flight prefill — the
+encoder itself is ~20 ms and encode is entirely off the critical path.
+
+**Oracle forensics worth remembering.** The Orin verify first read 0.15 where
+the A5000 read 0.012 on the same input — a 12x device inconsistency that
+looked like a kernel bug. Dumping all four legs settled it: **the GPU rows
+are bit-identical across A5000 and Orin (max |diff| 0.0)**; it is the two
+HOST references that disagree with each other by 0.15 (fast-math OpenMP,
+x86 AVX vs ARM NEON, on unnormalized rows with |x| up to ~50 — ~3e-3
+relative). The host leg the Orin ran in production until today WAS the
+0.15 leg; the GPU path is more consistent than what it replaces. Rule:
+when LG_MEDIA_VERIFY reads high on one device only, suspect the reference.
+
+Gates: image reply word-for-word identical to the host path (A5000, 12B
+note.png); audio reply re-phrased but heard the same sentence (the expected
+greedy sensitivity to ~3e-3 embedding drift — quality-equivalent class);
+both deterministic across repeated runs; Orin camera reply identical, video
+reply reads the counter; E4B legacy battery reply IDENTICAL after the
+dispatch refactor; CPU `run` target still builds (stubs extended).

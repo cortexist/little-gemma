@@ -198,10 +198,14 @@ file is 11 tensors (167 MB): vision is one linear layer over 48×48-pixel
 patches plus three norms and a learned 2-axis position table; audio is one
 linear layer over raw 16 kHz waveform sliced into 640-sample (40 ms) frames.
 No vision transformer, no conformer, no mel spectrogram. `media.c` implements
-exactly that (the math mirrors llama.cpp's `gemma4uv`/`gemma4ua` graphs), and
-the resulting embedding rows prefill through the same batched-chunk path as
-text — they are just rows the tokenizer didn't make. Media embeddings are
-*not* `√n_embd`-scaled; only real token lookups are.
+exactly that (the math mirrors llama.cpp's `gemma4uv`/`gemma4ua` graphs), the
+CUDA builds run it on tensor cores (`media-cuda.cu` — an image is two GEMM
+launches and change, an audio clip's frame-at-a-time matvec loop becomes one
+batched GEMM; the GPU rows are bit-identical across devices, and the host
+path stays in as oracle and fallback), and the resulting embedding rows
+prefill through the same batched-chunk path as text — they are just rows the
+tokenizer didn't make. Media embeddings are *not* `√n_embd`-scaled; only
+real token lookups are.
 
 The runner never reads media **files**. The split mirrors the socket design:
 file formats — JPEG entropy coding, WAV chunk soup, resampling, resize

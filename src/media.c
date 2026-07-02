@@ -505,45 +505,46 @@ fail:
     return NULL;
 }
 
+// LG_MEDIA_VERIFY: the GPU rows against the host path's, for any embedder pair.
+static void verify_rows(const struct media *md, const float *rows, const float *ref, int n, int n2) {
+    double mx = 0;
+    if (ref && n2 == n)
+        for (size_t i = 0; i < (size_t)n2 * md->n_embd; i++) {
+            double d = fabs((double)rows[i] - ref[i]);
+            if (d > mx) mx = d;
+        }
+    fprintf(stderr, "media: gpu vs host max |diff| %.3g over %d rows\n", mx, n2);
+    // Reading the number: the GPU rows are BIT-IDENTICAL across devices (verified
+    // A5000 vs Orin, 2026-07-02); what varies is this HOST reference — fast-math
+    // OpenMP differs per CPU arch (x86 vs ARM read ~0.01 vs ~0.15 on the unified
+    // path, whose rows are unnormalized, |x| ~ 50 — that is ~3e-3 relative).
+}
+
 float *media_embed_image(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens) {
     int P = media_patch(md);
     if (w <= 0 || h <= 0 || w % P || h % P) {
         fprintf(stderr, "media: image %dx%d is not a multiple of the %d-pixel patch\n", w, h, P);
         return NULL;
     }
-    if (!md->legacy_v)
-        return uv_embed_image(md, rgb, w, h, n_tokens);
-    // legacy gemma4v: try the GPU encoder (NULL in the CPU build / when unusable), then host
-    float *rows = v_embed_image_gpu(md, rgb, w, h, n_tokens);
+    // try the GPU embedder (NULL in the CPU build / when unusable), then host
+    float *(*host)(struct media *, const uint8_t *, int, int, int *) =
+        md->legacy_v ? v_embed_image : uv_embed_image;
+    float *rows = md->legacy_v ? v_embed_image_gpu(md, rgb, w, h, n_tokens)
+                               : uv_embed_image_gpu(md, rgb, w, h, n_tokens);
     if (rows && getenv("LG_MEDIA_VERIFY")) {        // host path as numeric oracle
         int n2 = 0;
-        float *ref = v_embed_image(md, rgb, w, h, &n2);
-        double mx = 0;
-        if (ref && n2 == *n_tokens)
-            for (size_t i = 0; i < (size_t)n2 * md->n_embd; i++) {
-                double d = fabs((double)rows[i] - ref[i]);
-                if (d > mx) mx = d;
-            }
-        fprintf(stderr, "media: gpu vs host max |diff| %.3g over %d rows\n", mx, n2);
+        float *ref = host(md, rgb, w, h, &n2);
+        verify_rows(md, rows, ref, *n_tokens, n2);
         free(ref);
     }
     if (rows) return rows;                          // NULL: no GPU / unusable -> host
-    return v_embed_image(md, rgb, w, h, n_tokens);
+    return host(md, rgb, w, h, n_tokens);
 }
 
 // ---- audio ------------------------------------------------------------------
 
-float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens) {
+static float *uv_embed_audio(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens) {
     const int F = md->frame, ne = md->n_embd;
-    if (md->legacy_v) {
-        fprintf(stderr, "media: E2B/E4B audio (gemma4a) is not supported — "
-                        "use Whisper upstream, or the 12B, which hears\n");
-        return NULL;
-    }
-    if (n_samples <= 0 || n_samples % F) {
-        fprintf(stderr, "media: %d samples is not a multiple of the %d-sample frame\n", n_samples, F);
-        return NULL;
-    }
     int n = n_samples / F;                      // one token per 40 ms frame
     float *out = malloc((size_t)n * ne * sizeof(float));
     float *vec = malloc((size_t)F * sizeof(float));
@@ -556,4 +557,26 @@ float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, in
     free(vec);
     *n_tokens = n;
     return out;
+}
+
+float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens) {
+    const int F = md->frame;
+    if (md->legacy_v) {
+        fprintf(stderr, "media: E2B/E4B audio (gemma4a) is not supported — "
+                        "use Whisper upstream, or the 12B, which hears\n");
+        return NULL;
+    }
+    if (n_samples <= 0 || n_samples % F) {
+        fprintf(stderr, "media: %d samples is not a multiple of the %d-sample frame\n", n_samples, F);
+        return NULL;
+    }
+    float *rows = uv_embed_audio_gpu(md, pcm, n_samples, n_tokens);
+    if (rows && getenv("LG_MEDIA_VERIFY")) {        // host path as numeric oracle
+        int n2 = 0;
+        float *ref = uv_embed_audio(md, pcm, n_samples, &n2);
+        verify_rows(md, rows, ref, *n_tokens, n2);
+        free(ref);
+    }
+    if (rows) return rows;                          // NULL: no GPU / unusable -> host
+    return uv_embed_audio(md, pcm, n_samples, n_tokens);
 }

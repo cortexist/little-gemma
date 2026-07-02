@@ -276,17 +276,60 @@ static __global__ void k_attn(float *D, const float *Q, const float *K, const fl
     }
 }
 
-// im2col + [-1,1] scaling, from the raw RGB frame on device: the host used to
-// build the [np][768] f32 patch matrix and upload 7MB; now the 0.9MB frame
-// uploads and this unpacks it. Layout matches the host encoder: channel-major
-// within the patch, vec[(c*P+ky)*P+kx].
-static __global__ void k_im2col(float *F, const uint8_t *rgb, int w, int n_cols, int P, int ne, size_t total) {
+// im2col from the raw RGB frame on device: the host used to build the f32
+// patch matrix and upload it (7MB for a 624x480 legacy frame); now the 0.9MB
+// frame uploads and this unpacks it. Layout matches the host encoders:
+// channel-major within the patch, vec[(c*P+ky)*P+kx]. sc/ofs pick the range —
+// (2,-1) for the legacy path's [-1,1], (1,0) for the unified path's [0,1] —
+// applied in the host's exact op order (/255 first).
+static __global__ void k_im2col(float *F, const uint8_t *rgb, int w, int n_cols, int P, int pin,
+                                float sc, float ofs, size_t total) {
     for (size_t idx = blockIdx.x * 256ull + threadIdx.x; idx < total; idx += gridDim.x * 256ull) {
-        int p = (int)(idx / ne), i = (int)(idx % ne);
+        int p = (int)(idx / pin), i = (int)(idx % pin);
         int col = p % n_cols, row = p / n_cols;
         int c = i / (P * P), ky = i / P % P, kx = i % P;
-        F[idx] = (float)rgb[3 * ((size_t)(row * P + ky) * w + col * P + kx) + c] / 255.0f * 2.0f - 1.0f;
+        F[idx] = (float)rgb[3 * ((size_t)(row * P + ky) * w + col * P + kx) + c] / 255.0f * sc + ofs;
     }
+}
+
+// LayerNorm one row: y = (x - mean) * rsqrt(var + eps) * w + b. Block per row.
+static __global__ void k_lnorm(float *out, const float *in, const float *w, const float *b,
+                               int n, float eps) {
+    __shared__ float red[256];
+    const float *x = in + (size_t)blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) s += x[i];
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int st = 128; st; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float mean = red[0] / (float)n;
+    __syncthreads();
+    s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) { float d = x[i] - mean; s += d * d; }
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int st = 128; st; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float sc = rsqrtf(red[0] / (float)n + eps);
+    float *y = out + (size_t)blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += 256) y[i] = (x[i] - mean) * sc * w[i] + b[i];
+}
+
+// X[row] += b, the same bias for every row.
+static __global__ void k_addrow(float *X, const float *b, int ne, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull)
+        X[i] += b[i % ne];
+}
+
+// i16 PCM -> f32 in [-1,1).
+static __global__ void k_aframe(float *A, const int16_t *pcm, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull)
+        A[i] = (float)pcm[i] / 32768.0f;
 }
 
 // X += learned position row: x-table[col] + y-table[row], straight from the
@@ -414,7 +457,7 @@ extern "C" float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w,
     dim3 g_at((np + 63) / 64, nh);
     int nadd = (int)(((size_t)np * ne + 255) / 256);
 
-    k_im2col<<<nadd, 256>>>(vc->F, vc->rgb, w, n_cols, P, ne, (size_t)np * ne);
+    k_im2col<<<nadd, 256>>>(vc->F, vc->rgb, w, n_cols, P, ne, 2.0f, -1.0f, (size_t)np * ne);
     k_gemm<<<g_sq, 256>>>(vc->X, vc->F, vc->patch16, np, ne, ne);
     k_posadd<<<nadd, 256>>>(vc->X, vc->vpos, n_cols, md->pos_size, ne, (size_t)np * ne);
 
@@ -454,9 +497,129 @@ extern "C" float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w,
     return out;
 }
 
+// ---- the unified path (gemma4uv / gemma4ua: the 12B) -------------------------
+// No transformer at all: an image token is LayerNorm + linear of a raw 48x48
+// patch, an audio token is rms + linear of a raw 40 ms frame — the 12B's own
+// layers do the seeing (which is why its media spans need bidirectional
+// attention). The host ground ~11 GFLOP per image through OpenMP matmats;
+// here it is two k_gemm launches and change, and the audio clip's
+// frame-at-a-time matvec loop becomes ONE batched GEMM.
+
+struct uvcuda {
+    __half *pw, *mmv, *aw;          // [pin -> ne] patch linear, [ne -> ne] projector, [frame -> ne] audio
+    float *pb, *n1w, *n1b, *n2w, *n2b, *n3w, *n3b, *vpos;
+    int np_cap, af_cap;             // work-buffer sizes, in patches / audio frames
+    uint8_t *rgb;                   // [np * pin] the raw frame
+    float *F, *E, *rows;            // [np][pin], [np][ne], [np][ne]
+    int16_t *pcm;                   // [af * frame]
+    float *A, *arows;               // [af][frame], [af][ne]
+};
+
+static struct uvcuda *uvcuda_init(struct media *md) {
+    struct uvcuda *vc = (struct uvcuda *)calloc(1, sizeof *vc);
+    if (!vc) return NULL;
+    const int ne = md->n_embd, pin = md->patch * md->patch * 3;
+    int ok = 1;
+    if (md->v_patch_w)
+        ok = (vc->pw = up_h(md->v_patch_w)) && (vc->mmv = up_h(md->mm_v)) &&
+             (vc->pb = up_f(md->v_patch_b, ne)) &&
+             (vc->n1w = up_f(md->vn1w, pin)) && (vc->n1b = up_f(md->vn1b, pin)) &&
+             (vc->n2w = up_f(md->vn2w, ne)) && (vc->n2b = up_f(md->vn2b, ne)) &&
+             (vc->n3w = up_f(md->vn3w, ne)) && (vc->n3b = up_f(md->vn3b, ne)) &&
+             (vc->vpos = up_f(md->v_pos, (size_t)2 * md->pos_size * ne)) != NULL;
+    if (ok && md->mm_a) ok = (vc->aw = up_h(md->mm_a)) != NULL;
+    if (!ok) {
+        fprintf(stderr, "media-cuda: weight upload failed, using the host encoder\n");
+        free(vc);                                      // leaked partial uploads: OOM at startup only
+        return NULL;
+    }
+    return vc;
+}
+
+// The lazy first-use init both unified embedders share (same latch as legacy).
+static struct uvcuda *uv_state(struct media *md) {
+    if (md->gpu == (void *)-1) return NULL;
+    struct uvcuda *vc = (struct uvcuda *)md->gpu;
+    if (!vc) {
+        vc = uvcuda_init(md);
+        md->gpu = vc ? (void *)vc : (void *)-1;
+    }
+    return vc;
+}
+
+extern "C" float *uv_embed_image_gpu(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens) {
+    struct uvcuda *vc = uv_state(md);
+    if (!vc || !vc->pw) return NULL;
+    const int P = md->patch, pin = P * P * 3, ne = md->n_embd;
+    int n_cols = w / P, n_rows = h / P, n = n_cols * n_rows;
+    if (n_cols > md->pos_size || n_rows > md->pos_size) return NULL;   // host prints the error
+    if (n > vc->np_cap) {
+        cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->E); cudaFree(vc->rows);
+        if (cudaMalloc(&vc->rgb, (size_t)n * pin) != cudaSuccess ||
+            cudaMalloc(&vc->F, (size_t)n * pin * 4) != cudaSuccess ||
+            cudaMalloc(&vc->E, (size_t)n * ne * 4) != cudaSuccess ||
+            cudaMalloc(&vc->rows, (size_t)n * ne * 4) != cudaSuccess) { vc->np_cap = 0; return NULL; }
+        vc->np_cap = n;
+    }
+    size_t tin = (size_t)n * pin, tne = (size_t)n * ne;
+    cudaMemcpy(vc->rgb, rgb, tin, cudaMemcpyHostToDevice);
+    dim3 gm((ne + 63) / 64, (n + 63) / 64);
+    k_im2col<<<(int)((tin + 255) / 256), 256>>>(vc->F, vc->rgb, w, n_cols, P, pin, 1.0f, 0.0f, tin);
+    k_lnorm<<<n, 256>>>(vc->F, vc->F, vc->n1w, vc->n1b, pin, 1e-5f);
+    k_gemm<<<gm, 256>>>(vc->E, vc->F, vc->pw, n, pin, ne);
+    k_addrow<<<(int)((tne + 255) / 256), 256>>>(vc->E, vc->pb, ne, tne);
+    k_lnorm<<<n, 256>>>(vc->E, vc->E, vc->n2w, vc->n2b, ne, 1e-5f);
+    k_posadd<<<(int)((tne + 255) / 256), 256>>>(vc->E, vc->vpos, n_cols, md->pos_size, ne, tne);
+    k_lnorm<<<n, 256>>>(vc->E, vc->E, vc->n3w, vc->n3b, ne, 1e-5f);
+    k_rms<<<n, 256>>>(vc->E, vc->E, NULL, ne, 1e-6f);
+    k_gemm<<<gm, 256>>>(vc->rows, vc->E, vc->mmv, n, ne, ne);
+    float *out = (float *)malloc(tne * 4);
+    if (!out) return NULL;
+    VC_CHECK(cudaMemcpy(out, vc->rows, tne * 4, cudaMemcpyDeviceToHost));
+    VC_CHECK(cudaGetLastError());
+    *n_tokens = n;
+    return out;
+}
+
+extern "C" float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens) {
+    struct uvcuda *vc = uv_state(md);
+    if (!vc || !vc->aw) return NULL;
+    const int F = md->frame, ne = md->n_embd;
+    int n = n_samples / F;
+    if (n > vc->af_cap) {
+        cudaFree(vc->pcm); cudaFree(vc->A); cudaFree(vc->arows);
+        if (cudaMalloc(&vc->pcm, (size_t)n * F * 2) != cudaSuccess ||
+            cudaMalloc(&vc->A, (size_t)n * F * 4) != cudaSuccess ||
+            cudaMalloc(&vc->arows, (size_t)n * ne * 4) != cudaSuccess) { vc->af_cap = 0; return NULL; }
+        vc->af_cap = n;
+    }
+    size_t tA = (size_t)n * F, tne = (size_t)n * ne;
+    cudaMemcpy(vc->pcm, pcm, tA * 2, cudaMemcpyHostToDevice);
+    k_aframe<<<(int)((tA + 255) / 256), 256>>>(vc->A, vc->pcm, tA);
+    k_rms<<<n, 256>>>(vc->A, vc->A, NULL, F, 1e-6f);
+    k_gemm<<<dim3((ne + 63) / 64, (n + 63) / 64), 256>>>(vc->arows, vc->A, vc->aw, n, F, ne);
+    float *out = (float *)malloc(tne * 4);
+    if (!out) return NULL;
+    VC_CHECK(cudaMemcpy(out, vc->arows, tne * 4, cudaMemcpyDeviceToHost));
+    VC_CHECK(cudaGetLastError());
+    *n_tokens = n;
+    return out;
+}
+
 extern "C" void v_gpu_free(struct media *md) {
+    if (!md->gpu || md->gpu == (void *)-1) return;
+    if (!md->legacy_v) {
+        struct uvcuda *vc = (struct uvcuda *)md->gpu;
+        cudaFree(vc->pw); cudaFree(vc->mmv); cudaFree(vc->aw);
+        cudaFree(vc->pb); cudaFree(vc->n1w); cudaFree(vc->n1b); cudaFree(vc->n2w); cudaFree(vc->n2b);
+        cudaFree(vc->n3w); cudaFree(vc->n3b); cudaFree(vc->vpos);
+        cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->E); cudaFree(vc->rows);
+        cudaFree(vc->pcm); cudaFree(vc->A); cudaFree(vc->arows);
+        free(vc);
+        md->gpu = NULL;
+        return;
+    }
     struct vcuda *vc = (struct vcuda *)md->gpu;
-    if (!vc || md->gpu == (void *)-1) return;
     for (int L = 0; L < md->v_layer; L++) {
         struct vld *d = &vc->vl[L];
         cudaFree(d->ln1); cudaFree(d->ln2); cudaFree(d->attn_post); cudaFree(d->ffn_post);

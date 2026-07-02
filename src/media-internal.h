@@ -44,9 +44,11 @@ struct media {
 #ifdef __cplusplus
 extern "C" {
 #endif
-// GPU gemma4v encoder. Returns NULL when the GPU path is unusable (init failure, an
-// unsupported geometry) — the caller then falls back to the host path.
+// GPU embedders. Each returns NULL when the GPU path is unusable (init failure,
+// an unsupported geometry) — the caller then falls back to the host path.
 float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
+float *uv_embed_image_gpu(struct media *md, const uint8_t *rgb, int w, int h, int *n_tokens);
+float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n_samples, int *n_tokens);
 void   v_gpu_free(struct media *md);
 #ifdef __cplusplus
 }
