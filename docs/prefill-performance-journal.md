@@ -371,6 +371,30 @@ reduction restructure (~0.1 s). Sum of EVERYTHING lands ~4.7 s ≈ 197 tok/s ≈
 instruction schedule, priced and declined) or new ideas. The strategy
 decision above this line belongs to the user.
 
+## Orin push — Phase 2 (2026-07-02): option (b) — the numerics gate opens for attention
+
+User decision: pursue the attention gap (their flash is 8×) with the
+numerics-gated levers, under the f16-KV-precedent gate battery
+(determinism + quality A/B + MTP==plain preserved) instead of byte-identity
+vs f32.
+
+**f16 SWA rings (33127a9): KEPT — the enabler.** The last f32 K/V goes
+half; ring memory halves; the prefill flash sheds the per-fragment f32→f16
+pack; decode's split-K reads half the bytes. Gate battery caught a real
+bug byte-identity never would have: the device MTP draft kept reading the
+rings as f32 — output stayed byte-correct (greedy verify absorbs bad
+drafts) while acceptance silently collapsed 94% → 1.1%. Fixed (draft
+dispatch follows kv->f16); MTP==plain preserved at 93.8%.
+
+| | Orin prefill | Orin decode | A5000 prefill |
+|---|---|---|---|
+| 12B | 165.8 → **168.3** | 8.0 → **8.7 (+8.8%)** | 1770 → **1799** |
+| E4B | 382.9 → **387.6** | 27.8 → **30.0 (+7.9%)** | 3602 → **3683** |
+
+The decode win is the sleeper: rings were the decode-bandwidth path.
+Stage 2 (in flight): K/V shared staging inside the packed f16 flash —
+pure copies now, so byte-identity applies again.
+
 ### Where this leaves prefill
 
 The whole 2026-07-01/02 arc, all gates green on both devices:
