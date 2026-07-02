@@ -1,12 +1,21 @@
 // GPU gemma4v encoder — the same 16-block vision transformer media.c runs on
-// the host, as a handful of plain CUDA kernels. The host path stays in the
-// binary as oracle (LG_MEDIA_VERIFY=1) and fallback; this file exists because
-// even a well-vectorized CPU needs ~15 s per 266-token image for the ~1 TFLOP
-// this costs, and an A5000 does it in well under a second.
+// the host, as a handful of CUDA kernels. The host path stays in the binary
+// as oracle (LG_MEDIA_VERIFY=1) and fallback; this file exists because even a
+// well-vectorized CPU needs ~15 s per 266-token image for the ~1 TFLOP this
+// costs.
 //
-// Everything is f32 with the f16 weights converted in the GEMM's inner loop —
-// no quantization, no CUDA graph, default stream: the encoder runs once per
-// image, latency hiding is not the game here, readability is.
+// The heavy math (GEMMs and attention, ~97% of the frame) runs on tensor
+// cores: m16n8k16, f16 inputs, f32 accumulation. The weights are f16 in the
+// file and stay f16 into the mma; activations live in f32 between kernels and
+// are rounded to f16 at the GEMM and attention seams. That input rounding is
+// the whole numerics story — LG_MEDIA_VERIFY reports ~1e-3 vs the host's f32,
+// the precision class of the LLM's f16 flash path (and tighter than
+// llama.cpp's f16-ACCUMULATE cuBLAS encoder). Everything between the matmuls
+// (norms, rope, residuals) stays f32; default stream, no CUDA graph — one
+// image is a few hundred launches and the tensor cores, not the launch gaps,
+// are the story. The first cut of this file was all-f32 CUDA-core FMA,
+// readable but ~5x off: the Orin spent longer in the encoder than in the LLM
+// it feeds, which is backwards for a camera.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,8 +42,10 @@ struct vld {
 struct vcuda {
     struct vld *vl;                 // host array of device pointers
     __half *patch16, *mmv;
+    float *vpos;                    // [2*pos_size][768] learned x/y position tables
     int np_cap;                     // current size of the work buffers, in patches
-    float *F, *posadd;              // [np][768] im2col input, position-table sum
+    uint8_t *rgb;                   // the raw frame, as received
+    float *F;                       // [np][768] im2col patch matrix
     float *X, *H, *Q, *K, *V, *D;   // [np][768]
     float *G, *U;                   // [np][3072]
     float *pooled, *rows;           // [np/9][768], [np/9][n_embd]
@@ -42,45 +53,67 @@ struct vcuda {
 
 // ---- kernels ----------------------------------------------------------------
 
-// C[t][n] = A[t][k] . W[n][k] — 64x64 register-tiled GEMM: 16x16 threads, each
-// holding a 4x4 patch of outputs in registers. Two wins over the plain 16x16
-// tiling this replaced: every weight slab is read from global memory once per
-// 64 positions instead of per 16 (the whole encoder, ~300MB, was re-streamed
-// once per tile row), and the inner loop's 8 shared loads feed 16 FMAs where
-// the old loop paid 2 loads per FMA. The k-slabs are staged k-major so a
-// thread's 4 a-values and 4 w-values are each one float4 read. Each output
-// still accumulates in plain ascending-k order: same floats, same order,
-// byte-identical results — only the thread-to-output mapping changed.
-#define TS 16                   // k-slab depth, and threads per block side
-#define BT 64                   // output tile side (4 outputs per thread per side)
+// The m16n8k16 idiom, same as the LLM's flash kernel (fragment layout pinned
+// by .scratch/mma6_test.cu): a-frags are two packed halves per register from
+// the 16x16 row-major A tile, b-frags two packed halves per register from the
+// 16x8 col-major B tile — and "col-major B" is exactly a row of W[n][k] (or a
+// key row, or a transposed V column), so every fragment here is one aligned
+// 4-byte shared read.
+static __device__ __forceinline__ uint32_t vh_pk(__half a, __half b) {
+    return (uint32_t)__half_as_ushort(a) | ((uint32_t)__half_as_ushort(b) << 16);
+}
+static __device__ __forceinline__ uint32_t vh_pkf(float a, float b) {
+    return vh_pk(__float2half(a), __float2half(b));
+}
+static __device__ __forceinline__ void vh_mma(float *c,
+        uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// C[t][n] = A[t][k] . W[n][k] — tensor-core GEMM. A (f32) is rounded to f16
+// when staged; W stays the f16 it is in memory (the f32-FMA kernel this
+// replaced widened every weight element to f32 per use and left the tensor
+// cores idle — ~4x the silicon for this shape). 256 threads = 8 warps, 64x64
+// output tile, each warp an m16xn32 stripe (4 n8 mma tiles sharing its
+// a-frags); k staged in 64-deep shared slabs. K must be even; T, N arbitrary
+// (short/odd edges are zero-padded in staging and masked at the write).
+#define GK 64                   // k-slab depth
 static __global__ void k_gemm(float *C, const float *A, const __half *W, int T, int K, int N) {
-    __shared__ float a[TS][BT + 4], w[TS][BT + 4];      // +4: float4-aligned, conflict-free
-    int t0 = blockIdx.y * BT, n0 = blockIdx.x * BT;
-    int tid = threadIdx.y * TS + threadIdx.x;
+    __shared__ __half a[64][GK + 8], w[64][GK + 8];     // +8: 4B-aligned pairs, bank-spread rows
+    int t0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    int warp = threadIdx.x >> 5, g = (threadIdx.x & 31) >> 2, tig = threadIdx.x & 3;
+    int ar = (warp & 3) * 16, wr = (warp >> 2) * 32;    // warp's rows in a[], w[]
     float acc[4][4] = { 0 };
-    for (int k0 = 0; k0 < K; k0 += TS) {
-        for (int e = tid; e < BT * TS; e += TS * TS) {  // stage both slabs, k-major
-            int r = e >> 4, i = e & (TS - 1);
-            a[i][r] = t0 + r < T ? A[(size_t)(t0 + r) * K + k0 + i] : 0.0f;
-            w[i][r] = n0 + r < N ? __half2float(W[(size_t)(n0 + r) * K + k0 + i]) : 0.0f;
+    for (int k0 = 0; k0 < K; k0 += GK) {
+        for (int e = threadIdx.x; e < 64 * GK / 2; e += 256) {  // stage pairs, coalesced
+            int r = e / (GK / 2), i = e % (GK / 2) * 2, ka = k0 + i;
+            float2 av = t0 + r < T && ka < K ? *(const float2 *)&A[(size_t)(t0 + r) * K + ka]
+                                             : make_float2(0.0f, 0.0f);
+            *(uint32_t *)&a[r][i] = vh_pkf(av.x, av.y);
+            *(uint32_t *)&w[r][i] = n0 + r < N && ka < K ? *(const uint32_t *)&W[(size_t)(n0 + r) * K + ka]
+                                                         : 0u;
         }
         __syncthreads();
-        for (int i = 0; i < TS; i++) {
-            float av[4], wv[4];
-            *(float4 *)av = *(const float4 *)&a[i][threadIdx.y * 4];
-            *(float4 *)wv = *(const float4 *)&w[i][threadIdx.x * 4];
-            for (int y = 0; y < 4; y++)
-                for (int x = 0; x < 4; x++) acc[y][x] += av[y] * wv[x];
+        for (int ks = 0; ks < GK; ks += 16) {
+            uint32_t a0 = *(const uint32_t *)&a[ar + g][ks + tig * 2];
+            uint32_t a1 = *(const uint32_t *)&a[ar + g + 8][ks + tig * 2];
+            uint32_t a2 = *(const uint32_t *)&a[ar + g][ks + tig * 2 + 8];
+            uint32_t a3 = *(const uint32_t *)&a[ar + g + 8][ks + tig * 2 + 8];
+            for (int nt = 0; nt < 4; nt++)
+                vh_mma(acc[nt],
+                       a0, a1, a2, a3,
+                       *(const uint32_t *)&w[wr + nt * 8 + g][ks + tig * 2],
+                       *(const uint32_t *)&w[wr + nt * 8 + g][ks + tig * 2 + 8]);
         }
         __syncthreads();
     }
-    for (int y = 0; y < 4; y++) {
-        int tt = t0 + threadIdx.y * 4 + y;
-        if (tt >= T) break;
-        for (int x = 0; x < 4; x++) {
-            int tn = n0 + threadIdx.x * 4 + x;
-            if (tn < N) C[(size_t)tt * N + tn] = acc[y][x];
-        }
+    for (int nt = 0; nt < 4; nt++) {
+        int tt = t0 + ar + g, tn = n0 + wr + nt * 8 + tig * 2;
+        if (tn >= N) continue;                          // N even => the pair is in or out together
+        if (tt < T)     { C[(size_t)tt * N + tn] = acc[nt][0];       C[(size_t)tt * N + tn + 1] = acc[nt][1]; }
+        if (tt + 8 < T) { C[(size_t)(tt + 8) * N + tn] = acc[nt][2]; C[(size_t)(tt + 8) * N + tn + 1] = acc[nt][3]; }
     }
 }
 
@@ -145,49 +178,124 @@ static __global__ void k_rope2d(float *X, int ne, int n_cols, float theta) {
     s[i + 16] = a * sn + b * c;
 }
 
-// Full attention at scale 1.0. Block = (query, head); shmem holds the np
-// scores + a 256-wide reduction scratch. Scores: warp per key row, lanes split
-// the 64-dim dot. AV: thread (i, slice) so V reads coalesce over i.
+// Full attention at scale 1.0, tensor-core flash. One CTA = 64 queries x one
+// head; 4 warps, each owning 16 query rows END TO END — its own S tile, its
+// own online max/sum, its own O accumulator, so there is no cross-warp
+// reduction anywhere. K/V stream through shared in 32-key tiles as f16 (V
+// staged TRANSPOSED so the PV b-fragments are packed pairs, like a W row); Q
+// rides in registers as a-fragments for the whole key loop. Replaces a
+// materialized-score kernel (one block per query x head, 2 FMAs per 5-shuffle
+// dot) that cost more wall time than all seven GEMMs together — and with it
+// goes its 48KB dynamic-shmem cap on the patch count.
 static __global__ void k_attn(float *D, const float *Q, const float *K, const float *V,
                               int np, int ne) {
-    extern __shared__ float sm[];
-    float *att = sm, *red = sm + np;
-    int p = blockIdx.x, hh = blockIdx.y;
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float *q = Q + (size_t)p * ne + hh * 64;
-    for (int kk = warp; kk < np; kk += 8) {
-        const float *kr = K + (size_t)kk * ne + hh * 64;
-        float s = q[lane] * kr[lane] + q[lane + 32] * kr[lane + 32];
-        for (int o = 16; o; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (!lane) att[kk] = s;
+    __shared__ __half sk[32][72], svt[64][40];          // K tile; V tile, dim-major
+    int hh = blockIdx.y, warp = threadIdx.x >> 5, g = (threadIdx.x & 31) >> 2, tig = threadIdx.x & 3;
+    int qr = blockIdx.x * 64 + warp * 16;               // this warp's 16 query rows
+    uint32_t qf[4][4];                                  // Q[16][64] as a-frags, 4 k-steps
+    for (int ks = 0; ks < 4; ks++) {
+        const float *q0 = Q + (size_t)(qr + g) * ne + hh * 64 + ks * 16 + tig * 2;
+        const float *q8 = q0 + (size_t)8 * ne;
+        qf[ks][0] = qr + g < np     ? vh_pkf(q0[0], q0[1]) : 0u;
+        qf[ks][1] = qr + g + 8 < np ? vh_pkf(q8[0], q8[1]) : 0u;
+        qf[ks][2] = qr + g < np     ? vh_pkf(q0[8], q0[9]) : 0u;
+        qf[ks][3] = qr + g + 8 < np ? vh_pkf(q8[8], q8[9]) : 0u;
     }
-    __syncthreads();
-    float mx = -1e30f;
-    for (int kk = threadIdx.x; kk < np; kk += 256) mx = fmaxf(mx, att[kk]);
-    red[threadIdx.x] = mx;
-    __syncthreads();
-    for (int s = 128; s; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+    float acc[8][4] = { 0 };                            // O[16][64]: 8 n8 tiles
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;   // rows g and g+8
+    for (int kb = 0; kb < np; kb += 32) {
+        for (int e = threadIdx.x; e < 32 * 16; e += 128) {   // stage K and V^T, f32 -> f16
+            int r = e / 16, i = e % 16 * 4;                  // 4 dims per element
+            const float *src = K + (size_t)(kb + r) * ne + hh * 64 + i;
+            float4 kv = kb + r < np ? *(const float4 *)src : make_float4(0, 0, 0, 0);
+            *(uint32_t *)&sk[r][i] = vh_pkf(kv.x, kv.y);
+            *(uint32_t *)&sk[r][i + 2] = vh_pkf(kv.z, kv.w);
+            src = V + (size_t)(kb + r) * ne + hh * 64 + i;
+            float4 vv = kb + r < np ? *(const float4 *)src : make_float4(0, 0, 0, 0);
+            svt[i][r] = __float2half(vv.x); svt[i + 1][r] = __float2half(vv.y);
+            svt[i + 2][r] = __float2half(vv.z); svt[i + 3][r] = __float2half(vv.w);
+        }
+        __syncthreads();
+        float s[4][4] = { 0 };                          // S[16][32]: 4 n8 tiles, f32
+        for (int ks = 0; ks < 4; ks++)
+            for (int kt = 0; kt < 4; kt++)
+                vh_mma(s[kt],
+                       qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3],
+                       *(const uint32_t *)&sk[kt * 8 + g][ks * 16 + tig * 2],
+                       *(const uint32_t *)&sk[kt * 8 + g][ks * 16 + tig * 2 + 8]);
+        float hi0 = -1e30f, hi1 = -1e30f;               // online softmax, per query row
+        for (int kt = 0; kt < 4; kt++) {                // mask the tail keys, find row maxes
+            if (kb + kt * 8 + tig * 2 >= np)     s[kt][0] = s[kt][2] = -1e30f;
+            if (kb + kt * 8 + tig * 2 + 1 >= np) s[kt][1] = s[kt][3] = -1e30f;
+            hi0 = fmaxf(hi0, fmaxf(s[kt][0], s[kt][1]));
+            hi1 = fmaxf(hi1, fmaxf(s[kt][2], s[kt][3]));
+        }
+        for (int o = 1; o < 4; o <<= 1) {               // max across the row's 4 lanes
+            hi0 = fmaxf(hi0, __shfl_xor_sync(0xffffffffu, hi0, o));
+            hi1 = fmaxf(hi1, __shfl_xor_sync(0xffffffffu, hi1, o));
+        }
+        float mn0 = fmaxf(m0, hi0), mn1 = fmaxf(m1, hi1);
+        float al0 = __expf(m0 - mn0), al1 = __expf(m1 - mn1);
+        m0 = mn0; m1 = mn1;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int kt = 0; kt < 4; kt++) {                // P = exp(S - m), rows rescaled
+            s[kt][0] = __expf(s[kt][0] - m0); s[kt][1] = __expf(s[kt][1] - m0);
+            s[kt][2] = __expf(s[kt][2] - m1); s[kt][3] = __expf(s[kt][3] - m1);
+            sum0 += s[kt][0] + s[kt][1]; sum1 += s[kt][2] + s[kt][3];
+        }
+        for (int o = 1; o < 4; o <<= 1) {
+            sum0 += __shfl_xor_sync(0xffffffffu, sum0, o);
+            sum1 += __shfl_xor_sync(0xffffffffu, sum1, o);
+        }
+        l0 = l0 * al0 + sum0; l1 = l1 * al1 + sum1;
+        for (int nt = 0; nt < 8; nt++)
+            for (int c = 0; c < 4; c++) acc[nt][c] *= c < 2 ? al0 : al1;
+        for (int ks = 0; ks < 2; ks++) {                // O += P.V, P refragmented in registers
+            uint32_t p0 = vh_pkf(s[ks * 2][0], s[ks * 2][1]);
+            uint32_t p1 = vh_pkf(s[ks * 2][2], s[ks * 2][3]);
+            uint32_t p2 = vh_pkf(s[ks * 2 + 1][0], s[ks * 2 + 1][1]);
+            uint32_t p3 = vh_pkf(s[ks * 2 + 1][2], s[ks * 2 + 1][3]);
+            for (int nt = 0; nt < 8; nt++)
+                vh_mma(acc[nt], p0, p1, p2, p3,
+                       *(const uint32_t *)&svt[nt * 8 + g][ks * 16 + tig * 2],
+                       *(const uint32_t *)&svt[nt * 8 + g][ks * 16 + tig * 2 + 8]);
+        }
         __syncthreads();
     }
-    mx = red[0];
-    __syncthreads();
-    float sum = 0.0f;
-    for (int kk = threadIdx.x; kk < np; kk += 256) { float e = __expf(att[kk] - mx); att[kk] = e; sum += e; }
-    red[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = 128; s; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
+    float inv0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inv1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    for (int nt = 0; nt < 8; nt++) {
+        int i = hh * 64 + nt * 8 + tig * 2;
+        if (qr + g < np) {
+            D[(size_t)(qr + g) * ne + i] = acc[nt][0] * inv0;
+            D[(size_t)(qr + g) * ne + i + 1] = acc[nt][1] * inv0;
+        }
+        if (qr + g + 8 < np) {
+            D[(size_t)(qr + g + 8) * ne + i] = acc[nt][2] * inv1;
+            D[(size_t)(qr + g + 8) * ne + i + 1] = acc[nt][3] * inv1;
+        }
     }
-    float inv = 1.0f / red[0];
-    __syncthreads();
-    int i = threadIdx.x & 63, sl = threadIdx.x >> 6;    // 4 slices over the keys
-    float o = 0.0f;
-    for (int kk = sl; kk < np; kk += 4) o += att[kk] * V[(size_t)kk * ne + hh * 64 + i];
-    red[threadIdx.x] = o;
-    __syncthreads();
-    if (!sl) D[(size_t)p * ne + hh * 64 + i] = (red[i] + red[64 + i] + red[128 + i] + red[192 + i]) * inv;
+}
+
+// im2col + [-1,1] scaling, from the raw RGB frame on device: the host used to
+// build the [np][768] f32 patch matrix and upload 7MB; now the 0.9MB frame
+// uploads and this unpacks it. Layout matches the host encoder: channel-major
+// within the patch, vec[(c*P+ky)*P+kx].
+static __global__ void k_im2col(float *F, const uint8_t *rgb, int w, int n_cols, int P, int ne, size_t total) {
+    for (size_t idx = blockIdx.x * 256ull + threadIdx.x; idx < total; idx += gridDim.x * 256ull) {
+        int p = (int)(idx / ne), i = (int)(idx % ne);
+        int col = p % n_cols, row = p / n_cols;
+        int c = i / (P * P), ky = i / P % P, kx = i % P;
+        F[idx] = (float)rgb[3 * ((size_t)(row * P + ky) * w + col * P + kx) + c] / 255.0f * 2.0f - 1.0f;
+    }
+}
+
+// X += learned position row: x-table[col] + y-table[row], straight from the
+// once-uploaded position table (the host used to sum and upload these per frame).
+static __global__ void k_posadd(float *X, const float *vpos, int n_cols, int pos_size, int ne, size_t total) {
+    for (size_t idx = blockIdx.x * 256ull + threadIdx.x; idx < total; idx += gridDim.x * 256ull) {
+        int p = (int)(idx / ne), i = (int)(idx % ne);
+        X[idx] += vpos[(size_t)(p % n_cols) * ne + i] + vpos[((size_t)pos_size + p / n_cols) * ne + i];
+    }
 }
 
 // 3x3 average pool over the patch grid, x sqrt(768). Block = output token.
@@ -240,7 +348,8 @@ static struct vcuda *vcuda_init(struct media *md) {
     vc->vl = (struct vld *)calloc((size_t)md->v_layer, sizeof *vc->vl);
     vc->patch16 = up_h(md->v_patch16);
     vc->mmv = up_h(md->mm_v);
-    int ok = vc->vl && vc->patch16 && vc->mmv;
+    vc->vpos = up_f(md->v_pos, (size_t)2 * md->pos_size * md->v_embd);
+    int ok = vc->vl && vc->patch16 && vc->mmv && vc->vpos;
     int ne = md->v_embd, dh = 64;
     for (int L = 0; ok && L < md->v_layer; L++) {
         const struct vlayer *s = &md->vl[L];
@@ -262,16 +371,18 @@ static struct vcuda *vcuda_init(struct media *md) {
 
 static int ensure_bufs(struct vcuda *vc, int np, int ne, int n_embd) {
     if (np <= vc->np_cap) return 0;
-    float **bufs[] = { &vc->F, &vc->posadd, &vc->X, &vc->H, &vc->Q, &vc->K, &vc->V, &vc->D,
+    float **bufs[] = { &vc->F, &vc->X, &vc->H, &vc->Q, &vc->K, &vc->V, &vc->D,
                        &vc->G, &vc->U, &vc->pooled, &vc->rows };
-    size_t sz[] = { (size_t)np * ne, (size_t)np * ne, (size_t)np * ne, (size_t)np * ne,
+    size_t sz[] = { (size_t)np * ne, (size_t)np * ne, (size_t)np * ne,
                     (size_t)np * ne, (size_t)np * ne, (size_t)np * ne, (size_t)np * ne,
                     (size_t)np * 4 * ne, (size_t)np * 4 * ne,
                     (size_t)(np / 9 + 1) * ne, (size_t)(np / 9 + 1) * n_embd };
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 11; i++) {
         cudaFree(*bufs[i]);
         if (cudaMalloc(bufs[i], sz[i] * 4) != cudaSuccess) { vc->np_cap = 0; return -1; }
     }
+    cudaFree(vc->rgb);
+    if (cudaMalloc(&vc->rgb, (size_t)np * ne) != cudaSuccess) { vc->np_cap = 0; return -1; }
     vc->np_cap = np;
     return 0;
 }
@@ -294,62 +405,44 @@ extern "C" float *v_embed_image_gpu(struct media *md, const uint8_t *rgb, int w,
         fprintf(stderr, "media: image %dx%d exceeds the %d-entry position table\n", w, h, md->pos_size);
         return NULL;
     }
-    size_t attn_shmem = (size_t)np * 4 + 1024;
-    if (attn_shmem > 48 * 1024 || ensure_bufs(vc, np, ne, md->n_embd) != 0) return NULL;
+    if (ensure_bufs(vc, np, ne, md->n_embd) != 0) return NULL;
 
-    // im2col + the two position tables, on the host (cheap), then one upload each
-    float *F = (float *)malloc((size_t)np * ne * 4);
-    float *pa = (float *)malloc((size_t)np * ne * 4);
-    if (!F || !pa) { free(F); free(pa); return NULL; }
-    for (int p = 0; p < np; p++) {
-        int col = p % n_cols, row = p / n_cols;
-        float *vec = F + (size_t)p * ne;
-        for (int c = 0; c < 3; c++)
-            for (int ky = 0; ky < P; ky++)
-                for (int kx = 0; kx < P; kx++)
-                    vec[(c * P + ky) * P + kx] =
-                        (float)rgb[3 * ((size_t)(row * P + ky) * w + (col * P + kx)) + c] / 255.0f * 2.0f - 1.0f;
-        const float *ex = md->v_pos + (size_t)col * ne;
-        const float *ey = md->v_pos + ((size_t)md->pos_size + row) * ne;
-        for (int i = 0; i < ne; i++) pa[(size_t)p * ne + i] = ex[i] + ey[i];
-    }
-    cudaMemcpy(vc->F, F, (size_t)np * ne * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(vc->posadd, pa, (size_t)np * ne * 4, cudaMemcpyHostToDevice);
-    free(F); free(pa);
+    cudaMemcpy(vc->rgb, rgb, (size_t)np * ne, cudaMemcpyHostToDevice);   // ne = 3*P*P bytes/patch
 
-    dim3 blk(TS, TS);
-    dim3 g_sq((ne + BT - 1) / BT, (np + BT - 1) / BT);          // [np][768] outputs
-    dim3 g_up((4 * ne + BT - 1) / BT, (np + BT - 1) / BT);      // [np][3072]
+    dim3 g_sq((ne + 63) / 64, (np + 63) / 64);          // [np][768] outputs
+    dim3 g_up((4 * ne + 63) / 64, (np + 63) / 64);      // [np][3072]
+    dim3 g_at((np + 63) / 64, nh);
     int nadd = (int)(((size_t)np * ne + 255) / 256);
 
-    k_gemm<<<g_sq, blk>>>(vc->X, vc->F, vc->patch16, np, ne, ne);
-    k_add<<<nadd, 256>>>(vc->X, vc->posadd, (size_t)np * ne);
+    k_im2col<<<nadd, 256>>>(vc->F, vc->rgb, w, n_cols, P, ne, (size_t)np * ne);
+    k_gemm<<<g_sq, 256>>>(vc->X, vc->F, vc->patch16, np, ne, ne);
+    k_posadd<<<nadd, 256>>>(vc->X, vc->vpos, n_cols, md->pos_size, ne, (size_t)np * ne);
 
     for (int L = 0; L < md->v_layer; L++) {
         const struct vld *v = &vc->vl[L];
         k_rms<<<np, 256>>>(vc->H, vc->X, v->ln1, ne, eps);
-        k_gemm<<<g_sq, blk>>>(vc->Q, vc->H, v->q, np, ne, ne);
-        k_gemm<<<g_sq, blk>>>(vc->K, vc->H, v->k, np, ne, ne);
-        k_gemm<<<g_sq, blk>>>(vc->V, vc->H, v->v, np, ne, ne);
+        k_gemm<<<g_sq, 256>>>(vc->Q, vc->H, v->q, np, ne, ne);
+        k_gemm<<<g_sq, 256>>>(vc->K, vc->H, v->k, np, ne, ne);
+        k_gemm<<<g_sq, 256>>>(vc->V, vc->H, v->v, np, ne, ne);
         k_headnorm<<<np, nh * 32>>>(vc->Q, vc->K, vc->V, v->qn, v->kn, ne, eps);
         k_rope2d<<<np, nh * 32>>>(vc->Q, ne, n_cols, 100.0f);
         k_rope2d<<<np, nh * 32>>>(vc->K, ne, n_cols, 100.0f);
-        k_attn<<<dim3(np, nh), 256, attn_shmem>>>(vc->D, vc->Q, vc->K, vc->V, np, ne);
-        k_gemm<<<g_sq, blk>>>(vc->H, vc->D, v->o, np, ne, ne);
+        k_attn<<<g_at, 128>>>(vc->D, vc->Q, vc->K, vc->V, np, ne);
+        k_gemm<<<g_sq, 256>>>(vc->H, vc->D, v->o, np, ne, ne);
         k_rms<<<np, 256>>>(vc->H, vc->H, v->attn_post, ne, eps);
         k_add<<<nadd, 256>>>(vc->X, vc->H, (size_t)np * ne);
         k_rms<<<np, 256>>>(vc->H, vc->X, v->ln2, ne, eps);
-        k_gemm<<<g_up, blk>>>(vc->G, vc->H, v->gate, np, ne, 4 * ne);
-        k_gemm<<<g_up, blk>>>(vc->U, vc->H, v->up, np, ne, 4 * ne);
+        k_gemm<<<g_up, 256>>>(vc->G, vc->H, v->gate, np, ne, 4 * ne);
+        k_gemm<<<g_up, 256>>>(vc->U, vc->H, v->up, np, ne, 4 * ne);
         k_gelu_mul<<<nadd * 4, 256>>>(vc->G, vc->U, (size_t)np * 4 * ne);
-        k_gemm<<<g_sq, blk>>>(vc->D, vc->G, v->down, np, 4 * ne, ne);
+        k_gemm<<<g_sq, 256>>>(vc->D, vc->G, v->down, np, 4 * ne, ne);
         k_rms<<<np, 256>>>(vc->D, vc->D, v->ffn_post, ne, eps);
         k_add<<<nadd, 256>>>(vc->X, vc->D, (size_t)np * ne);
     }
 
     int out_x = n_cols / mg, out_y = n_rows / mg, n = out_x * out_y;
     k_pool<<<n, 256>>>(vc->pooled, vc->X, n_cols, out_x, ne, sqrtf((float)ne));
-    k_gemm<<<dim3((md->n_embd + BT - 1) / BT, (n + BT - 1) / BT), blk>>>
+    k_gemm<<<dim3((md->n_embd + 63) / 64, (n + 63) / 64), 256>>>
         (vc->rows, vc->pooled, vc->mmv, n, ne, md->n_embd);
     k_rms<<<n, 256>>>(vc->rows, vc->rows, NULL, md->n_embd, eps);
 
@@ -371,8 +464,8 @@ extern "C" void v_gpu_free(struct media *md) {
         cudaFree(d->q); cudaFree(d->k); cudaFree(d->v); cudaFree(d->o);
         cudaFree(d->gate); cudaFree(d->up); cudaFree(d->down);
     }
-    cudaFree(vc->patch16); cudaFree(vc->mmv);
-    cudaFree(vc->F); cudaFree(vc->posadd); cudaFree(vc->X); cudaFree(vc->H);
+    cudaFree(vc->patch16); cudaFree(vc->mmv); cudaFree(vc->vpos);
+    cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->X); cudaFree(vc->H);
     cudaFree(vc->Q); cudaFree(vc->K); cudaFree(vc->V); cudaFree(vc->D);
     cudaFree(vc->G); cudaFree(vc->U); cudaFree(vc->pooled); cudaFree(vc->rows);
     free(vc->vl);

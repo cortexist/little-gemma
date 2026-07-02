@@ -255,10 +255,12 @@ tell a sentence that arrived as sound from one that arrived as keystrokes.
 
 The E2B/E4B mmproj files instead carry conventional encoders — the **legacy
 path**. Their 16-block vision transformer (`gemma4v`) is implemented: on the
-CUDA backends it runs on the GPU (`media-cuda.cu`, ~0.8 s per image on a
-desktop card), with the host implementation kept in the binary as numeric
-oracle (`LG_MEDIA_VERIFY=1` runs both per image and prints the max
-difference) and as the only path on the CPU build. Their 12-block audio
+CUDA backends it runs on the GPU on tensor cores (`media-cuda.cu`, m16n8k16
+with f16 inputs and f32 accumulation — ~0.2 s per 130-token frame on the
+Orin, under 0.1 s on a desktop card), with the host implementation kept in
+the binary as numeric oracle (`LG_MEDIA_VERIFY=1` runs both per image and
+prints the max difference; ~6e-3, which is the f16 input rounding) and as
+the only path on the CPU build. Their 12-block audio
 conformer was implemented, verified against the reference, and **dropped**:
 it underperforms in practice, and production pipelines pair these models
 with a dedicated STT (Whisper) anyway — audio frames at a legacy mmproj say

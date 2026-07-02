@@ -518,3 +518,55 @@ For the ledger, two TTFT levers surfaced and left on the table:
   not API overhead. Worth an ncu look before believing any single theory.
 - the legacy E4B vision encoder (~1.1 s/frame on Orin) now dominates the
   camera-burst ttft — the model waits on the eyes, not the other way round.
+
+## 2026-07-02 — TTFT lever 2: the vision encoder on tensor cores
+
+With streaming prefill landed, the E4B camera burst spent 1.1 of its 1.82 s
+ttft inside the legacy gemma4v encoder — the model was waiting on the eyes.
+A 5-reader code audit + nsys agreed on the cause: the encoder ran entirely
+as f32 CUDA-core FMA (~21% of even the f32 peak, ~5% of the f16-TC peak),
+with the f16 weights widened to f32 per use, and an attention kernel
+(one block per query×head, 2 FMAs per 5-shuffle dot) that cost more wall
+time than all seven GEMMs together — 592 ms vs 473 ms of the 1.1 s frame.
+Weight residency was ruled out with evidence (encoder weights were already
+a cudaMalloc device copy on both devices; the zero-copy-uncached story
+belongs to the main model blob only).
+
+Rewrite (media-cuda.cu, same file, same layer structure):
+- `k_gemm` → m16n8k16 tensor cores, f16 inputs / **f32 accumulation**
+  (tighter than llama.cpp's f16-accumulate cuBLAS encoder). W stays the f16
+  it is in memory; A rounds to f16 at shared-staging time. 8 warps, 64×64
+  tile, m16×n32 warp stripes, 64-deep k slabs.
+- `k_attn` → tensor-core flash: one CTA = 64 queries × head, each warp owns
+  16 query rows end-to-end (own S tile, own online softmax, own O tile — no
+  cross-warp reductions). K/V stream through shared as f16, V staged
+  transposed; P refragmented in registers (c-frag == a-frag positions for
+  k16). Static shared — the old 48 KB dynamic-shmem patch cap is gone.
+- im2col + position add moved on-device (`k_im2col`, `k_posadd`): the raw
+  0.9 MB frame uploads instead of a host-built 7.2 MB f32 pair, and the
+  position table uploads once at init.
+
+Measured (624×480 = 1170 patches → 130 tokens, warm):
+
+| | before | after | |
+|---|---:|---:|---|
+| Orin embed/frame | 1.1 s | **0.2 s** | 5.5× |
+| Orin camera-burst ttft | 1.82 s | **0.92 s** | prefill (0.72 s) now dominates |
+| Orin k_attn / k_gemm per frame | 592 / 473 ms | 22.5 / 146 ms | 26× / 3.2× |
+| A5000 embed/frame | ~0.2 s | <0.1 s | image ttft 0.12 → 0.07 s |
+
+Gates: LG_MEDIA_VERIFY max |diff| 0.0055 (A5000) / 0.0064 (Orin) — the f16
+input-rounding class, as predicted, and consistent across devices; E4B
+note.png reply word-for-word identical to the f32 build; Orin camera reply
+identical; E4B video reply coherent with the frame counter read correctly;
+the 12B unified path is host-only and untouched.
+
+Left on the table, in order of current ttft share:
+- the per-frame LLM span prefill pads 130 media tokens to a 192-column wide
+  chunk plus a ~32-column marker chunk (~224 cols for ~136 real positions)
+  — now the largest term in the 0.92 s camera ttft (0.72 s packed call);
+- k_gemm keeps ~2× headroom (no cp.async pipeline; FFN slabs re-streamed
+  ceil(np/64)× — subsumed if it ever gets the A-staging treatment the LLM
+  q4k kernel got);
+- encoder work on its own stream could overlap span prefill on the A5000
+  (stream-serialized today; less relevant on the 8-SM Orin).
