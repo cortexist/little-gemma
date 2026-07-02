@@ -18,9 +18,9 @@
 // at all: vision is one linear layer over 48x48 pixel patches (plus norms and
 // a learned 2-axis position table), audio is one linear layer over raw 640-
 // sample (40 ms @ 16 kHz) waveform frames. The whole projector is 11 tensors.
-// The E2B/E4B mmproj files carry a legacy 16-block vision transformer and a
-// 12-block audio conformer instead; that path is not implemented (media_open
-// rejects those files), and may never be if encoder-free models win out.
+// The E2B/E4B mmproj files carry a legacy 16-block vision transformer (also
+// implemented — media.c + media-cuda.cu) and a 12-block audio conformer,
+// which is not: legacy audio is rejected (use Whisper upstream, or the 12B).
 
 struct media;
 
@@ -64,5 +64,13 @@ float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, in
 #define MEDIA_FRAME_IMAGE  'I'
 #define MEDIA_FRAME_AUDIO  'A'
 #define MEDIA_FRAME_TEXT   'T'
+
+// Barge-in: one bare byte (no header) a client may send WHILE a reply streams.
+// The server stops decoding at the next token, closes the turn on the wire
+// with "<turn|>", and the session continues — the context keeps the cut-off
+// reply, so the model knows what it did and didn't get to say. A voice client
+// sends this the moment its user starts talking over the answer; whether the
+// next turn mentions the interruption is the client's choice (a text note).
+#define MEDIA_BARGE        0x02
 
 #endif // MEDIA_H

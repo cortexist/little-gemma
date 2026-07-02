@@ -114,22 +114,28 @@ static int send_piece(sock_t s, const char *t) {
     return send_all(s, buf, n);
 }
 
-// Did the connection break? A buffered send() succeeds whether or not anyone
-// reads it, so failure is only visible to recv: peek non-blocking, without
-// consuming, so a healthy client's pipelined next turn stays intact. A clean
-// half-close (recv 0 — e.g. socat after stdin EOF, still reading the answer)
-// is NOT a break: the current turn finishes and the session ends at the next
-// read. Only a hard error aborts mid-turn.
-static int client_reset(sock_t s) {
+// Anything the client says mid-generation. 0 = nothing; 1 = the connection
+// broke; 2 = a MEDIA_BARGE byte (consumed) — the client's user started talking
+// over the reply, stop decoding. A buffered send() succeeds whether or not
+// anyone reads it, so a break is only visible to recv: peek non-blocking,
+// without consuming, so a healthy client's pipelined next turn stays intact.
+// A clean half-close (recv 0 — e.g. socat after stdin EOF, still reading the
+// answer) is NOT a break: the current turn finishes and the session ends at
+// the next read. Only a hard error aborts mid-turn.
+static int client_signal(sock_t s) {
     char c;
 #ifdef _WIN32
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
     int k = (int)recv(s, &c, 1, MSG_PEEK);
     int err = WSAGetLastError();
+    int barge = k == 1 && (unsigned char)c == MEDIA_BARGE;
+    if (barge) recv(s, &c, 1, 0);
     nb = 0; ioctlsocket(s, FIONBIO, &nb);
+    if (barge) return 2;
     return k < 0 && err != WSAEWOULDBLOCK;
 #else
     int k = (int)recv(s, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (k == 1 && (unsigned char)c == MEDIA_BARGE) { recv(s, &c, 1, 0); return 2; }
     return k < 0 && errno != EAGAIN && errno != EWOULDBLOCK;
 #endif
 }
@@ -339,6 +345,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             int pend_n = 0;
             for (;;) {
                 if (recv(c, &c0, 1, 0) != 1) { dead = 1; break; }
+                if ((unsigned char)c0 == MEDIA_BARGE) continue;   // lost the race with the turn's own end
                 if ((unsigned char)c0 != MEDIA_FRAME_MAGIC) break;
                 if (pend) {                              // the turn continues: the held span
                     double f0 = now_sec();               // prefills ahead of this frame
@@ -423,11 +430,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
             tp += t1 - t0;
-            int g = 0, fail = 0;                          // g = tokens streamed this turn
+            int g = 0, fail = 0, barged = 0;              // g = tokens streamed this turn
             double t_draft = 0, t_verify = 0;
             int n_draft = 0, n_accept = 0;
             for (;;) {                                   // stream raw token text, turn end included
-                if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
+                int sig = client_signal(c);
+                if (sig == 2) { send_piece(c, "<turn|>"); barged = 1; break; }
+                if (sig || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 g++;
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
                 if (g >= SERVE_GEN) {                    // runaway turn: end it ourselves
@@ -447,7 +456,9 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 pos += adv;
                 int brk = 0;
                 for (int e = 1; e < adv && !brk; e++) {  // stream the confirmed drafts toks[1..adv-1]
-                    if (client_reset(c) || send_piece(c, tokenizer_token_text(tk, toks[e])) != 0) { fail = 1; brk = 1; break; }
+                    int es = client_signal(c);
+                    if (es == 2) { send_piece(c, "<turn|>"); barged = 1; brk = 1; break; }
+                    if (es || send_piece(c, tokenizer_token_text(tk, toks[e])) != 0) { fail = 1; brk = 1; break; }
                     g++;
                     if (toks[e] == eot || toks[e] == eos || pos + 1 >= SERVE_SEQ) { brk = 1; break; }
                     if (g >= SERVE_GEN) {
@@ -464,6 +475,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     total, tp, total / (tp > 0 ? tp : 1e-9),
                     g, dt, g / (dt > 0 ? dt : 1e-9),
                     t1 - t0);
+            if (barged) fprintf(stderr, "turn barged at %d tokens\n", g);
             if (t && n_draft)
                 fprintf(stderr, "mtp:    accepted %d/%d drafts (%.1f%%) — %d rounds: draft %.2fs (%.1fms ea), verify %.2fs (%.1fms ea)\n",
                         n_accept, n_draft, 100.0 * n_accept / n_draft,
