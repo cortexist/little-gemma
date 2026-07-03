@@ -241,6 +241,14 @@ replies, deferred vs streamed, all three models. (One span of holdback is
 kept unprefilled to absorb ASR revisions of the most recent words; MSG_PEEK
 lets the server prefill right up to the pending frame without consuming it.)
 
+![Figure 1 — prefill under speech: deferred vs streamed delivery of a
+929-token spoken instruction (12B, Orin NX)](fig-prefill-under-speech.svg)
+
+*Figure 1: In deferred delivery (a) the 5.37 s prefill starts only when the
+turn closes; streamed (b), committed words prefill during the speech itself
+and the turn close leaves only the holdback span — TTFT 5.37 → 0.55 s with
+byte-identical replies.*
+
 Measured on the Orin (TTFT after last word, deferred → paced): 12B
 **5.37 → 0.55 s**, E4B **2.23 → 0.26 s**, E2B **1.15 → 0.10 s**. The
 mechanism generalizes beyond dictation: camera and video frames prefill on
@@ -362,10 +370,13 @@ not assumed; deferred runs reproduce to the millisecond.)
 E2B QAT, voice-sys prompt, streamed dictation of the 30-second spoken
 instruction, everything on-device:
 
-```
-last word spoken ──0.10 s── first token ──+0.44──> first clause complete
-                 ──+0.27 s piper synthesis──> FIRST AUDIO at 0.82 s
-```
+![Figure 2 — anatomy of first audio: baseline vs voice-sys prompt (E2B QAT,
+Orin NX)](fig-first-audio-anatomy.svg)
+
+*Figure 2: The same question, two system prompts. The voice-sys prompt cuts
+the first speakable unit from 21 to 8 words, which both starts synthesis
+earlier and makes it cheaper (VITS is ~linear in audio length): first audio
+1.21 → 0.82 s.*
 
 With whisper.cpp's final-commit pass in the loop (base.en CUDA, ~0.55 s
 per invocation, invocation-cost-dominated), voicecat closes the turn ~1.0 s
@@ -382,6 +393,14 @@ One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 | 12B | strongest open-weight ≤16GB | ~3.6 s | "common experience" (P90 region) |
 | E4B | high | ~1.5 s | industry median (1.4–1.7 s) |
 | E2B QAT | good | **0.82 s** | inside the "theoretical ideal", rarely achieved in production |
+
+![Figure 3 — the three tiers against production voice-AI latency
+bands](fig-tiers-vs-industry.svg)
+
+*Figure 3: One board, one pipeline, three operating points. The E2B tier
+lands inside the natural-conversation window that production telemetry
+reports as rarely achieved; the E4B matches the industry median; the 12B
+trades latency for the strongest answers.*
 
 The tier table is the product story: the same hardware and pipeline lets a
 robot answer trivia with the 12B and do fluent small talk with the E2B —
