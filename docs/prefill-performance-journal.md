@@ -1283,3 +1283,24 @@ BufferedReader.read(n) on a pipe blocks for the FULL n bytes — a
 clause of PCM (~44 KB) sat invisible behind a 64 KB read while the
 clock ran; os.read has available-bytes semantics. Both fixed before any
 number above was recorded.
+
+## 2026-07-03 — the scale, completed: piper weighs 0.31 GB
+
+The 8GB study weighed little-gemma and whisper the honest way
+(anonymous + nvmap) but piper only got a VmRSS glance (360 MB) from the
+timing session — the very metric the study warned against. Measured
+properly on the Orin (smaps_rollup Anonymous sampled at 50 ms through a
+service session, including the 21-word / 9.4s-audio sentence as the
+worst case): **309 MB peak anonymous**, VmHWM 340 MB — only ~30 MB of
+the glance was evictable file pages, so RSS happened to be nearly
+honest this time. CPU-only onnxruntime, so no nvmap side at all.
+
+The peak lands during the LONGEST sentence — VITS activations scale
+with output length — so the voice-sys clause-splitting loop actually
+runs piper lighter than this ceiling.
+
+Updated arithmetic for the Nano Super 8GB: 3.9 GB (LLM + ASR) + 0.31 GB
+(TTS) ≈ **4.2 GB unreclaimable** for the full voice loop — ears, brain,
+and mouth — leaving ~2.2 GB of slack on a 7.4GB-usable headless board,
+still with room for the vision encoder. The conclusion survives its
+last missing number.
