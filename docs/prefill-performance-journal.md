@@ -1304,3 +1304,47 @@ Updated arithmetic for the Nano Super 8GB: 3.9 GB (LLM + ASR) + 0.31 GB
 and mouth — leaving ~2.2 GB of slack on a 7.4GB-usable headless board,
 still with room for the vision encoder. The conclusion survives its
 last missing number.
+
+## 2026-07-03 — piper on the GPU: measured, and the CPU-first bet was right
+
+With the LLM leg down to 0.1–0.3 s, TTS is 30–50% of the voice loop — so
+the obvious question got measured: would GPU piper help? First, the
+archaeology: upstream DID attempt GPU. `--cuda` wires
+CUDAExecutionProvider, and `cudnn_conv_algo_search: HEURISTIC`
+(voice.py) is a scar — ORT's default exhaustive conv autotune makes the
+first GPU call take seconds, someone hit it and dialed it down. It never
+became the default because the target hardware (Rhasspy, Raspberry Pi)
+has no CUDA, the pip default is CPU-only onnxruntime, and a
+process-per-utterance CLI pays the CUDA context cost every call.
+
+The A/B (A5000, ORT-gpu 1.27 prepended via PYTHONPATH, CUDA-13 +
+cuDNN-9 DLLs borrowed from the moshi venv's torch/lib,
+.scratch/piper_gpu_ab.py; kristin-medium, warm medians of 5):
+
+| clause | CPU (i7-8086K) | CUDA (A5000) |
+|---|---:|---:|
+| 3.9 s of audio | 0.185 s | 0.116 s (1.6×) |
+| 2.2 s of audio | **0.089 s** | 0.112 s (0.8× — loses) |
+| first call | 0.081 s | 0.640 s |
+
+The tell is ORT's own warning: **28 Memcpy nodes** inserted — VITS keeps
+shape/duration/alignment ops on CPU, so every synthesis round-trips the
+bus repeatedly, and launch+copy overhead swamps ~20 MB of conv math on
+short utterances. GPU only wins as audio length grows. **The crossover
+sits at our clause length**: voice-sys clause splitting deliberately
+moved TTS into the short regime, so GPU TTS is worthless for this
+pipeline even on a free datacenter GPU. On the Orin it is doubly moot:
+no pip onnxruntime-gpu for Jetson aarch64, and the iGPU would contend
+with LLM decode for the same LPDDR5.
+
+Two traps for the record: the first A/B run silently fell back to CPU
+(the provider DLL's *transitive* cudnn dependency resolves via PATH, not
+add_dll_directory — and the "CUDA" numbers matching CPU was the only
+tell; the script now hard-asserts the active provider), and piper's
+session must be checked with get_providers(), never trusted.
+
+The real lever for the TTS share is streaming synthesis: first-byte
+currently equals whole-clause synthesis because VITS decodes the whole
+utterance in one ONNX call. A chunked vocoder decode would put first PCM
+at tens of milliseconds on the same CPU — the Moshi lesson (Mimi streams
+by construction) applied to the cascade's mouth.

@@ -193,7 +193,13 @@ Three processes, one GPU owner:
   whole-clause synthesis, ~0.27–0.49 s per clause on the Orin's cores
   (~18–26× realtime), 0.31 GB peak anonymous memory. Piper was chosen over
   Kokoro on speed [TODO: one-line Kokoro comparison number if we keep this
-  claim].
+  claim]. CPU placement is measured, not assumed: on the A5000, CUDA piper
+  *loses* to a desktop CPU at clause length (0.112 vs 0.089 s — the ONNX
+  graph round-trips the bus 28 times for ops pinned to CPU, and launch/copy
+  overhead swamps ~20 MB of conv math) and only reaches 1.6× on long
+  sentences; clause splitting (§4.3) moves TTS precisely into the regime
+  where CPU wins, and on the Orin the iGPU would contend with decode for
+  the same LPDDR5 anyway.
 
 **Why external ASR when Gemma 4 is natively multimodal?** Because we
 measured the native path and it fails three ways (§7 for details): the
@@ -508,9 +514,16 @@ axis — and why a 6,000-line runner can hold the design point at all.
 
 Finetune for human pause placement (shorter than grammatical clauses);
 persistent whisper service (flips the streaming-vs-endpass verdict
-unconditionally); Nano 8GB SKU validation; barge-in latency
-characterization; camera+voice concurrent sessions (the A/V exclusion
-policy exists, the latency study does not).
+unconditionally); **streaming vocoder synthesis** — with the LLM leg at
+0.1–0.3 s, TTS is now 30–50% of the loop, and the lever is not hardware
+(GPU TTS measured and falsified at clause length, §3) but chunked
+vocoder decode: VITS emits first PCM only after synthesizing the whole
+clause, where a streaming decoder would put first audio at tens of
+milliseconds on the same CPU — Moshi's codec streams by construction,
+and it is the one piece of its architecture the cascade should borrow;
+Nano 8GB SKU validation; barge-in latency characterization; camera+voice
+concurrent sessions (the A/V exclusion policy exists, the latency study
+does not).
 
 ## 9. Conclusion
 
