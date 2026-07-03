@@ -1155,3 +1155,30 @@ for the mmproj vision encoder (~0.7GB) on top. Perf will scale with the
 Nano's lower GPU clocks, but memory is no longer the question. (Not
 verified on the actual SKU — this is the NX 16GB measuring an 8GB
 budget.)
+
+## 2026-07-02 — the last number: TTS, and the voice loop closes at ~1.2s
+
+TTFS told us when the first sentence is READY; the user experience ends at
+when it is HEARD. Piper (en_US-ozgirl_v6-step18500, onnxruntime CPU — the
+GPU stays reserved for the LLM) measured on the Orin, tts_time.py:
+
+| mode | latency |
+|---|---:|
+| cold one-shot (python + espeak + onnx load + synth) | 2.47 s |
+| service, per sentence (persistent process, lines in / raw PCM out) | **0.49 s** |
+
+The load dominates the cold path, so piper runs as a service — same
+verdict as whisper, and piper's stdin-line mode already IS the service:
+one process, each line synthesized as it arrives. Steady-state it turns
+the dictation reply's 21-word first sentence into 9.0–9.7 s of audio in
+0.49 s (~18x realtime, three runs within 10 ms), all on CPU, 360 MB RSS
+(stack + piper ≈ 4.3 GB — still comfortable in the 8 GB budget).
+
+**The full equation, E2B QAT on the Orin, streamed dictation:** last
+spoken word → first token 0.10 s → first sentence complete 0.72 s → first
+audio byte **≈ 1.2 s**. Ears (whisper), brain (little-gemma + MTP), and
+voice (piper) all on-device; while the 9 s first sentence plays, the rest
+of the reply decodes 30x faster than it needs to. Refinements if 1.2 s
+ever matters: piper synthesizes per sentence in one ONNX call, so
+clause-level splitting would shave the 0.49, and TTS overlaps decode
+already — the loop is speech-paced from here, not compute-paced.
