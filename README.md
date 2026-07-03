@@ -96,6 +96,53 @@ cmake --build build --config Release --target run-cuda-i8
 Same CLI as `run`. The CPU backend (`model-cpu.c`) and the CUDA backends
 (`model-cuda-f32.cu`, `model-cuda-i8.cu`) implement the same `model.h`; only the compute kernels differ.
 
+### Vulkan build (optional — the no-CUDA machines)
+
+If the Vulkan SDK (with `glslc`) is found, CMake also builds `run-vulkan` — the
+backend for machines with no NVIDIA GPU at all, integrated laptop graphics most
+of all:
+
+```
+cmake --build build --config Release --target run-vulkan
+```
+
+Same CLI as `run`. The layering is the CPU backend's with one substitution:
+the forward stays `model-cpu.c`'s readable host code (norms, RoPE, attention
+over the host KV cache), and the quantized matmul — nearly all of a token's
+weight traffic and compute — runs as a compute shader
+(`src/vulkan/shaders/matmul.comp`, compiled per weight type by `glslc` at
+build time and embedded; q4_K, q6_K, q8_0, q4_0, f16, bf16, f32). Weights stay
+in their GGUF quantized form on the GPU, dequantized in the shader exactly as
+`quant.c` does — and on an integrated GPU they are not even copied: the GGUF
+blob is imported in place (`VK_EXT_external_memory_host`), so a 5.3 GB model
+costs 5.3 GB of the shared DRAM, once. The same zero-copy instinct as the
+Orin build, arrived at from the other side: a 16 GB laptop cannot afford the
+model twice.
+
+Measured on the machine this backend was written for (AMD Radeon integrated
+GPU, 16 GB shared DDR, Windows) — E4B Q4_K_M, same prompt, same greedy
+tokens on all three:
+
+| backend                   | generation |
+|---------------------------|-----------:|
+| `run` (scalar + OpenMP)   | 1.1 tok/s  |
+| `run-vulkan`, v1 shader   | 0.8 tok/s  |
+| `run-vulkan`, coalesced   | 2.5 tok/s  |
+
+The two shader rows are the whole GPU lesson in miniature: v1 gave each lane
+its own 32-element group, adjacent lanes read ~144 bytes apart, and almost
+nothing coalesced; the rewrite lays lanes across each superblock so adjacent
+lanes read adjacent words, and it is 3× faster before any real tuning. The
+second doubling came from a memory-type fix on the *output* buffer — the CPU
+was reading logits back from write-combined memory, which is exactly the
+direction write-combining is slow in. `LG_VK_VERIFY=1` runs every GPU matmul
+beside the host oracle and reports the max difference (~1e-4 on 1e2-scale
+outputs: summation-order reassociation only, the dequantized values are
+bit-identical); `LG_VK_NO_IMPORT=1` forces the upload path (the A/B that
+proved zero-copy costs ~nothing here); `LG_VK_DEVICE=n` picks a GPU,
+`LG_VK_VALIDATE=1` enables validation layers. Known next steps, in the CUDA
+journey's order: batch the per-matmul submits, then chunked prefill.
+
 ## Usage
 
 ```
@@ -535,6 +582,7 @@ head, CLI + socket server — 2,711 lines) plus exactly one backend:
 | `run`         | `model-cpu.c`                                            |      3,079 |
 | `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      5,128 |
 | `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      6,058 |
+| `run-vulkan`  | `model-vulkan.c` + `vk-compute.c` + `matmul.comp`        |     ~3,780 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by
 `graph_test` only.) So the program that out-decodes llama.cpp CUDA on the

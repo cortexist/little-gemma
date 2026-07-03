@@ -1,0 +1,210 @@
+#version 450
+// The quantized matvec as a compute shader: out[row] = W[row,:] . x, weights
+// read directly in their GGUF quantized form — no f32 copy exists anywhere,
+// exactly like matmul_q in model-cpu.c. Compiled once per weight type with
+// -DQTYPE=<ggml type id> (CMake drives glslc); the dequantization is ported
+// from src/quant.c and must stay bit-identical to it — the only difference
+// vs the CPU backend is summation order (a parallel tree here, serial
+// there), the same reassociation the CUDA backends accept.
+//
+// Geometry: one 64-lane workgroup per output row (matches an RDNA wave);
+// rows beyond 65535 use the y dispatch dimension (n_vocab = 262144 rows for
+// the logits head). Within the row the lanes are laid out so that ADJACENT
+// LANES READ ADJACENT WORDS of the weight stream — a naive one-group-per-
+// lane version read lane-strided bytes instead, coalesced almost nothing,
+// and measured ~4 GB/s where the DRAM does tens (v1 of this file; the
+// rewrite is the same lesson every backend here learned once).
+//
+// Alignment: tensor offsets are 32-aligned (GGUF general.alignment), so
+// w_base is word-aligned — but q6_K blocks are 210 bytes and q8_0 blocks 34,
+// so *blocks* are only 2-aligned and those types fetch at 16-bit granularity
+// (u16 below). w_base is a byte offset into the bound buffer: the zero-copy
+// path binds one big window of the imported GGUF blob and points each tensor
+// into it from the push constants (a descriptor offset would have to satisfy
+// minStorageBufferOffsetAlignment; a push-constant base dodges that).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer W  { uint  w[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer Xb { float x[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Ob { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint k;        // row length in elements (multiple of the block size)
+    uint m;        // number of rows
+    uint w_base;   // byte offset of the tensor inside the bound buffer (32-aligned)
+    uint x_off;    // x offset, in floats
+    uint out_off;  // out offset, in floats
+} pc;
+
+// ggml type ids (mirror include/quant.h)
+#define T_F32   0
+#define T_F16   1
+#define T_Q4_0  2
+#define T_Q8_0  8
+#define T_Q4_K 12
+#define T_Q6_K 14
+#define T_BF16 30
+
+uint  u16(uint o)   { return (w[o >> 2] >> ((o & 2u) << 3)) & 0xFFFFu; }  // o even
+float f16e(uint o)  { return unpackHalf2x16(u16(o)).x; }                  // o even
+uint  b8(uint o)    { return (w[o >> 2] >> ((o & 3u) << 3)) & 0xFFu; }    // any o
+uint  bx(uint v, uint i) { return (v >> (i << 3u)) & 0xFFu; }             // byte i of a word
+int   sx8(uint b)   { return int(b << 24) >> 24; }                        // sign-extend a byte
+
+// This lane's share of dot(W[row,:], x); the 64 partials tree-reduce in main.
+float lane_acc(uint row, uint tid) {
+    float acc = 0.0;
+
+#if QTYPE == T_Q4_K
+    // block_q4_K, 144 bytes = 36 words: d f16, dmin f16, scales[12], qs[128].
+    // Two superblocks in flight: lanes 0-31 even superblocks, 32-63 odd; lane
+    // qw loads qs word qw — 32 lanes cover the 128 qs bytes contiguously.
+    // qs byte j of 32-byte chunk c holds elements c*64+j (low nibble) and
+    // c*64+32+j (high); sub-block 2c scales the lows, 2c+1 the highs.
+    uint nsb = pc.k >> 8u;
+    uint rb  = (pc.w_base >> 2u) + row * nsb * 36u;
+    uint qw  = tid & 31u;
+    uint c   = qw >> 3u;              // 64-chunk 0..3
+    uint j   = (qw & 7u) << 2u;       // first of this word's 4 bytes in the chunk
+    for (uint sb = tid >> 5u; sb < nsb; sb += 2u) {
+        uint b = rb + sb * 36u;
+        vec2 dd = unpackHalf2x16(w[b]);                    // (d, dmin)
+        uint s0 = w[b + 1u], s1 = w[b + 2u], s2 = w[b + 3u];
+        // get_scale_min_k4 for sub-blocks 2c and 2c+1 (6-bit packed scales)
+        float scl, mnl, sch, mnh;
+        {
+            uint i0 = c << 1u, i1 = i0 + 1u;               // 2c < 8 always
+            if (i0 < 4u) { scl = float(bx(s0, i0) & 63u); mnl = float(bx(s1, i0) & 63u); }
+            else { uint i = i0 - 4u;
+                   scl = float((bx(s2, i) & 0xFu) | ((bx(s0, i) >> 6u) << 4u));
+                   mnl = float((bx(s2, i) >> 4u)  | ((bx(s1, i) >> 6u) << 4u)); }
+            if (i1 < 4u) { sch = float(bx(s0, i1) & 63u); mnh = float(bx(s1, i1) & 63u); }
+            else { uint i = i1 - 4u;
+                   sch = float((bx(s2, i) & 0xFu) | ((bx(s0, i) >> 6u) << 4u));
+                   mnh = float((bx(s2, i) >> 4u)  | ((bx(s1, i) >> 6u) << 4u)); }
+        }
+        uint q  = w[b + 4u + qw];
+        uint xb = pc.x_off + sb * 256u + c * 64u + j;
+        float sql = 0.0, sxl = 0.0, sqh = 0.0, sxh = 0.0;
+        for (uint i = 0u; i < 4u; ++i) {
+            uint by = bx(q, i);
+            float xl = x[xb + i], xh = x[xb + 32u + i];
+            sql += xl * float(by & 0xFu);  sxl += xl;
+            sqh += xh * float(by >> 4u);   sxh += xh;
+        }
+        acc += dd.x * (scl * sql + sch * sqh) - dd.y * (mnl * sxl + mnh * sxh);
+    }
+
+#elif QTYPE == T_Q6_K
+    // block_q6_K, 210 bytes: ql[128], qh[64], scales[16] i8, d f16 — blocks
+    // only 2-aligned, hence u16 fetches. Lanes 0-31 take 128-half 0, 32-63
+    // half 1; lane t covers elements 2t,2t+1 (ql low nibbles) and +64 (high).
+    // Element e of a half uses qh[e&31] shifted by 2*(e>>5), and scale
+    // (half*128+e)>>4 — quant.c's dequant_q6_K, relaid per lane.
+    uint nsb = pc.k >> 8u;
+    uint rb  = pc.w_base + row * nsb * 210u;
+    uint ch  = tid >> 5u;
+    uint t   = tid & 31u;
+    uint shl = (t >= 16u) ? 2u : 0u;             // qh shift for elems 2t,2t+1
+    for (uint sb = 0u; sb < nsb; ++sb) {
+        uint b   = rb + sb * 210u;
+        float d  = f16e(b + 208u);
+        uint ql  = u16(b + ch * 64u + 2u * t);             // bytes 2t, 2t+1
+        uint qh  = u16(b + 128u + ch * 32u + ((2u * t) & 31u));
+        uint scb = b + 192u + ch * 8u;
+        uint xb  = pc.x_off + sb * 256u + ch * 128u + 2u * t;
+        float s = 0.0;
+        for (uint i = 0u; i < 2u; ++i) {
+            uint qlv = bx(ql, i), qhv = bx(qh, i);
+            uint e   = 2u * t + i;                       // low element, 0..63 in the half
+            int lo = int((qlv & 0xFu) | (((qhv >> shl)        & 3u) << 4u)) - 32;
+            int hi = int((qlv >> 4u)  | (((qhv >> (shl + 4u)) & 3u) << 4u)) - 32;
+            float sl = float(sx8(b8(scb + (e >> 4u))));        // i8 scale, elems e
+            float sh = float(sx8(b8(scb + 4u + (e >> 4u))));   // i8 scale, elems e+64
+            s += sl * float(lo) * x[xb + i] + sh * float(hi) * x[xb + 64u + i];
+        }
+        acc += d * s;
+    }
+
+#elif QTYPE == T_Q8_0
+    // block_q8_0, 34 bytes: d f16, qs[32] i8 — 2-aligned. Four blocks in
+    // flight: lane = (block, u16 slot of its 16), two elements per lane.
+    uint nb = pc.k >> 5u;
+    uint rb = pc.w_base + row * nb * 34u;
+    uint t  = tid & 15u;
+    for (uint blk = tid >> 4u; blk < nb; blk += 4u) {
+        uint b  = rb + blk * 34u;
+        float d = f16e(b);
+        uint v  = u16(b + 2u + 2u * t);
+        uint xb = pc.x_off + (blk << 5u) + 2u * t;
+        acc += d * (float(sx8(bx(v, 0u))) * x[xb] + float(sx8(bx(v, 1u))) * x[xb + 1u]);
+    }
+
+#elif QTYPE == T_Q4_0
+    // block_q4_0, 18 bytes: d f16, qs[16] — element j low nibble, j+16 high.
+    // Eight blocks in flight: lane = (block, u16 slot of its 8).
+    uint nb = pc.k >> 5u;
+    uint rb = pc.w_base + row * nb * 18u;
+    uint t  = tid & 7u;
+    for (uint blk = tid >> 3u; blk < nb; blk += 8u) {
+        uint b  = rb + blk * 18u;
+        float d = f16e(b);
+        uint v  = u16(b + 2u + 2u * t);
+        uint xb = pc.x_off + (blk << 5u) + 2u * t;
+        for (uint i = 0u; i < 2u; ++i) {
+            uint by = bx(v, i);
+            acc += d * (float(int(by & 0xFu) - 8) * x[xb + i]
+                      + float(int(by >> 4u)  - 8) * x[xb + 16u + i]);
+        }
+    }
+
+#elif QTYPE == T_F16
+    // lane-strided whole words: perfectly coalesced, two elements per load
+    uint words = pc.k >> 1u;
+    uint rw = (pc.w_base >> 2u) + row * words;
+    for (uint wi = tid; wi < words; wi += 64u) {
+        vec2 hv = unpackHalf2x16(w[rw + wi]);
+        uint xb = pc.x_off + 2u * wi;
+        acc += hv.x * x[xb] + hv.y * x[xb + 1u];
+    }
+
+#elif QTYPE == T_BF16
+    // bf16 is the top 16 bits of an f32; a word is a (lo, hi) element pair
+    uint words = pc.k >> 1u;
+    uint rw = (pc.w_base >> 2u) + row * words;
+    for (uint wi = tid; wi < words; wi += 64u) {
+        uint pair = w[rw + wi];
+        uint xb = pc.x_off + 2u * wi;
+        acc += uintBitsToFloat(pair << 16)          * x[xb]
+             + uintBitsToFloat(pair & 0xFFFF0000u) * x[xb + 1u];
+    }
+
+#elif QTYPE == T_F32
+    uint rw = (pc.w_base >> 2u) + row * pc.k;
+    for (uint e = tid; e < pc.k; e += 64u)
+        acc += uintBitsToFloat(w[rw + e]) * x[pc.x_off + e];
+
+#else
+#error "unknown QTYPE"
+#endif
+
+    return acc;
+}
+
+shared float red[64];
+
+void main() {
+    // row index: y extends the dispatch past the 65535-per-dimension limit
+    uint row = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
+    if (row >= pc.m) return;               // uniform per workgroup: safe before barrier()
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = lane_acc(row, tid);
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u)
+        o[pc.out_off + row] = red[0];
+}

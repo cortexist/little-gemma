@@ -101,6 +101,55 @@ else()
     message(STATUS "CUDA not found — skipping run-cuda")
 endif()
 
+# --- Vulkan build (optional) -------------------------------------------------
+# run-vulkan: the backend for machines with no CUDA — integrated laptop GPUs
+# most of all. Same model.h as the others; the quantized matmul runs as a
+# compute shader (one SPIR-V per weight type, compiled here by glslc and
+# embedded as C arrays), the rest of the forward is the CPU reference code.
+# On an APU the GGUF blob is imported zero-copy (VK_EXT_external_memory_host),
+# so the weights exist once in the shared DRAM.
+find_package(Vulkan COMPONENTS glslc)
+if(Vulkan_FOUND AND TARGET Vulkan::glslc)
+    set(LG_VK_SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/vk-spv)
+    file(MAKE_DIRECTORY ${LG_VK_SPV_DIR})
+    set(LG_VK_SPV_INCS "")
+    # name=ggml type id (quant.h); each becomes matmul_<name>.spv.inc, a
+    # comma-separated word list (-mfmt=num) included into a uint32_t[] in
+    # vk-compute.c. Adding a quant type = one line here + one #elif in the
+    # shader + one make_pipe line.
+    foreach(variant "f32=0" "f16=1" "q4_0=2" "q8_0=8" "q4_K=12" "q6_K=14" "bf16=30")
+        string(REPLACE "=" ";" v ${variant})
+        list(GET v 0 vname)
+        list(GET v 1 vid)
+        set(inc ${LG_VK_SPV_DIR}/matmul_${vname}.spv.inc)
+        add_custom_command(OUTPUT ${inc}
+            COMMAND Vulkan::glslc -O --target-env=vulkan1.1 -DQTYPE=${vid} -mfmt=num
+                    -o ${inc} ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/shaders/matmul.comp
+            DEPENDS src/vulkan/shaders/matmul.comp
+            COMMENT "glslc matmul.comp (${vname})"
+            VERBATIM)
+        list(APPEND LG_VK_SPV_INCS ${inc})
+    endforeach()
+    add_custom_target(vk-shaders DEPENDS ${LG_VK_SPV_INCS})
+
+    add_executable(run-vulkan ${CORE} src/vulkan/model-vulkan.c src/vulkan/vk-compute.c
+                   src/cpu/media-gpu-stub.c)   # host media path (like the CPU build)
+    add_dependencies(run-vulkan vk-shaders)
+    target_include_directories(run-vulkan PRIVATE include src ${LG_VK_SPV_DIR})
+    target_link_libraries(run-vulkan PRIVATE Vulkan::Vulkan)
+    if(WIN32)
+        target_link_libraries(run-vulkan PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
+    elseif(UNIX)
+        target_link_libraries(run-vulkan PRIVATE m)
+    endif()
+    if(OpenMP_C_FOUND)
+        target_link_libraries(run-vulkan PRIVATE OpenMP::OpenMP_C)
+    endif()
+    message(STATUS "Vulkan + glslc found — building run-vulkan")
+else()
+    message(STATUS "Vulkan (with glslc) not found — skipping run-vulkan")
+endif()
+
 # --- tools -------------------------------------------------------------------
 # socket_cat: AF_UNIX stdin/stdout client for talking to `run -s` on systems
 # without socat (native Windows, most of all).

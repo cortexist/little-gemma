@@ -234,6 +234,31 @@ static bool read_tensor(FILE *f, struct gguf_tensor *t) {
     return true;
 }
 
+// The tensor blob is allocated page-aligned and page-padded (not plain
+// malloc'd) so a GPU backend may import it IN PLACE — zero-copy weights: both
+// CUDA on the Orin (cudaHostRegister) and Vulkan on integrated GPUs
+// (VK_EXT_external_memory_host) require a page-aligned base and whole pages.
+// Costs nothing for everyone else. Must be freed with blob_free.
+#define BLOB_ALIGN 4096
+static void *blob_alloc(size_t size) {
+    size_t padded = (size + BLOB_ALIGN - 1) & ~(size_t)(BLOB_ALIGN - 1);
+#ifdef _WIN32
+    void *p = _aligned_malloc(padded, BLOB_ALIGN);
+#else
+    void *p = NULL;
+    if (posix_memalign(&p, BLOB_ALIGN, padded) != 0) p = NULL;
+#endif
+    if (p) memset((unsigned char *)p + size, 0, padded - size);   // defined padding
+    return p;
+}
+static void blob_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
 // Pull general.alignment out of the metadata if present (default 32).
 static size_t find_alignment(const struct gguf_context *ctx) {
     for (uint64_t i = 0; i < ctx->header.num_meta; i++) {
@@ -342,7 +367,12 @@ struct gguf_context *load_gguf(const char *filepath) {
         }
 #endif
         if (!ctx->data) {
-            ctx->data = malloc(ctx->data_size);
+            // blob_alloc, not malloc: page-aligned and page-padded so the
+            // Vulkan backend can import the blob in place (zero-copy). This
+            // branch is the only path on Windows — its Vulkan target. A
+            // mapped blob sits at data_offset % pagesize within its pages,
+            // so the import simply declines it and uploads instead.
+            ctx->data = blob_alloc(ctx->data_size);
             if (!ctx->data) {
                 fprintf(stderr, "Out of memory: could not allocate %zu bytes for tensor data.\n",
                         ctx->data_size);
@@ -389,7 +419,7 @@ void free_gguf(struct gguf_context *ctx) {
     if (ctx->map_base) munmap(ctx->map_base, ctx->map_len);
     else
 #endif
-    free(ctx->data);
+    blob_free(ctx->data);
     if (ctx->meta) {
         for (uint64_t i = 0; i < ctx->header.num_meta; i++) free_meta(&ctx->meta[i]);
         free(ctx->meta);
