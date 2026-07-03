@@ -967,10 +967,21 @@ __global__ static void argmax_kernel(const float *x, int n, int *out) {
 
 static const struct gguf_context *g_ctx = NULL;
 static unsigned char *d_blob = NULL;
+static unsigned char **g_dw = NULL;       // per-tensor uploads when the blob never becomes device-resident
+
+// Does this backend repack `type` into its own device copy (so the blob's
+// bytes for it are dead after upload)? Defined by the backend .cu below.
+static int weights_repacked(uint32_t type);
+
+static size_t tensor_bytes(const struct gguf_tensor *t) {
+    int64_t n = 1;
+    for (uint32_t d = 0; d < t->n_dims; d++) n *= (int64_t)t->dims[d];
+    return (size_t)(n / ggml_blck_size((enum ggml_type)t->type)) * ggml_type_size((enum ggml_type)t->type);
+}
 
 static void ensure_weights(struct model *m) {
     ensure_split(LG_MTP_N * m->cfg.n_head);   // split-K scratch: decode B=1 + the B=LG_MTP_N verify; alloc here (pre-capture, no warmup after a chunked prefill)
-    if (d_blob) return;
+    if (d_blob || g_dw) return;
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
     // copying the blob would hold the weights TWICE in the same physical
@@ -985,16 +996,48 @@ static void ensure_weights(struct model *m) {
     // cudaMalloc'd copy is L2-cached). Doubles weight footprint -> only for models
     // that fit twice (E4B 4.6GB ok on 15GB; 12B OOMs).
     static int nozc = -1; if (nozc < 0) nozc = getenv("LG_NO_ZEROCOPY") != NULL;
-    if (prop.integrated && !nozc &&
-        cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
-        cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
-        return;
+    if (prop.integrated && !nozc) {
+        // When (almost) every weight byte is a type this backend repacks into
+        // its own device copy anyway (the QAT E2B is ALL q4_0), pinning the
+        // blob holds the quantized payload twice — 2.3GB of dead pinned
+        // memory, the difference between fitting and not fitting an 8GB
+        // Nano. Upload the residual tensors one by one instead and leave the
+        // blob a plain host mapping (embedding dequant and the repack
+        // sources still read it; the OS may evict it under pressure).
+        size_t inplace = 0;
+        for (uint64_t i = 0; i < m->ctx->header.num_tensors; i++) {
+            const struct gguf_tensor *t = &m->ctx->tensors[i];
+            if (!weights_repacked(t->type)) inplace += tensor_bytes(t);
+        }
+        if (inplace * 4 <= m->ctx->data_size) {
+            g_dw = (unsigned char **)calloc(m->ctx->header.num_tensors, sizeof *g_dw);
+            if (!g_dw) { fprintf(stderr, "ensure_weights: out of memory\n"); exit(1); }
+            for (uint64_t i = 0; i < m->ctx->header.num_tensors; i++) {
+                const struct gguf_tensor *t = &m->ctx->tensors[i];
+                if (weights_repacked(t->type)) continue;      // rweight makes its own copy
+                size_t bytes = tensor_bytes(t);
+                unsigned char *dev;
+                CUDA_CHECK(cudaMalloc(&dev, bytes));
+                CUDA_CHECK(cudaMemcpy(dev, t->data, bytes, cudaMemcpyHostToDevice));
+                g_dw[i] = dev;
+            }
+            return;
+        }
+        if (cudaHostRegister(m->ctx->data, m->ctx->data_size, cudaHostRegisterMapped) == cudaSuccess &&
+            cudaHostGetDevicePointer((void **)&d_blob, m->ctx->data, 0) == cudaSuccess && d_blob) {
+            return;
+        }
+        cudaGetLastError();                   // clear the failed-register error; fall back
+        // Falling through on an integrated GPU means holding the blob TWICE —
+        // say so, because for the big models the copy below is what OOMs.
+        fprintf(stderr, "weights: zero-copy pin failed, copying the %zu-byte blob (2x memory)\n",
+                m->ctx->data_size);
     }
-    cudaGetLastError();                       // clear any failed-register error; fall back
     CUDA_CHECK(cudaMalloc(&d_blob, m->ctx->data_size));
     CUDA_CHECK(cudaMemcpy(d_blob, m->ctx->data, m->ctx->data_size, cudaMemcpyHostToDevice));
 }
 static const unsigned char *dev_weight(const struct gguf_tensor *t) {
+    if (g_dw) return g_dw[(size_t)(t - g_ctx->tensors)];      // NULL only for repacked types, which never ask
     return d_blob + ((const unsigned char *)t->data - (const unsigned char *)g_ctx->data);
 }
 // Device pointer to an f32 norm/scale weight, or NULL if the tensor is absent.

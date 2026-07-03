@@ -26,7 +26,8 @@ static size_t available_memory(void) {
 
 #else
 #include <unistd.h>
-#include <fcntl.h>   // posix_fadvise
+#include <fcntl.h>    // posix_fadvise
+#include <sys/mman.h> // mmap the tensor-data section
 
 static int64_t file_size64(FILE *f) {
     if (fseeko(f, 0, SEEK_END) != 0) return -1;
@@ -320,26 +321,46 @@ struct gguf_context *load_gguf(const char *filepath) {
     // Refuse to load if it won't fit (cap / physical memory) rather than page.
     if (!memory_ok(ctx->data_size)) goto fail;
 
-    // Eagerly read the whole data section into memory.
+    // Bring the data section in: map the file where we can, read it where we
+    // can't. A mapping keeps the blob pages FILE-BACKED — clean and evictable
+    // — so weights a backend has copied elsewhere (the i8 repacks) cost no
+    // RAM once they go cold; a malloc'd blob is anonymous memory the kernel
+    // can never reclaim. PROT_WRITE is required, not a convenience: Tegra's
+    // cudaHostRegister refuses read-only pages, and the register failure
+    // silently falls back to a blob copy that OOMs the 12B. MAP_PRIVATE
+    // keeps the file safe (a stray write would COW, not corrupt).
     if (ctx->data_size) {
-        ctx->data = malloc(ctx->data_size);
-        if (!ctx->data) {
-            fprintf(stderr, "Out of memory: could not allocate %zu bytes for tensor data.\n",
-                    ctx->data_size);
-            goto fail;
-        }
-        if (seek64(f, (int64_t)ctx->data_offset) != 0 ||
-            fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) {
-            fprintf(stderr, "Failed to read tensor data.\n");
-            goto fail;
-        }
 #ifndef _WIN32
-        // The read just left a second copy of the model in the page cache —
-        // on a unified-memory board that is real pressure (a 7 GB model holds
-        // 14 GB of a 16 GB Orin until the kernel reclaims). We own the only
-        // copy that matters now; tell the kernel to drop the cached one.
-        posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+        size_t moff = ctx->data_offset / pg * pg;      // mmap offset must be page-aligned
+        void *mp = mmap(NULL, ctx->data_size + (ctx->data_offset - moff), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE, fileno(f), (off_t)moff);
+        if (mp != MAP_FAILED) {
+            ctx->map_base = mp;
+            ctx->map_len  = ctx->data_size + (ctx->data_offset - moff);
+            ctx->data     = (unsigned char *)mp + (ctx->data_offset - moff);
+        }
 #endif
+        if (!ctx->data) {
+            ctx->data = malloc(ctx->data_size);
+            if (!ctx->data) {
+                fprintf(stderr, "Out of memory: could not allocate %zu bytes for tensor data.\n",
+                        ctx->data_size);
+                goto fail;
+            }
+            if (seek64(f, (int64_t)ctx->data_offset) != 0 ||
+                fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) {
+                fprintf(stderr, "Failed to read tensor data.\n");
+                goto fail;
+            }
+#ifndef _WIN32
+            // The read just left a second copy of the model in the page cache —
+            // on a unified-memory board that is real pressure (a 7 GB model holds
+            // 14 GB of a 16 GB Orin until the kernel reclaims). We own the only
+            // copy that matters now; tell the kernel to drop the cached one.
+            posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
+        }
     }
 
     // Point each tensor into the loaded buffer (offsets are relative to data_offset).
@@ -364,6 +385,10 @@ fail:
 
 void free_gguf(struct gguf_context *ctx) {
     if (!ctx) return;
+#ifndef _WIN32
+    if (ctx->map_base) munmap(ctx->map_base, ctx->map_len);
+    else
+#endif
     free(ctx->data);
     if (ctx->meta) {
         for (uint64_t i = 0; i < ctx->header.num_meta; i++) free_meta(&ctx->meta[i]);

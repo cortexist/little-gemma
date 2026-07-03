@@ -30,6 +30,13 @@
 
 #include "model-cuda.cuh"
 
+// These types get repacked device copies in rweight below, so the blob's
+// bytes for them are dead after upload — ensure_weights uses this to skip
+// pinning the whole blob for all-repacked models (the QAT E2B).
+static int weights_repacked(uint32_t type) {
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K;
+}
+
 // Quantize a whole activation in one kernel (one thread per 32-element group).
 // Almost every activation is quantized by its producer's epilogue instead (see
 // model-cuda.cuh); this remains for the one with no producer kernel, the

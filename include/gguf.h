@@ -82,10 +82,14 @@ struct gguf_context {
     size_t              alignment; // general.alignment (default 32)
     size_t              data_offset;
 
-    // The tensor-data section is read eagerly into this heap buffer; tensors
-    // point into it. Loading fails rather than silently paging from disk.
-    void   *data;                  // owned buffer holding the data section
+    // The tensor-data section: on POSIX a read-only file mapping (pages are
+    // clean and evictable — weights a backend has copied elsewhere cost no
+    // RAM once cold), on Windows an eagerly-read heap buffer. Tensors point
+    // into it either way.
+    void   *data;                  // the data section (into map_base, or owned heap)
     size_t  data_size;             // its size in bytes (file_size - data_offset)
+    void   *map_base;              // mmap base when file-mapped (NULL = heap)
+    size_t  map_len;               // mapped length incl. the alignment head
 };
 
 // Returns the on-disk size in bytes of a scalar value type, or 0 for

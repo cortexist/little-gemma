@@ -1110,3 +1110,48 @@ IS the sentence. Acceptance on this prose reply is 39.5% (the 256-wide
 draft head), decode still nets 31.6 tok/s. Deferred runs are
 reproducible to the millisecond (1.148/1.144 back-to-back).
 docs/dictation-timing.html now carries the E2B rows (strip chart C).
+
+## 2026-07-02 — the 8GB question: peak memory of the E2B dictation stack
+
+"Would an Orin Nano Super 8GB run this?" Measured on the NX 16GB
+(mempeak.sh: per-process smaps_rollup + nvmap iovmm clients + a
+MemAvailable sampler), and the measuring taught us more than the number.
+
+**Metric lesson first.** On Jetson, no single counter tells the truth:
+VmHWM counts evictable file pages, and MemAvailable UNDER-counts nvmap
+(GPU allocations landed while the watermark barely moved). The honest
+figure is **anonymous RSS + nvmap** — neither is reclaimable.
+
+**Two fixes fell out.** (1) ensure_weights pinned the whole 2.4GB blob on
+Tegra while every q4_0 tensor also carried a repacked device copy — for
+models whose bulk types are all repacked (the QAT E2B), the blob now
+skips device residency entirely; the ~340MB f32 residual uploads
+per-tensor (`weights_repacked()` seam, per backend). (2) That alone saved
+nothing real, because gguf.c malloc+fread'd the blob — anonymous memory
+the kernel can never reclaim. The data section is now **mmap'd** on POSIX
+(PROT_READ|PROT_WRITE MAP_PRIVATE — Tegra's cudaHostRegister refuses
+read-only pages, and that register failure silently fell back to the
+blob copy that OOMs the 12B; a loud warning now marks that path). Blob
+pages are file-backed and evictable; after warmup only the embedding
+rows stay hot. All gates: E2B byte-identical through both changes,
+12B/E4B registered zero-copy path intact (Paris), Windows keeps fread.
+
+**The numbers (E2B QAT + MTP head, dictation workload):**
+
+| component | unreclaimable |
+|---|---:|
+| little-gemma serve: nvmap (repack 2.3GB + residual + rings/scratch) | 3.00 GB |
+| little-gemma serve: anonymous host RSS | 0.11 GB |
+| whisper.cpp CUDA base.en, per pass (nvmap 0.42 + anon ~0.25) | ~0.7 GB |
+| **stack peak, concurrent dictation + ASR** | **~3.9 GB** |
+
+Plus up to 2.4GB of *evictable* blob page cache the OS keeps only while
+it has room. Before the two fixes the same stack held ~5.5GB
+unreclaimable (pinned blob + repack, both resident by construction).
+
+**Verdict for the Nano Super 8GB:** ~3.9GB stack + ~1GB headless L4T
+leaves ~2.5GB of slack on a 7.4GB-usable board — comfortable, with room
+for the mmproj vision encoder (~0.7GB) on top. Perf will scale with the
+Nano's lower GPU clocks, but memory is no longer the question. (Not
+verified on the actual SKU — this is the NX 16GB measuring an 8GB
+budget.)

@@ -8,6 +8,10 @@
 
 #include "model-cuda.cuh"
 
+// The readable backend reads every quantized block straight from the blob —
+// nothing is repacked, so ensure_weights keeps the blob device-resident.
+static int weights_repacked(uint32_t type) { (void)type; return 0; }
+
 // Accumulate one block's contribution to the dot: each of the 32 lanes handles
 // elements {lane, lane+32, ...}. Per-block scale factors are computed once; the
 // per-element index math is derived from the sequential layouts in quant.c.
