@@ -1046,3 +1046,42 @@ q4_0 has no mma prefill route, so E2B prefills at 48 tok/s on the dp4a
 fallback vs the E4B's 271 — an own m16n8k32 q4_0 kernel (simpler epilogue
 than q4_K: no mins, no super-block) is the priced next step if QAT E2B
 graduates toward production.
+
+## 2026-07-02 — q4_0 joins the tensor cores: the mma flavor and the shape-shifting repack
+
+"Since we added the support, we should support it well." The dp4a fallback
+left QAT E2B prefilling at 48 tok/s on the Orin while the E4B did 271 —
+q4_0 had no mma route. Now it does, and the trick was to not write a new
+kernel at all.
+
+**One layout to feed them all.** q4_0 now repacks into a **q4_K-shaped
+144-byte superblock** (`block_q4_0m`): 8 consecutive 32-element blocks,
+nibbles rearranged into q4_K's lo/hi pair layout, and the 8 f16 scales
+sitting exactly where q4_K keeps its d/dmin/scales header. Two
+static_asserts pin the contract (same sizeof, same qs offset). The payoff:
+every q4_K walker reads it with its existing index math. The dp4a subs
+became eight-line siblings of `sub_q4_K` (signed nibbles via `__vsub4`, so
+the −8 rides the integer dot — no min term); the mma kernel gained a
+compile-time `Q40` flavor whose only differences are the per-sub-block
+scale decode (`d[sj]` from the same four header words) and a min-free
+epilogue. The q4_K instantiation is untouched — proven, not assumed:
+stash-A/B on a high-entropy prompt, **byte-identical**. MTP acceptance on
+the E2B (75.7%, same reply text) confirms the reshaped decode/verify subs
+kept their by-construction identity.
+
+**Numbers (warm serve, 912-token turns).** Orin: 48 → **798 tok/s**
+(16.6x the dp4a route, 1.9x the E4B's 417 — the half-size model finally
+prefills like one). A5000: **6,682 tok/s** (1.8x E4B's 3,722). Decode rode
+along: the uint4-friendly layout took plain decode 26.3 → 28.5 and the MTP
+verify 37.7 → 20.1 ms/round → structured MTP decode 31.5 → **55.3 tok/s**.
+Camera turn ttft 0.20s. mma-vs-dp4a replies diverge mid-text on the
+high-entropy prompt — the same relaxed prefill class as q4_K's mma,
+both coherent.
+
+**A measurement trap, twice avoided.** One-shot `-p` charged the in-process
+repack to the prompt timer: the A5000 "measured" 215 tok/s mma vs 200 dp4a
+— both numbers are mostly repack. Serve mode (repack in engine warmup)
+tells the truth; this is the same lesson the Orin one-shot benches taught
+in Phase 0, now confirmed on the discrete card. The byte-wise nibble weave
+also cost 3.2s of warmup; a word-wise rewrite (two mask-and-or lines per
+16 bytes) brought it to 1.51s, gated byte-identical output.

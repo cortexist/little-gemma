@@ -407,8 +407,13 @@ prefills through arch-tuned tensor-core GEMMs at large batch — and the
 |--------|-------|-------------:|--------------|
 | A5000 | 12B | 533 → **~1,820** | 0.81× (was 0.24×) |
 | A5000 | E4B | 1,020 → **~3,720** | ~0.70× (was 0.21×) |
+| A5000 | E2B QAT | **~6,680** | — |
 | Orin  | 12B | ~102 → **~173** | **0.80×** |
 | Orin  | E4B | ~192 → **~417** | **0.82×** |
+| Orin  | E2B QAT | **~798** | — |
+
+(The E2B rows are Google's QAT release — all q4_0 weights — running the
+same m16n8k32 kernel's q4_0 flavor over q4_K-shaped repacked superblocks.)
 
 Most steps were gated byte-identical; the f16 SWA rings and warp-row norms
 ship under the same determinism + quality gate as the original f16-KV step
@@ -517,21 +522,21 @@ vendors **nothing** — pure C/CUDA; media-file decoding lives in `mmcat` in
 the sibling little-gemma-tools repo. The backends are mutually exclusive, so
 no single program is anywhere near that. Each binary is the shared pipeline
 (GGUF parse, dequant, tokenizer, config, multimodal embedders, the MTP draft
-head, CLI + socket server — 2,658 lines) plus exactly one backend:
+head, CLI + socket server — 2,711 lines) plus exactly one backend:
 
-| binary        | backend on top of the shared 2,658                       | code lines |
+| binary        | backend on top of the shared 2,711                       | code lines |
 |---------------|----------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                            |      3,032 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      4,697 |
-| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      5,539 |
+| `run`         | `model-cpu.c`                                            |      3,079 |
+| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-cuda.cu` |      5,128 |
+| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-cuda.cu` |      6,058 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by
 `graph_test` only.) So the program that out-decodes llama.cpp CUDA on the
 Jetson on every model it runs — multi-turn socket serving, batched wide-chunk
 prefill, a ring-buffered f16 KV cache, tensor-core flash-attention prefill,
 split-K decode, image and audio understanding, a GPU vision encoder, an own
-m16n8k32 tensor-core q4_K prefill kernel, and byte-identical speculative
-decoding included — is **about 5,500 lines of C end to end**, tokenizer and
+m16n8k32 tensor-core q4_K/q4_0 prefill kernel, and byte-identical speculative
+decoding included — is **about 6,100 lines of C end to end**, tokenizer and
 all, with no vendored dependency.
 
 ## Validation
