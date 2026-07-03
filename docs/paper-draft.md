@@ -545,6 +545,16 @@ into the repo or a companion artifact for submission.]
 - [ ] Moshi note completion ("despite they got 100...")
 - [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
       at the question's final word (script change needed in measure_ttfb.py)
+- [ ] Moshi session-aging study: GitHub reports (unverified) say latency
+      grows past 1 s as the session runs — plausible mechanism: lock-step
+      80 ms frame budget + per-step cost growing with KV history = a
+      real-time cliff that accumulates rather than jitters (the demo's
+      session cap is circumstantial evidence). Measure step time vs session
+      length. If confirmed: stationary-vs-accumulating latency becomes a §6
+      argument — the cascade re-anchors per turn and has no deadline to miss.
+- [ ] Our own session-aging curve, same rigor: TTFT/TTFB vs turn number as
+      the 8K context fills (SWA rings bound memory, but global-layer KV and
+      attention cost grow) — preempt the symmetric reviewer question.
 - [ ] whisper-server (persistent) live-mic TTFB
 - [ ] price of Orin NX 16GB module for §3
 - [ ] burst-mode row values if the matrix table keeps all three deliveries
