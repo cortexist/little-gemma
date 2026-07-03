@@ -1182,3 +1182,36 @@ of the reply decodes 30x faster than it needs to. Refinements if 1.2 s
 ever matters: piper synthesizes per sentence in one ONNX call, so
 clause-level splitting would shave the 0.49, and TTS overlaps decode
 already — the loop is speech-paced from here, not compute-paced.
+
+## 2026-07-02 — the LLM is the splitter: a voice system prompt cuts first audio to 0.82s
+
+Generating 9s of audio in one piper call was the visible waste; the real
+finding is WHERE splitting can happen. The glue layer can flush to piper
+at any punctuation mark — piper synthesizes whatever line it is handed —
+but measurement shows the baseline E2B writes 21-word sentences with NO
+commas: a clause-flusher has nothing to flush. Only the LLM can create
+the split points. So the split policy lives in a system prompt, loaded
+once at startup via the existing `-sys` (docs/voice-sys.txt): spoken
+prose, no markdown, five-to-ten-word clauses, point first.
+
+E2B follows it beautifully. The dictation reply became "Paris became the
+capital of France in 1806. Napoleon Bonaparte moved the capital there.
+He wanted a central location for his empire." — short sentences, zero
+markdown to scrub, and the first speakable unit fell from 21 words to 8:
+
+| | first token | first speakable | + piper | first audio |
+|---|---:|---:|---:|---:|
+| baseline | 0.102 s | 0.714 s | 0.49 s | 1.21 s |
+| voice-sys | 0.101 s | **0.549 s** | **0.27 s** | **0.82 s** |
+
+Piper scales ~linearly with audio length (0.27s for 5s of clause audio
+vs 0.49s for 9.4s), so shorter first units pay off twice — earlier text
+AND faster synthesis. The 5s first clause plays while sentence two is
+long since decoded; the loop stays speech-paced.
+
+Two honest notes. (1) Style pressure showed the small model's edges: the
+voice-sys answer is crisper AND confidently wrong ("in 1806" — Paris
+predates Napoleon as capital by centuries), where the baseline was vague
+but defensible. (2) Prompt-only is the bootstrap; the production path is
+the finetune — teach the model human pause placement (often SHORTER than
+grammatical clauses) instead of asking a 2B to also be its own editor.
