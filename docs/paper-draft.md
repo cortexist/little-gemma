@@ -121,8 +121,14 @@ Contributions:
 7B text backbone with the Mimi streaming codec and full-duplex dialogue
 training; it reports ~160 ms theoretical / 200 ms practical latency on an
 NVIDIA L4 (24 GB, ~72 W TDP datacenter card); we measure ~130 ms TTFB warm on
-an RTX A5000 (trials 252/129/135 ms; ~23 ms connection handshake, inclusion
-under audit — TODO revisit). Mini-omni and successors [TODO cite] follow the
+an RTX A5000 (trials 252/129/135 ms; the ~23 ms WebSocket handshake is
+excluded by construction — the clock starts when the client begins streaming
+audio, after the handshake byte). Two disclosures make this number
+conservative in Moshi's favor: our run used the uncompiled PyTorch q8 path
+(torch.compile is broken on Windows), and the clock anchors at the *start*
+of input streaming, measuring the full-duplex loop latency (~one 80 ms Mimi
+frame + one model step) rather than a turn response; §7 discusses the anchor
+mismatch with our end-of-speech metric. Mini-omni and successors [TODO cite] follow the
 same species. These systems set the fluency bar, at the price of a fixed,
 purpose-trained model: the backbone is frozen into a speech topology, so the
 brain cannot be swapped for next quarter's better open-weight release, and
@@ -478,7 +484,14 @@ axis — and why a 6,000-line runner can hold the design point at all.
   live-mic number, ~1.0 s to turn close); Moshi's number includes its
   hearing. The persistent-whisper upgrade path narrows this and is measured
   future work.
-- Moshi's ~23 ms handshake in/out of its TTFB is unresolved [TODO].
+- The Moshi comparison is anchor-mismatched in Moshi's favor and ours at
+  once: its probe clock starts at the *start* of input streaming (fed
+  silence, the full-duplex model initiates speech itself), ours at the *end*
+  of user speech. Full-duplex design bounds Moshi's turn response by roughly
+  the same loop latency, so the citation is fair in spirit, but the rigorous
+  head-to-head — stream a recorded question, anchor at its final word —
+  remains future work. (The handshake question is resolved: excluded by
+  construction.)
 - Style pressure makes the 2B confidently wrong where it was vaguely right
   (§4.3); the clause-splitting prompt trades a quality edge for fluency at
   the smallest tier. Finetuning may recover both.
@@ -530,6 +543,8 @@ into the repo or a companion artifact for submission.]
       31.6 tok/s with MTP at 39.5% acceptance)
 - [ ] Kokoro comparison number, or drop the "faster than Kokoro" claim
 - [ ] Moshi note completion ("despite they got 100...")
+- [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
+      at the question's final word (script change needed in measure_ttfb.py)
 - [ ] whisper-server (persistent) live-mic TTFB
 - [ ] price of Orin NX 16GB module for §3
 - [ ] burst-mode row values if the matrix table keeps all three deliveries
