@@ -63,16 +63,20 @@ typedef struct {                 // q6_K repacked: 210 -> 212 bytes (pad only)
     uint8_t   pad[2];
 } block_q6_Kr;
 
-typedef struct {                 // q4_0 repacked: 18 -> 20 bytes (pad only)
-    ggml_half d;
-    uint8_t   pad[2];            // -> qs lands 4-aligned (18-byte blocks alternate)
-    uint8_t   qs[16];            // nibbles, unchanged
-} block_q4_0r;
+typedef struct {                 // q4_0 repacked: 8 blocks -> one q4_K-SHAPED superblock
+    ggml_half d[8];              // per-32 scales, sitting where q4_K keeps d/dmin/scales
+    uint8_t   qs[128];           // nibbles rearranged into q4_K's lo/hi pair layout
+} block_q4_0m;
 
 static_assert(sizeof(block_q3_Kr) == 116 && offsetof(block_q3_Kr, qs) % 4 == 0
               && offsetof(block_q3_Kr, hmask) % 4 == 0, "block_q3_Kr layout");
 static_assert(sizeof(block_q6_Kr) == 212 && offsetof(block_q6_Kr, qh) % 4 == 0, "block_q6_Kr layout");
-static_assert(sizeof(block_q4_0r) == 20 && offsetof(block_q4_0r, qs) % 4 == 0, "block_q4_0r layout");
+// The mma kernel reads a q4_0m superblock THROUGH a block_q4_K pointer (same
+// stride, same qs offset, header d[8] under q4_K's four d/dmin/scales words) —
+// only the per-sub-block scale decode differs, picked by the kernel's Q40
+// template flavor. These asserts ARE that contract.
+static_assert(sizeof(block_q4_0m) == sizeof(block_q4_K)
+              && offsetof(block_q4_0m, qs) == offsetof(block_q4_K, qs), "block_q4_0m rides q4_K's layout");
 
 
 __device__ static uint32_t ld32(const void *p) { return *(const uint32_t *)p; }
@@ -183,14 +187,23 @@ __device__ static float sub_q8_0(const block_q8_0 *p, const int8_t *xqb, const f
     for (int i = 0; i < 32; i++) dot += (int)p->qs[i] * xqb[i];
     return xds[0].x * d_fp16(p->d) * dot;
 }
-__device__ static float sub_q4_0(const block_q4_0r *p, const int8_t *xqb, const float2 *xds) {
-    int dot = 0;                                   // Google's QAT release format:
-    for (int i = 0; i < 16; i += 4) {              // low nibbles = elems 0-15, high = 16-31
-        uint32_t w = ld32(p->qs + i);
-        dot = __dp4a((int)__vsub4(w & 0x0F0F0F0Fu, 0x08080808u), *(const int *)(xqb + i), dot);
-        dot = __dp4a((int)__vsub4((w >> 4) & 0x0F0F0F0Fu, 0x08080808u), *(const int *)(xqb + i + 16), dot);
+// q4_0 (Google's QAT release format), repacked into q4_K's shape: same qs pair
+// layout, so the same uint4 walk — but nibbles are SIGNED (q-8 via __vsub4) and
+// the scale is just d[sj]. No mins, no super-block scale.
+__device__ static int nib4s(uint32_t w, int half) { return (int)__vsub4((uint32_t)nib4(w, half), 0x08080808u); }
+__device__ static float sub_q4_0m(const block_q4_0m *p, int sj, const int8_t *xqb, const float2 *xds) {
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    const int4  *a = (const int4 *)(xqb + sj * 32);
+    int dot = 0;
+    for (int h = 0; h < 2; h++) {
+        uint4 q4 = q[h]; int4 a4 = a[h];
+        dot = __dp4a(nib4s(q4.x, half), a4.x, dot);
+        dot = __dp4a(nib4s(q4.y, half), a4.y, dot);
+        dot = __dp4a(nib4s(q4.z, half), a4.z, dot);
+        dot = __dp4a(nib4s(q4.w, half), a4.w, dot);
     }
-    return xds[0].x * d_fp16(p->d) * dot;
+    return xds[sj].x * d_fp16(p->d[sj]) * dot;
 }
 
 // Chunk-form siblings of the subs above: identical math in identical order
@@ -319,24 +332,24 @@ __device__ static void sub_q8_0_n(const block_q8_0 *p, const int8_t *xq0, int k,
     }
 }
 template <int NB>
-__device__ static void sub_q4_0_n(const block_q4_0r *p, const int8_t *xq0, int k,
-                                  const float2 *xds0, int kg, float *s) {
-    int lo[4], hi[4];                              // elems 0-15 / 16-31, dp4a-ready
-    for (int i = 0; i < 4; i++) {
-        uint32_t w = ld32(p->qs + 4 * i);
-        lo[i] = (int)__vsub4(w & 0x0F0F0F0Fu, 0x08080808u);
-        hi[i] = (int)__vsub4((w >> 4) & 0x0F0F0F0Fu, 0x08080808u);
-    }
-    float dd = d_fp16(p->d);
+__device__ static void sub_q4_0m_n(const block_q4_0m *p, int sj, const int8_t *xq0, int k,
+                                   const float2 *xds0, int kg, float *s) {
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *q = (const uint4 *)(p->qs + g * 32);
+    uint4 qa = q[0], qb = q[1];
+    int w0 = nib4s(qa.x, half), w1 = nib4s(qa.y, half), w2 = nib4s(qa.z, half), w3 = nib4s(qa.w, half);
+    int w4 = nib4s(qb.x, half), w5 = nib4s(qb.y, half), w6 = nib4s(qb.z, half), w7 = nib4s(qb.w, half);
+    float d = d_fp16(p->d[sj]);
     #pragma unroll
     for (int j = 0; j < NB; j++) {
-        const int8_t *xqb = xq0 + (size_t)j * k;
+        const int4 *a = (const int4 *)(xq0 + (size_t)j * k + sj * 32);
+        int4 a0 = a[0], a1 = a[1];
         int dot = 0;
-        for (int i = 0; i < 4; i++) {
-            dot = __dp4a(lo[i], *(const int *)(xqb + 4 * i), dot);
-            dot = __dp4a(hi[i], *(const int *)(xqb + 16 + 4 * i), dot);
-        }
-        s[j] += xds0[(size_t)j * kg].x * dd * dot;
+        dot = __dp4a(w0, a0.x, dot); dot = __dp4a(w1, a0.y, dot);
+        dot = __dp4a(w2, a0.z, dot); dot = __dp4a(w3, a0.w, dot);
+        dot = __dp4a(w4, a1.x, dot); dot = __dp4a(w5, a1.y, dot);
+        dot = __dp4a(w6, a1.z, dot); dot = __dp4a(w7, a1.w, dot);
+        s[j] += xds0[(size_t)j * kg + sj].x * d * dot;
     }
 }
 
@@ -358,9 +371,9 @@ matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int 
     float s = 0.0f;
 
     int nsub = 0;
-    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_0) nsub = 8;
     else if (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K) nsub = 16;
-    else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) nsub = 1;
+    else if (type == GGML_TYPE_Q8_0) nsub = 1;
 
     if (nsub) {
         int total = nb * nsub;
@@ -375,7 +388,7 @@ matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int 
                 case GGML_TYPE_Q3_K: s += sub_q3_Kr((const block_q3_Kr *)blk, sj, xqb, xdsb); break;
                 case GGML_TYPE_Q6_K: s += sub_q6_Kr((const block_q6_Kr *)blk, sj, xqb, xdsb); break;
                 case GGML_TYPE_Q8_0: s += sub_q8_0((const block_q8_0 *)blk, xqb, xdsb); break;
-                case GGML_TYPE_Q4_0: s += sub_q4_0((const block_q4_0r *)blk, xqb, xdsb); break;
+                case GGML_TYPE_Q4_0: s += sub_q4_0m((const block_q4_0m *)blk, sj, xqb, xdsb); break;
             }
         }
     } else if (type == GGML_TYPE_F32) {                  // float fallbacks: lanes split the row
@@ -422,14 +435,31 @@ static void repack_q6_K(block_q6_Kr *dst, const block_q6_K *src, size_t nb) {
         dst[i].d = src[i].d;
     }
 }
-// q4_0's 18-byte blocks alternate 2-byte alignment, so pad to 20 for ld32/dp4a.
-// The device copy also matters on its own: the Orin reads the in-place blob
-// UNCACHED (zero-copy), which the QAT E2B release — all q4_0 — would pay on
-// every weight byte of every matmul.
-static void repack_q4_0(block_q4_0r *dst, const block_q4_0 *src, size_t nb) {
-    for (size_t i = 0; i < nb; i++) {
-        dst[i].d = src[i].d;
-        memcpy(dst[i].qs, src[i].qs, 16);
+// q4_0 -> the q4_K-shaped superblock: 8 consecutive 32-element blocks become
+// one 144-byte block_q4_0m, nibbles rearranged into q4_K's pair layout (pair p
+// packs sub-block 2p in the low nibbles and 2p+1 in the high, sequential
+// within each) so the q4_K walkers -- dp4a subs AND the mma kernel -- read it
+// with their existing index math. The device copy also matters on its own: the
+// Orin reads the in-place blob UNCACHED (zero-copy), which the QAT E2B
+// release -- all q4_0 -- would pay on every weight byte of every matmul.
+static void repack_q4_0m(block_q4_0m *dst, const block_q4_0 *src, size_t nsb) {
+    for (size_t i = 0; i < nsb; i++, src += 8) {
+        for (int j = 0; j < 8; j++) dst[i].d[j] = src[j].d;
+        for (int p = 0; p < 4; p++) {
+            // Word-wise nibble weave (a byte loop here cost ~3s of engine
+            // warmup on the 2.4GB E2B). Output byte b<16 packs lo(A,b) and
+            // lo(C,b); byte b+16 packs the two hi nibbles — A/C being the
+            // pair's two q4_0 blocks. qs sits 2-aligned in the 18-byte source
+            // blocks, so the loads go through memcpy.
+            uint32_t a[4], c[4];
+            memcpy(a, src[2 * p].qs, 16);
+            memcpy(c, src[2 * p + 1].qs, 16);
+            uint32_t *q = (uint32_t *)(dst[i].qs + p * 32);
+            for (int wq = 0; wq < 4; wq++) {
+                q[wq]     = (a[wq] & 0x0F0F0F0Fu) | ((c[wq] & 0x0F0F0F0Fu) << 4);
+                q[wq + 4] = ((a[wq] >> 4) & 0x0F0F0F0Fu) | (c[wq] & 0xF0F0F0F0u);
+            }
+        }
     }
 }
 
@@ -439,10 +469,16 @@ static void repack_q4_0(block_q4_0r *dst, const block_q4_0 *src, size_t nb) {
 // cudaMallocs here are done before graph capture begins.
 static unsigned char **g_rw = NULL;
 
+// q4_0's repacked superblock groups 256 elements: index the repacked blob (and
+// its 8 activation groups) at QK_K granularity, not q4_0's native 32.
+static int rblck(const struct gguf_tensor *t) {
+    return t->type == GGML_TYPE_Q4_0 ? QK_K : ggml_blck_size(t->type);
+}
+
 static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
     *ts = (t->type == GGML_TYPE_Q3_K) ? (int)sizeof(block_q3_Kr)
         : (t->type == GGML_TYPE_Q6_K) ? (int)sizeof(block_q6_Kr)
-        : (t->type == GGML_TYPE_Q4_0) ? (int)sizeof(block_q4_0r)
+        : (t->type == GGML_TYPE_Q4_0) ? (int)sizeof(block_q4_0m)
         : (int)ggml_type_size(t->type);
     if (!g_rw) {
         g_rw = (unsigned char **)calloc(g_ctx->header.num_tensors, sizeof *g_rw);
@@ -452,15 +488,23 @@ static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
     if (g_rw[i]) return g_rw[i];
     if (t->type != GGML_TYPE_Q3_K && t->type != GGML_TYPE_Q6_K && t->type != GGML_TYPE_Q4_0)
         return g_rw[i] = (unsigned char *)dev_weight(t);
+    // The superblock must not straddle a row: rows of a q4_0 tensor with
+    // k % 256 != 0 would interleave across 256-element groups. No known q4_0
+    // model does this (Google's QAT E2B is all %256); refuse loudly, the CPU
+    // and f32 backends still take such a file.
+    if (t->type == GGML_TYPE_Q4_0 && t->dims[0] % QK_K) {
+        fprintf(stderr, "rweight: q4_0 tensor %s has k %% 256 != 0 - unsupported on the i8 backend\n", t->name);
+        exit(1);
+    }
 
     int64_t n = 1;
     for (uint32_t d = 0; d < t->n_dims; d++) n *= (int64_t)t->dims[d];
-    size_t nb = (size_t)(n / ggml_blck_size(t->type)), bytes = nb * (size_t)*ts;
+    size_t nb = (size_t)(n / QK_K), bytes = nb * (size_t)*ts;
     void *host = malloc(bytes);
     if (!host) { fprintf(stderr, "rweight: out of memory repacking %s\n", t->name); exit(1); }
     if (t->type == GGML_TYPE_Q3_K)      repack_q3_K((block_q3_Kr *)host, (const block_q3_K *)t->data, nb);
     else if (t->type == GGML_TYPE_Q6_K) repack_q6_K((block_q6_Kr *)host, (const block_q6_K *)t->data, nb);
-    else                                repack_q4_0((block_q4_0r *)host, (const block_q4_0 *)t->data, nb);
+    else                                repack_q4_0m((block_q4_0m *)host, (const block_q4_0 *)t->data, nb);
     unsigned char *dev;
     CUDA_CHECK(cudaMalloc(&dev, bytes));
     CUDA_CHECK(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice));
@@ -615,7 +659,7 @@ static void rweight_init_all(void) {
 
 static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
-    int blck = ggml_blck_size(t->type), ts;
+    int blck = rblck(t), ts;
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
@@ -649,9 +693,9 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
     for (int j = 0; j < NB; j++) s[j] = 0.0f;
 
     int nsub = 0;
-    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) nsub = 8;
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_0) nsub = 8;
     else if (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K) nsub = 16;
-    else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) nsub = 1;
+    else if (type == GGML_TYPE_Q8_0) nsub = 1;
 
     if (nsub) {
         int total = nb * nsub;
@@ -666,7 +710,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
                 case GGML_TYPE_Q3_K: sub_q3_Kr_n<NB>((const block_q3_Kr *)blk, sj, xq0, k, xds0, k / 32, s); break;
                 case GGML_TYPE_Q6_K: sub_q6_Kr_n<NB>((const block_q6_Kr *)blk, sj, xq0, k, xds0, k / 32, s); break;
                 case GGML_TYPE_Q8_0: sub_q8_0_n<NB>((const block_q8_0 *)blk, xq0, k, xds0, k / 32, s); break;
-                case GGML_TYPE_Q4_0: sub_q4_0_n<NB>((const block_q4_0r *)blk, xq0, k, xds0, k / 32, s); break;
+                case GGML_TYPE_Q4_0: sub_q4_0m_n<NB>((const block_q4_0m *)blk, sj, xq0, k, xds0, k / 32, s); break;
             }
         }
     } else if (type == GGML_TYPE_F32) {
@@ -804,7 +848,15 @@ __device__ static void mma_stage_b(int8_t *sB, float2 *sBxds, int buf,
 //               a2 row gid   k16..31, a3 row gid+8 k16..31
 //   B (2 regs): b0 col gid   k0..15, b1 col gid   k16..31
 //   C (4 regs): c0/c1 row gid col tid*2/+1, c2/c3 row gid+8 same
-template<int COLS>
+// The Q40 flavor reads a block_q4_0m through the same pointer (layout contract
+// asserted at the typedef): the four header words are the repack's d[8] halves
+// instead of d/dmin/scales, nibbles unpack SIGNED (the -8 rides the fragment,
+// like the dp4a subs), and the epilogue drops the min term. Everything else --
+// staging, pipeline, mma, output -- is the q4_K code, compile-time selected.
+__device__ static uint32_t nib4f(uint32_t w, int half, int biased) {
+    return (uint32_t)(biased ? nib4s(w, half) : nib4(w, half));
+}
+template<int COLS, int Q40 = 0>
 __global__ static void __launch_bounds__(256)
 matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const float2 *xds, int k, int m,
                       int swapxy = 0) {
@@ -887,10 +939,10 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                 int8_t *sAt = sAw + t * 2 * 16 * SA_ROW;
                 uint32_t *lo = (uint32_t *)(sAt + ar * SA_ROW + hi * 16);             // half sjp*2
                 uint32_t *hh = (uint32_t *)(sAt + 16 * SA_ROW + ar * SA_ROW + hi * 16); // half sjp*2+1
-                lo[0] = (uint32_t)nib4(q4.x, 0); lo[1] = (uint32_t)nib4(q4.y, 0);
-                lo[2] = (uint32_t)nib4(q4.z, 0); lo[3] = (uint32_t)nib4(q4.w, 0);
-                hh[0] = (uint32_t)nib4(q4.x, 1); hh[1] = (uint32_t)nib4(q4.y, 1);
-                hh[2] = (uint32_t)nib4(q4.z, 1); hh[3] = (uint32_t)nib4(q4.w, 1);
+                lo[0] = nib4f(q4.x, 0, Q40); lo[1] = nib4f(q4.y, 0, Q40);
+                lo[2] = nib4f(q4.z, 0, Q40); lo[3] = nib4f(q4.w, 0, Q40);
+                hh[0] = nib4f(q4.x, 1, Q40); hh[1] = nib4f(q4.y, 1, Q40);
+                hh[2] = nib4f(q4.z, 1, Q40); hh[3] = nib4f(q4.w, 1, Q40);
             }
             if (sjp < 3) {                                         // next pair's qs go in flight across the mma phase
                 #pragma unroll
@@ -908,8 +960,14 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
             #pragma unroll
             for (int half = 0; half < 2; half++) {
                 int sj = sjp * 2 + half;
-                uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
-                float dscL = dD * sc, mnmL = dM * mm;              // my header ROW's pair
+                float dscL, mnmL = 0.0f;
+                if (Q40) {                                         // header words = the repack's d[8]
+                    uint32_t wv = sj < 2 ? dm : sj < 4 ? s0 : sj < 6 ? s1 : s2;
+                    dscL = d_fp16((uint16_t)((sj & 1) ? (wv >> 16) : wv));
+                } else {
+                    uint8_t sc, mm; d_gsm32r(sj, s0, s1, s2, &sc, &mm);
+                    dscL = dD * sc; mnmL = dM * mm;                // my header ROW's pair
+                }
                 float dsc[2][2], mnm[2][2];                        // [tile][row-half] -> the 16 rows
                 #pragma unroll
                 for (int t = 0; t < 2; t++) {
@@ -937,10 +995,17 @@ matmul_q4k_mma_kernel(float *out, const block_q4_K *w, const int8_t *xq, const f
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                             : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-                        acc[t][h][0] += xd0.x * (dsc[t][0] * (float)c0 - mnm[t][0] * xd0.y);
-                        acc[t][h][1] += xd1.x * (dsc[t][0] * (float)c1 - mnm[t][0] * xd1.y);
-                        acc[t][h][2] += xd0.x * (dsc[t][1] * (float)c2 - mnm[t][1] * xd0.y);
-                        acc[t][h][3] += xd1.x * (dsc[t][1] * (float)c3 - mnm[t][1] * xd1.y);
+                        if (Q40) {                                 // no min term; (xd.x*d)*c = the dp4a subs' order
+                            acc[t][h][0] += xd0.x * dsc[t][0] * (float)c0;
+                            acc[t][h][1] += xd1.x * dsc[t][0] * (float)c1;
+                            acc[t][h][2] += xd0.x * dsc[t][1] * (float)c2;
+                            acc[t][h][3] += xd1.x * dsc[t][1] * (float)c3;
+                        } else {
+                            acc[t][h][0] += xd0.x * (dsc[t][0] * (float)c0 - mnm[t][0] * xd0.y);
+                            acc[t][h][1] += xd1.x * (dsc[t][0] * (float)c1 - mnm[t][0] * xd1.y);
+                            acc[t][h][2] += xd0.x * (dsc[t][1] * (float)c2 - mnm[t][1] * xd0.y);
+                            acc[t][h][3] += xd1.x * (dsc[t][1] * (float)c3 - mnm[t][1] * xd1.y);
+                        }
                     }
                 }
             }
@@ -972,7 +1037,7 @@ static int mma_integrated(void) {
 // q4_K mma launcher for a compile-time COLS. Mirrors launch_q6k_mmq: 32 rows/warp,
 // shrink warps-per-CTA to keep the grid over the SMs, carve out the dynamic shared
 // past 48 KB once. The A tile is 2 tiles x 2 halves x 16 rows x SA_ROW per warp.
-template<int COLS>
+template<int COLS, int Q40 = 0>
 static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
                            int k, int m, int sms, int ncol = 1) {
     int wpc = 8;
@@ -992,7 +1057,7 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
     static int carve = 0;
     if (!carve) {
         size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
-        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
+        if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS, Q40>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
         carve = 1;
     }
     int blocks = (m + 32 * wpc - 1) / (32 * wpc);
@@ -1003,9 +1068,9 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
     static int swapxy = -2;
     if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }
     if (swapxy && ncol > 1)
-        matmul_q4k_mma_kernel<COLS><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, 1);
+        matmul_q4k_mma_kernel<COLS, Q40><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, 1);
     else
-        matmul_q4k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
+        matmul_q4k_mma_kernel<COLS, Q40><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -1231,7 +1296,7 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
 // LG_NO_MMA forces the dp4a path (debug / A-B).
 static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
-    int blck = ggml_blck_size(t->type), ts;
+    int blck = rblck(t), ts;
     const unsigned char *w = rweight(t, &ts);
     if (t->type < 40) g_cov[t->type] += (double)k * m;
 
@@ -1256,6 +1321,23 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
             float *outc = d_out + (size_t)c0 * m;
             if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
             else                     { launch_q4k_mma<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
+        }
+        return;
+    }
+
+    // q4_0 (the whole QAT E2B release): the same kernel's Q40 flavor over the
+    // repacked q4_K-shaped superblocks (rweight guaranteed k % 256 == 0).
+    if (!no_mma && t->type == GGML_TYPE_Q4_0 && PREFILL_B % 32 == 0) {
+        const block_q4_K *q4 = (const block_q4_K *)w;      // layout contract, see block_q4_0m
+        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+            launch_q4k_mma<64, 1>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+            return;
+        }
+        for (int c0 = 0; c0 < g_pf_cols; ) {
+            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+            float *outc = d_out + (size_t)c0 * m;
+            if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64, 1>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
+            else                     { launch_q4k_mma<32, 1>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
         }
         return;
     }
@@ -1288,9 +1370,9 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
         return;
     }
 
-    // Everything else — q4_0/q8_0 (the QAT E2B release is all q4_0), q3/q5_K,
-    // any untwinned f32/bf16, and the whole zoo under LG_NO_MMA — takes the
-    // dp4a chunk kernel. This MUST be an unconditional fallthrough: an early
+    // Everything else — q8_0, q3/q5_K, any untwinned f32/bf16, and the whole
+    // zoo under LG_NO_MMA — takes the dp4a chunk kernel. This MUST be an
+    // unconditional fallthrough: an early
     // version gated it behind LG_NO_MMA, and a type with no mma route above
     // launched NOTHING — stale d_out, garbage KV, and only prefill breaks, so
     // decode happily continues from trash. float s[NB] spills past ~32, so
@@ -1308,7 +1390,7 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
 // and the NB==LG_MTP_N float-aux guards above keep the float matmuls in decode order.
 static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
-    int blck = ggml_blck_size(t->type), ts;
+    int blck = rblck(t), ts;
     const unsigned char *w = rweight(t, &ts);
     int blocks = (m + 7) / 8;
     matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
