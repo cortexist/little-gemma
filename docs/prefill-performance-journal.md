@@ -1085,3 +1085,28 @@ tells the truth; this is the same lesson the Orin one-shot benches taught
 in Phase 0, now confirmed on the discrete card. The byte-wise nibble weave
 also cost 3.2s of warmup; a word-wise rewrite (two mask-and-or lines per
 16 bytes) brought it to 1.51s, gated byte-identical output.
+
+## 2026-07-02 — dictation timing, plan C: the lightest Gemma closes the loop in 0.7s
+
+Same protocol as the 12B/E4B matrix (929-token spoken instruction via
+ttft_dictate.py, client-side clocks, MTP block-3, warmup turn discarded,
+pinned clocks): QAT E2B on the Orin.
+
+| model | deferred ttft / ttfs | streamed 30 w/s ttft / ttfs | reply decode |
+|---|---:|---:|---|
+| 12B | 5.37 / 8.13 s | 0.55 / 3.31 s | 9.3 tok/s, thought + sentence |
+| E4B | 2.23 / 3.20 s | 0.26 / 1.24 s | 18.7 tok/s, no thought |
+| **E2B QAT** | **1.15 / 1.76 s** | **0.10 / 0.72 s** | **31.6 tok/s @ 39.5% acc, no thought** |
+
+Streamed dictation on the E2B: first token 0.10 s after the last spoken
+word, first speakable sentence 0.72 s — the whole 930-token prefill hides
+under the 30.6 s of speaking and what remains is one flush plus a
+19-word sentence at 31.6 tok/s. Even DEFERRED delivery is now sub-2s to a
+speakable sentence (811 tok/s turn prefill), so on this model streaming
+buys a second, not five. Burst re-measured: 1.67/2.29 s — still pays the
+small-chunk pads, plain line stays the right call for burst clients.
+Like the E4B, the E2B answers with no thought channel; its ttfs−ttft gap
+IS the sentence. Acceptance on this prose reply is 39.5% (the 256-wide
+draft head), decode still nets 31.6 tok/s. Deferred runs are
+reproducible to the millisecond (1.148/1.144 back-to-back).
+docs/dictation-timing.html now carries the E2B rows (strip chart C).

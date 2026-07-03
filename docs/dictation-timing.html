@@ -102,7 +102,7 @@
   <div class="frame">
     <div class="nameplate">
       <h1>little-gemma · dictation timing</h1>
-      <span class="sub">Orin NX · gemma-4 12B &amp; E4B, Q4_K_M · 929-token spoken instruction · MTP block-3 decode · 2026-07-02 · commit 59479be</span>
+      <span class="sub">Orin NX · gemma-4 12B &amp; E4B (Q4_K_M) &amp; E2B (QAT q4_0) · 929-token spoken instruction · MTP block-3 decode · 2026-07-02 · commit 59479be</span>
     </div>
     <p class="thesis"><b>The turn is appendable, so the prompt prefills while it is being dictated.</b>
       Confirmed transcript streams into the open turn as <b>'T'</b> commits and flushes into the kv cache
@@ -130,8 +130,8 @@
     <div class="panel">
       <div class="panel-head">
         <span class="panel-tag">C · AFTER THE LAST WORD</span>
-        <span class="panel-title">both models, both deliveries — silence until the first token, then decode to the first sentence</span>
-        <span class="panel-metric">E4B streaming: sentence at <b class="up">+1.24&thinsp;s</b></span>
+        <span class="panel-title">all three models, both deliveries — silence until the first token, then decode to the first sentence</span>
+        <span class="panel-metric">E2B streaming: sentence at <b class="up">+0.72&thinsp;s</b></span>
       </div>
       <div class="wavebox"><svg id="pC" aria-label="Post-utterance comparison, both models"></svg></div>
     </div>
@@ -267,6 +267,8 @@
     { name: '12B · STREAMING', ttft: 0.55, ttfs: 3.31, good: true, note: 'thought + sentence at 9.3 tok/s' },
     { name: 'E4B · DEFERRED',  ttft: 2.23, ttfs: 3.20, note: 'no thought — sentence at 18.7 tok/s' },
     { name: 'E4B · STREAMING', ttft: 0.26, ttfs: 1.24, good: true, note: 'no thought — sentence at 18.7 tok/s' },
+    { name: 'E2B · DEFERRED',  ttft: 1.15, ttfs: 1.76, note: 'QAT q4_0 — no thought, sentence at 31.6 tok/s' },
+    { name: 'E2B · STREAMING', ttft: 0.10, ttfs: 0.72, good: true, note: 'QAT q4_0 — no thought, sentence at 31.6 tok/s' },
   ];
 
   // ---- renderers -------------------------------------------------------------
