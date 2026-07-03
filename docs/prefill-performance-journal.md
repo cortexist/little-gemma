@@ -1215,3 +1215,71 @@ predates Napoleon as capital by centuries), where the baseline was vague
 but defensible. (2) Prompt-only is the bootstrap; the production path is
 the finetune — teach the model human pause placement (often SHORTER than
 grammatical clauses) instead of asking a 2B to also be its own editor.
+
+## 2026-07-03 — same silicon, different species: the cascade vs Moshi on the A5000
+
+Moshi (Kyutai) is the natural reference point for conversational
+latency: a full-duplex speech-to-speech foundation model, no text stage
+at all. Measured on this A5000: TTFB to first audio ~0.13 s warm
+(trials 252/129/135 ms; ~23 ms connection handshake, whether it's
+included in the TTFB clock still to be confirmed). Moshi on an Orin is
+impractical to set up, so the field was levelled the other way: the
+little-gemma voice pipeline on the A5000, all three Gemma 4 models.
+
+Protocol is the Orin dictation matrix verbatim — the 929-token spoken
+instruction, typed 'T' frames at 30 words/s, voice-sys prompt, MTP
+block-3, warmup turn discarded — with one port: Windows CPython has no
+AF_UNIX, so the client is native C (.scratch/ttfc_dictate.c), a
+byte-exact mirror of ttft_dictate.py that also clocks the FIRST CLAUSE
+(any of ,;:.!? — the unit the TTS leg consumes). TTS is piper
+en_US-kristin-medium on the host CPU (i7-8086K; the GPU belongs to the
+LLM), persistent service, first-byte clocked per clause
+(.scratch/tts_time_win.py). Medians of 3-4 runs, streamed delivery:
+
+| model | first token | first clause | + piper | last word → first audio |
+|---|---:|---:|---:|---:|
+| 12B Q4_K_M | 0.090 s | 0.241 s | 0.109 s | **0.35 s** |
+| E4B Q4_K_M | 0.065 s | 0.132 s | 0.108 s | **0.24 s** |
+| E2B QAT q4_0 | 0.121 s | 0.29 s | 0.193 s | **0.48 s** |
+
+Deferred delivery (whole line at turn end — no streaming to hide
+behind) still closes at 0.79 / 0.41 / 0.43 s respectively. Replies were
+byte-identical across deliveries per model, reconfirming the
+space-boundary exactness on a second OS and a second client
+implementation. Server crosschecks all on spec: deferred prefill ~6,970
+/ 3,650 / 1,743 tok/s (E2B/E4B/12B), decode with MTP 145 / 118 / 69
+tok/s at 22.5 / 39.3 / 52.4% acceptance.
+
+Three readings. (1) Moshi is 2-4x ahead, and the gap is structural, not
+an engineering deficit: a speech-native model starts vocoding without
+waiting for a speakable text unit, while the cascade's floor is one
+decoded clause plus one VITS call (~0.2 s at these rates). (2) In
+exchange, the cascade stays inside the human turn-gap band (~0.2-0.5 s)
+with a general-purpose text LLM underneath — tools, reading, 12B-class
+answers vs Moshi's ~7B speech backbone — and swappable voices. (3) On
+the A5000, model size has almost stopped mattering: 2B to 12B spans
+first-clause 0.13-0.29 s, and the E2B is the SLOWEST end-to-end because
+its clause says "in 1806." — which verbalizes to 3.9 s of audio and
+0.19 s of synthesis. Once streaming hides prefill, content dominates
+silicon. Corollary: the whole datacenter card + desktop CPU buys only
+~1.7x over the 20W Jetson (0.48 vs 0.82 s on the same E2B) — in the
+conversational regime the pipeline is floor-bound, not compute-bound.
+
+One small inversion tells on desktop DVFS: E2B deferred first-clause
+(0.232 s) beats paced (0.29 s). Its prefill is so fast (929 tokens in
+0.13 s) that streaming hides nothing, while the 30 s paced send window
+lets the unlocked GPU park at 210 MHz idle clocks and the reply pays
+the ramp. The Orin never shows this — jetson_clocks pins it.
+
+Pitfalls, both with teeth. (1) The first 12B pass read 3.9 s ttft —
+uniformly 7.5x slow (prefill, decode, MTP verify alike) with SM 100%,
+clocks a healthy 1920 MHz, and the memory controller near 0%. Cause:
+`pkill` doesn't exist in Git Bash (masked by 2>/dev/null), three
+servers stacked to 24.2/24.5 GB, and Windows WDDM PAGES oversubscribed
+cudaMalloc memory per-launch instead of failing loudly. That counter
+signature (SM pegged, DRAM idle) is the tell; `taskkill //F //IM` and a
+memory.used check between servers is the rule. (2) Python's
+BufferedReader.read(n) on a pipe blocks for the FULL n bytes — a
+clause of PCM (~44 KB) sat invisible behind a 64 KB read while the
+clock ran; os.read has available-bytes semantics. Both fixed before any
+number above was recorded.
