@@ -157,10 +157,19 @@ join it later without breaking anything:
   side is deliberate too: the server does not neutralize tags, so sanitizing
   untrusted text belongs upstream, exactly where TLS and auth already live.
 - stdout/stderr are logging only; per-turn stats go to stderr.
+- Decoding is greedy by default — the byte-identity property every gate in
+  this repo leans on. `-temp T` samples instead: temperature over the top-k,
+  truncated at top-p, with `-topk`/`-topp` defaulting to the model's own
+  recommendation shipped in the gguf (`general.sampling.*` — Gemma 4 says
+  top-k 64, top-p 0.95) and `-seed N` for reproducible runs (the chosen seed
+  prints to stderr either way). Under MTP the verify samples the target's
+  distribution at each position and accepts a draft only when the sample
+  agrees, so speculation still changes only tokens/s, never the distribution
+  (acceptance drops accordingly; greedy remains the benchmarked config).
 - A turn is capped at 1,024 output tokens (`SERVE_GEN`): greedy decoding has
-  no sampler and no repetition penalty, so a degenerate loop would otherwise
-  spin until the context filled (observed: 8,098 tokens of the same sentence).
-  A capped turn ends with a visible `[SERVE_GEN cap]<turn|>`.
+  no repetition penalty, so a degenerate loop would otherwise spin until the
+  context filled (observed: 8,098 tokens of the same sentence). A capped turn
+  ends with a visible `[SERVE_GEN cap]<turn|>`.
 - A clean half-close (e.g. `nc -N` after stdin EOF) still receives the full turn
   in flight; only a hard reset aborts generation early — checked between
   tokens, so one ~5–17 ms forward is the most work a dead client can waste.

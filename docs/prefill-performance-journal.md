@@ -1431,3 +1431,42 @@ model, and does not transfer to the QAT release.
 
 Harness preserved: .scratch/bench-serve-orin.sh (the PS1 bench's bash
 twin — one connection per turn, first discarded).
+
+## 2026-07-04 — a little temperature: sampling lands without breaking a single gate
+
+Greedy-only was a design pillar (byte-identity, MTP verify equality, the
+acceptance tripwires), so sampling enters through the narrowest possible
+door: a `model_pick` hook in model.h. NULL — the default — leaves every
+backend's device-argmax path untouched, bit for bit; `-temp` installs a
+host sampler (temperature over top-k, truncated at top-p) and each
+backend calls it on the softcapped logits row instead of the argmax —
+plain decode and the MTP verify alike, no call-site changes anywhere.
+
+The MTP composition is the part worth writing down: the verify samples
+the TARGET's own distribution at every block position, and a draft is
+accepted only when the sample agrees. The emitted tokens are exactly
+target samples — speculation still changes only tokens/s, never the
+distribution, no rejection-sampling correction needed. Acceptance drops
+as the price (E2B planets: 76.6% greedy → 28–46% at temp 1.0) but the
+batching stays net-positive. Drafts remain greedy — they only gate
+batching; the pick is what lands.
+
+Defaults come from the model itself: Gemma 4 ggufs ship
+`general.sampling.*` (top-k 64, top-p 0.95), read as the `-topk`/`-topp`
+fallbacks. `-seed` fixes the run (same backend ⇒ byte-reproducible,
+verified); without it a time-derived seed prints to stderr. Cross-backend
+identity remains a greedy-only property — a boundary case in the
+cumulative distribution can flip on ~1e-6 logit differences.
+
+Gates, all green: default greedy byte-identical to the pre-change binary
+with the 76.6% acceptance tripwire unchanged; seed-42 runs identical
+twice; different seeds diverge into distinct coherent replies; CPU and
+f32 backends compile with the hook; serve mode samples end-to-end.
+
+One build trap for the record: installing CUDA 13.1/13.3 deleted the
+CUDA_PATH_V13_0 env var and repointed CUDA_PATH, so the VS2019-generated
+project (pinned to 13.0 targets) failed with an empty toolkit dir — and
+half-fixing it (V13_0 only) mixes 13.3 headers with 13.0 cudart
+(LNK2019: cudaGetDeviceProperties_v2). Export BOTH to v13.0 to build.
+Also caught: yesterday's "rebuild" was an MSBuild no-op (binary mtime
+unmoved) — check the timestamp, not the success banner.

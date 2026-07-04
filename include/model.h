@@ -102,6 +102,14 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
 // 4 bytes cross the bus per token instead of the whole vocabulary's logits.
 int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos);
 
+// Optional pick hook (-temp): when set, every backend picks generated tokens by
+// calling it on the softcapped logits row instead of taking the argmax — plain
+// decode and the MTP verify alike (the draft head still drafts greedily; drafts
+// only gate batching, the pick is what lands). NULL, the default, is greedy and
+// byte-identical. On the GPU backends a set hook costs one n_vocab logits copy
+// per generated token.
+extern int (*model_pick)(const float *logits, int n);
+
 // The forward for prompt tokens whose outputs nobody reads: fills the kv cache
 // for tokens[0..n) at positions pos0..pos0+n-1 and skips the head — the final
 // norm, the n_vocab×n_embd output projection (~10% of a token's weight

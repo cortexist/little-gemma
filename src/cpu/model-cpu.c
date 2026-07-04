@@ -473,6 +473,7 @@ int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) 
         if (!lbuf) return -1;
     }
     model_forward(m, kv, token, pos, lbuf);
+    if (model_pick) return model_pick(lbuf, m->cfg.n_vocab);
     int best = 0;
     for (int v = 1; v < m->cfg.n_vocab; v++) if (lbuf[v] > lbuf[best]) best = v;
     return best;

@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <math.h>
 #include <time.h>
 #include <sys/stat.h>
 
@@ -67,6 +69,53 @@ static int mtp_step(struct mtp *t, struct model *m, struct kvcache *kv, int best
     return adv;
 }
 
+// ---- sampling (-temp) --------------------------------------------------------
+// Greedy is the default and stays byte-identical: model_pick is NULL and every
+// backend keeps its argmax path. With -temp the hook below samples instead —
+// temperature over the top-k (default: the model's own recommendation from the
+// gguf's general.sampling.* keys), truncated at top-p. Under MTP the verify
+// samples the target's distribution at every position and accepts a draft only
+// when the sample agrees, so speculation still changes only tokens/s, never the
+// distribution. A fixed -seed makes a sampled run reproducible on one backend
+// (tiny cross-backend logit differences can move a cumulative-probability
+// boundary, so cross-backend identity is a greedy-only property).
+int (*model_pick)(const float *logits, int n) = NULL;
+
+#define TOPK_CAP 256
+static struct { float temp, topp; int topk; uint64_t rng; } g_smp;
+
+static double rng_uniform(void) {                      // xorshift64*, in [0,1)
+    g_smp.rng ^= g_smp.rng >> 12;
+    g_smp.rng ^= g_smp.rng << 25;
+    g_smp.rng ^= g_smp.rng >> 27;
+    return (double)((g_smp.rng * 2685821657736338717ULL) >> 11) / 9007199254740992.0;
+}
+
+static int pick_sampled(const float *logits, int n) {
+    float v[TOPK_CAP];
+    int   id[TOPK_CAP];
+    int k = g_smp.topk < 1 ? 1 : (g_smp.topk > TOPK_CAP ? TOPK_CAP : g_smp.topk);
+    int filled = 0;
+    for (int i = 0; i < n; i++) {                      // one pass, k-array kept sorted
+        if (filled == k && logits[i] <= v[filled - 1]) continue;
+        int j = filled < k ? filled : k - 1;
+        while (j > 0 && logits[i] > v[j - 1]) { v[j] = v[j - 1]; id[j] = id[j - 1]; j--; }
+        v[j] = logits[i]; id[j] = i;
+        if (filled < k) filled++;
+    }
+    double p[TOPK_CAP], sum = 0.0;
+    for (int j = 0; j < filled; j++) sum += p[j] = exp((v[j] - v[0]) / g_smp.temp);
+    int last = filled;                                 // top-p: keep the smallest prefix >= topp
+    double cum = 0.0;
+    for (int j = 0; j < filled; j++) {
+        cum += p[j] / sum;
+        if (cum >= g_smp.topp) { last = j + 1; break; }
+    }
+    double r = rng_uniform() * cum * sum;
+    for (int j = 0; j < last; j++) { r -= p[j]; if (r <= 0.0) return id[j]; }
+    return id[last - 1];
+}
+
 // Print a token's text with the ▁ marker (U+2581 = e2 96 81) rendered as a space.
 static void print_piece(const char *s) {
     if (!s) return;
@@ -92,10 +141,11 @@ static void print_piece(const char *s) {
 #define SERVE_TEXT_FLUSH 256   // accumulated 'T' text (chars) that triggers an
                                // incremental prefill of the open turn — long
                                // dictation prefills while the user speaks
-#define SERVE_GEN 1024   // output cap per turn: greedy decode has no sampler and
-                         // no repeat penalty, so a degenerate loop would otherwise
-                         // spin until the context fills (observed: 8,098 tokens,
-                         // 270 s, of the same sentence about a typo)
+#define SERVE_GEN 1024   // output cap per turn: there is no repeat penalty, so a
+                         // degenerate greedy loop would otherwise spin until the
+                         // context fills (observed: 8,098 tokens, 270 s, of the
+                         // same sentence about a typo); -temp mostly defuses these
+
 
 static int send_all(sock_t s, const char *buf, int n) {
     while (n > 0) {
@@ -663,6 +713,9 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
 
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt = NULL, *spath = NULL, *cpath = NULL, *mmproj = NULL, *mtp = NULL, *syspath = NULL;
+    float temp = 0.0f, topp = -1.0f;
+    int topk = -1;
+    uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
@@ -671,16 +724,34 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
         else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
         else if (!strcmp(argv[i], "-sys") && i + 1 < argc) syspath = argv[++i];
+        else if (!strcmp(argv[i], "-temp") && i + 1 < argc) temp = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-topk") && i + 1 < argc) topk = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-topp") && i + 1 < argc) topp = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
     }
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
-        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-sys <skills.txt>] [-p \"prompt\" | -s <socket>]\n"
+        printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-sys <skills.txt>]\n"
+               "          [-temp T [-topk K] [-topp P] [-seed N]] [-p \"prompt\" | -s <socket>]\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
 
     struct gguf_context *ctx = load_gguf(model);
     if (!ctx) return 1;
+
+    if (temp > 0.0f) {
+        // -topk/-topp default to the model's own recommendation, shipped in the
+        // gguf (general.sampling.*); Gemma 4's is top-k 64, top-p 0.95.
+        g_smp.temp = temp;
+        g_smp.topk = topk > 0 ? topk : gguf_get_i32(ctx, "general.sampling.top_k", 64);
+        g_smp.topp = topp > 0.0f ? topp : gguf_get_f32(ctx, "general.sampling.top_p", 0.95f);
+        if (!seed) { seed = (uint64_t)time(NULL) * 2654435761ULL ^ 0x9E3779B97F4A7C15ULL; }
+        g_smp.rng = seed ? seed : 1;
+        model_pick = pick_sampled;
+        fprintf(stderr, "sampling: temp %.2f, top-k %d, top-p %.2f, seed %llu\n",
+                g_smp.temp, g_smp.topk, g_smp.topp, (unsigned long long)seed);
+    }
 
     gguf_dump(ctx);
 

@@ -556,8 +556,12 @@ axis — and why a 6,000-line runner can hold the design point at all.
   confabulation; 12B vision-disables-hearing exclusion) — findings we
   report [TODO: decide whether the A/V exclusion becomes its own §
   or stays a finding table] but that make the whisper lane load-bearing.
-- Greedy decoding throughout (byte-identity discipline requires it);
-  sampling interacts with MTP acceptance and is unexplored here.
+- All benchmarks use greedy decoding (the byte-identity discipline
+  requires it). Sampling exists and composes with MTP distribution-exactly
+  — the verify samples the target's distribution and accepts a draft only
+  on agreement, so speculation never alters the output distribution —
+  but acceptance drops (76.6% → 28–46% at temperature 1.0 on the 2B) and
+  sampled-mode latency/quality is not separately characterized here.
 - Single-user, single-stream serving; no batching story.
 - 8 GB verdict extrapolated from the NX 16GB (§5.6).
 

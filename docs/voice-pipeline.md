@@ -56,6 +56,9 @@ Variants:
 
 - **Model tier**: swap `-m`/`-mtp` for the E4B or 12B pair — nothing else
   changes.
+- **Variety**: add `-temp 1` to the server for sampled replies (top-k/top-p
+  default to the model's own recommendation in the gguf; `-seed N` makes a
+  run reproducible). All published numbers are greedy — the default.
 - **Camera**: add `-mm <mmproj>` to the server and feed frames as `'I'`
   frames (see README serve protocol). Note the measured A/V exclusion:
   with vision in context the 12B stops hearing native audio — speech

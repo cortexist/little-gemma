@@ -1851,8 +1851,28 @@ extern "C" void model_forward(struct model *m, struct kvcache *kv, int token, in
     CUDA_CHECK(cudaMemcpy(logits, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
 }
 
+// Host-side logits staging for the model_pick hook (-temp): one n_vocab row for
+// decode, LG_MTP_N rows for the verify. Only allocated once a hook is set — the
+// greedy default never copies logits off the device.
+static float *pick_rows(size_t n) {
+    static float *buf = NULL;
+    static size_t cap = 0;
+    if (n > cap) {
+        free(buf);
+        buf = (float *)malloc(n * 4);
+        if (!buf) { fprintf(stderr, "pick_rows: out of memory\n"); exit(1); }
+        cap = n;
+    }
+    return buf;
+}
+
 extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) {
     forward_token(m, kv, token, pos, 1);
+    if (model_pick) {
+        float *row = pick_rows(m->cfg.n_vocab);
+        CUDA_CHECK(cudaMemcpy(row, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
+        return model_pick(row, m->cfg.n_vocab);
+    }
     argmax_kernel<<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
     int best;
     CUDA_CHECK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
@@ -2144,7 +2164,16 @@ extern "C" int model_forward_spec(struct model *m, struct kvcache *kv, const int
     if (prof < 0) prof = getenv("LG_MTP_PROFILE") != NULL;
     if (prof) verify_profiled(m, kv, has_ple);
     else      verify_graph_spec(m, kv, has_ple);
-    CUDA_CHECK(cudaMemcpy(out, d_best_spec, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost));
+    if (model_pick) {
+        // Sample the target's own distribution at every row; a draft is accepted
+        // only when the sample agrees, so the emitted tokens are exactly target
+        // samples — speculation changes speed, never the distribution. (The
+        // captured graph's argmaxes still run; their result just isn't read.)
+        float *rows_h = pick_rows((size_t)N * c->n_vocab);
+        CUDA_CHECK(cudaMemcpy(rows_h, d_logits_spec, (size_t)N * c->n_vocab * 4, cudaMemcpyDeviceToHost));
+        for (int j = 0; j < N; j++) out[j] = model_pick(rows_h + (size_t)j * c->n_vocab, c->n_vocab);
+    } else
+        CUDA_CHECK(cudaMemcpy(out, d_best_spec, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost));
 
     // accept run: out[0] always valid; out[j] valid iff every earlier draft held.
     int adv = 1;
