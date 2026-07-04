@@ -16,19 +16,19 @@
   <!-- tier rows: lollipops -->
   <g font-size="12" fill="#1f2328">
     <text x="52" y="79" text-anchor="end" font-weight="bold">12B</text>
-    <line x1="60" y1="75" x2="654" y2="75" stroke="#8a9099" stroke-width="2"/>
-    <circle cx="654" cy="75" r="6" fill="#8a9099"/>
-    <text x="642" y="70" font-size="11" text-anchor="end" fill="#555b61">≈3.6 s (est.) — the strongest answers</text>
+    <line x1="60" y1="75" x2="621" y2="75" stroke="#8a9099" stroke-width="2"/>
+    <circle cx="621" cy="75" r="6" fill="#8a9099"/>
+    <text x="609" y="70" font-size="11" text-anchor="end" fill="#555b61">≈3.4 s (est.) — the strongest answers</text>
 
     <text x="52" y="114" text-anchor="end" font-weight="bold">E4B</text>
-    <line x1="60" y1="110" x2="307.5" y2="110" stroke="#8a9099" stroke-width="2"/>
-    <circle cx="307.5" cy="110" r="6" fill="#8a9099"/>
-    <text x="322" y="114" font-size="11" fill="#555b61">≈1.5 s (est.) — at the industry median</text>
+    <line x1="60" y1="110" x2="282.8" y2="110" stroke="#8a9099" stroke-width="2"/>
+    <circle cx="282.8" cy="110" r="6" fill="#8a9099"/>
+    <text x="297" y="114" font-size="11" fill="#555b61">≈1.35 s (est.) — just under the industry median</text>
 
     <text x="52" y="149" text-anchor="end" font-weight="bold">E2B</text>
-    <line x1="60" y1="145" x2="195.3" y2="145" stroke="#3e6fbf" stroke-width="3"/>
-    <circle cx="195.3" cy="145" r="7" fill="#3e6fbf"/>
-    <text x="210" y="149" font-size="11" font-weight="bold" fill="#3e6fbf">0.82 s measured — inside the natural window</text>
+    <line x1="60" y1="145" x2="167.3" y2="145" stroke="#3e6fbf" stroke-width="3"/>
+    <circle cx="167.3" cy="145" r="7" fill="#3e6fbf"/>
+    <text x="182" y="149" font-size="11" font-weight="bold" fill="#3e6fbf">0.65 s — well inside the natural window</text>
   </g>
 
   <!-- axis -->
@@ -44,6 +44,6 @@
   </g>
   <text x="380" y="185" font-size="10" fill="#555b61" text-anchor="middle" opacity="0">.</text>
 
-  <text x="380" y="215" font-size="12" fill="#1f2328" text-anchor="middle">Time from end of speech to first audio, Jetson Orin NX 16GB. E2B QAT measured end-to-end;</text>
-  <text x="380" y="229" font-size="12" fill="#1f2328" text-anchor="middle">E4B/12B estimated as measured TTFS + first-clause synthesis. Bands: production telemetry (hamming.ai).</text>
+  <text x="380" y="215" font-size="12" fill="#1f2328" text-anchor="middle">Time from end of speech to first audio, Jetson Orin NX 16GB, streaming vocoder (§4.4). E2B composed from measured legs;</text>
+  <text x="380" y="229" font-size="12" fill="#1f2328" text-anchor="middle">E4B/12B estimated as measured TTFS + streaming-TTS first PCM. Bands: production telemetry (hamming.ai).</text>
 </svg>

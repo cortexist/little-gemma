@@ -1,7 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 265" font-family="Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" font-family="Helvetica, Arial, sans-serif">
   <!-- Figure 2: anatomy of first audio. E2B QAT, Orin NX, streamed dictation.
-       x(t) = 60 + t*500 px (axis 0..1.3 s). -->
-  <rect width="760" height="265" fill="#ffffff"/>
+       x(t) = 60 + t*500 px (axis 0..1.3 s). Three configurations:
+       baseline prompt, voice-sys prompt, voice-sys + streaming vocoder. -->
+  <rect width="760" height="350" fill="#ffffff"/>
 
   <!-- legend -->
   <g font-size="11" fill="#1f2328">
@@ -10,7 +11,7 @@
     <rect x="170" y="24" width="14" height="12" fill="#d8e2f4" stroke="#3e6fbf"/>
     <text x="190" y="34">decode of the first speakable unit</text>
     <rect x="392" y="24" width="14" height="12" fill="url(#hatch2)" stroke="#5a5f66"/>
-    <text x="412" y="34">TTS synthesis (VITS — ~linear in audio length)</text>
+    <text x="412" y="34">TTS synthesis before first PCM</text>
   </g>
 
   <!-- row 1: baseline -->
@@ -25,29 +26,41 @@
 
   <!-- row 2: voice-sys -->
   <text x="60" y="142" font-size="12" font-weight="bold" fill="#1f2328">voice-sys prompt — the LLM creates the flush points</text>
-  <text x="720" y="142" font-size="12" font-weight="bold" fill="#3e6fbf" text-anchor="end">first audio · 0.82 s</text>
+  <text x="720" y="142" font-size="12" font-weight="bold" fill="#1f2328" text-anchor="end">first audio · 0.82 s</text>
   <rect x="60" y="150" width="50.5" height="30" fill="#eceef0" stroke="#c9cdd2"/>
   <rect x="110.5" y="150" width="224" height="30" fill="#d8e2f4" stroke="#3e6fbf"/>
   <text x="222" y="169" font-size="11" fill="#1f2328" text-anchor="middle">decode 8-word clause · 0.55 s</text>
   <rect x="334.5" y="150" width="135" height="30" fill="url(#hatch2)" stroke="#5a5f66"/>
   <text x="402" y="169" font-size="11" fill="#1f2328" text-anchor="middle">piper 0.27 s</text>
-  <line x1="470" y1="144" x2="470" y2="186" stroke="#3e6fbf" stroke-width="2.5"/>
-  <text x="478" y="176" font-size="11" fill="#3e6fbf">speech begins 0.39 s earlier</text>
+  <line x1="470" y1="144" x2="470" y2="186" stroke="#1f2328" stroke-width="2.5"/>
+
+  <!-- row 3: voice-sys + streaming vocoder -->
+  <text x="60" y="222" font-size="12" font-weight="bold" fill="#1f2328">voice-sys + streaming vocoder (§4.4) — first PCM decoupled from clause length</text>
+  <text x="720" y="222" font-size="12" font-weight="bold" fill="#3e6fbf" text-anchor="end">first audio · 0.65 s</text>
+  <rect x="60" y="230" width="50.5" height="30" fill="#eceef0" stroke="#c9cdd2"/>
+  <rect x="110.5" y="230" width="224" height="30" fill="#d8e2f4" stroke="#3e6fbf"/>
+  <text x="222" y="249" font-size="11" fill="#1f2328" text-anchor="middle">decode 8-word clause · 0.55 s</text>
+  <rect x="334.5" y="230" width="50" height="30" fill="url(#hatch2)" stroke="#5a5f66"/>
+  <line x1="385" y1="224" x2="385" y2="266" stroke="#3e6fbf" stroke-width="2.5"/>
+  <rect x="387" y="230" width="185" height="30" fill="none" stroke="#9aa0a6" stroke-dasharray="4 3"/>
+  <text x="480" y="249" font-size="11" fill="#555b61" text-anchor="middle">synthesis continues under playback</text>
+  <text x="359" y="277" font-size="11" fill="#1f2328" text-anchor="middle">first PCM 0.10 s</text>
 
   <!-- axis -->
-  <line x1="60" y1="205" x2="720" y2="205" stroke="#555b61" stroke-width="1"/>
+  <line x1="60" y1="290" x2="720" y2="290" stroke="#555b61" stroke-width="1"/>
   <g stroke="#555b61" stroke-width="1">
-    <line x1="60" y1="205" x2="60" y2="210"/><line x1="185" y1="205" x2="185" y2="210"/>
-    <line x1="310" y1="205" x2="310" y2="210"/><line x1="435" y1="205" x2="435" y2="210"/>
-    <line x1="560" y1="205" x2="560" y2="210"/><line x1="685" y1="205" x2="685" y2="210"/>
+    <line x1="60" y1="290" x2="60" y2="295"/><line x1="185" y1="290" x2="185" y2="295"/>
+    <line x1="310" y1="290" x2="310" y2="295"/><line x1="435" y1="290" x2="435" y2="295"/>
+    <line x1="560" y1="290" x2="560" y2="295"/><line x1="685" y1="290" x2="685" y2="295"/>
   </g>
   <g font-size="10" fill="#555b61" text-anchor="middle">
-    <text x="60" y="223">0</text><text x="185" y="223">0.25</text><text x="310" y="223">0.5</text>
-    <text x="435" y="223">0.75</text><text x="560" y="223">1.0</text><text x="685" y="223">1.25 s</text>
+    <text x="60" y="308">0</text><text x="185" y="308">0.25</text><text x="310" y="308">0.5</text>
+    <text x="435" y="308">0.75</text><text x="560" y="308">1.0</text><text x="685" y="308">1.25 s</text>
   </g>
-  <text x="56" y="196" font-size="10" fill="#555b61" text-anchor="end">last word</text>
+  <text x="56" y="281" font-size="10" fill="#555b61" text-anchor="end">last word</text>
 
-  <text x="380" y="250" font-size="12" fill="#1f2328" text-anchor="middle">E2B QAT on Orin NX, streamed dictation. Shorter first units pay twice: earlier text AND faster synthesis.</text>
+  <text x="380" y="332" font-size="12" fill="#1f2328" text-anchor="middle">E2B QAT on Orin NX, streamed dictation; measured legs, composed identically across rows.</text>
+  <text x="380" y="346" font-size="12" fill="#1f2328" text-anchor="middle">The ablation ladder: 1.21 → 0.82 (prompt) → 0.65 s (+streaming vocoder).</text>
 
   <defs>
     <pattern id="hatch2" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">

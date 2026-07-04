@@ -1348,3 +1348,49 @@ currently equals whole-clause synthesis because VITS decodes the whole
 utterance in one ONNX call. A chunked vocoder decode would put first PCM
 at tens of milliseconds on the same CPU — the Moshi lesson (Mimi streams
 by construction) applied to the cascade's mouth.
+
+## 2026-07-03 — the streaming vocoder ships: first PCM is O(1), loop 0.82 → 0.65 s
+
+Same day, lever pulled. VITS's two halves have opposite constraints: the
+text encoder + duration + flow need the WHOLE clause (prosody is
+global), but they're cheap; the HiFi-GAN upsampler is most of the
+compute and is a pure convnet — finite receptive field, no attention, no
+recurrence — so it can decode in overlapped chunks whose interiors are
+exact. piper's published ONNX is monolithic, but the graph names its
+decoder (`/dec/…`), and exactly ONE tensor crosses into it (z·mask
+feeding dec.conv_pre). `.scratch/vits_split.py` finds that boundary
+automatically and extracts enc/dec halves from any stock piper voice —
+no retraining, no re-export; verified on kristin-medium and the ozgirl
+finetune (same boundary, both).
+
+Chunked decode (`.scratch/piper_stream.py`, drop-in for
+`piper --output-raw`): overlap R=16 frames saturates exactness — max
+sample diff 4e-07 vs the monolithic decode, pure fp32 noise, both
+machines both voices. First chunk K=10 frames = 0.12 s of audio.
+
+End-to-end through the service on the Orin (ozgirl, includes espeak +
+enc + chunk decode + pipe; `.scratch/tts_stream_time.py`):
+
+| clause | stock piper first byte | streaming | audio |
+|---|---:|---:|---:|
+| 8-word voice-sys clause | ~0.27 s | **0.10 s** | 4.8 s |
+| 21-word baseline sentence | 0.49 s | **0.15 s** | 9.1 s |
+
+First byte no longer scales with clause length (enc's linear term is
+tiny); synthesis stays 6–13× realtime despite the overlap redundancy
+(the CPU cores were idle anyway). A5000 bench: 0.036–0.065 s first byte,
+2.5–5× over baseline, same exactness.
+
+**Voice loop arithmetic (E2B QAT, Orin, streamed dictation):** last word
+→ first clause 0.549 s + streaming TTS 0.10 s ≈ **0.65 s first audio**
+(was 0.82; composed from same-box measured legs, the same method as the
+0.82). The ablation ladder now reads: baseline 1.21 → voice-sys 0.82 →
++streaming vocoder 0.65. Even WITHOUT the voice-sys prompt the loop
+would hit 0.714 + 0.15 ≈ 0.87 s — the vocoder alone nearly matches what
+prompt engineering bought, and they compose.
+
+One design note: streamed chunks can't be peak-normalized (that needs
+the whole clause); the service ships VITS's native level with a fixed
+gain. And one measurement note: the in-process bench understated first
+byte by the espeak phonemization cost — the service-level number (0.10)
+is the honest one; always clock through the pipe.

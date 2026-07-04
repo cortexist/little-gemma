@@ -32,19 +32,24 @@ edge board, using unmodified state-of-the-art open-weight models.
 
 Our pipeline — streaming ASR (whisper.cpp), a Gemma 4 model (2B–12B) on a
 purpose-built ~6,000-line C/CUDA runner, and a VITS TTS (piper) — reaches
-**0.82 s from end of speech to first audio** on a Jetson Orin NX 16GB
+**0.65 s from end of speech to first audio** on a Jetson Orin NX 16GB
 responding to a 30-second spoken instruction, with the entire stack holding
 **4.2 GB of unreclaimable memory** (it fits an 8 GB Jetson Nano) and peaking
-near 20 W. Three techniques carry the result, none of which modify the model:
-(1) *prefill under speech* — streaming ASR commits prefill into the open turn
-while the user is still speaking, backed by a proof that space-boundary
-splits are exact for SentencePiece, cutting post-speech TTFT from 5.37 s to
-0.55 s on the 12B; (2) *the LLM as clause splitter* — a system prompt that
-makes the model create TTS flush points, motivated by the measured finding
-that the baseline model emits 21-word sentences with zero commas, leaving a
-clause-flushing TTS layer nothing to flush; (3) *multi-token-prediction
-speculative decoding* characterized honestly as content-dependent
-(1.1–2.1×) and as a battery feature (2.29 vs 2.85 J/token). A cross-silicon
+near 20 W. Four techniques carry the result, none of which modify the
+models: (1) *prefill under speech* — streaming ASR commits prefill into the
+open turn while the user is still speaking, backed by a proof that
+space-boundary splits are exact for SentencePiece, cutting post-speech TTFT
+from 5.37 s to 0.55 s on the 12B; (2) *the LLM as clause splitter* — a
+system prompt that makes the model create TTS flush points, motivated by
+the measured finding that the baseline model emits 21-word sentences with
+zero commas, leaving a clause-flushing TTS layer nothing to flush; (3) *a
+streaming vocoder from stock TTS voices* — ONNX graph surgery splits
+piper's monolithic VITS at the latent boundary so the HiFi-GAN decoder
+(finite receptive field) runs in overlapped chunks, making first PCM O(1)
+in clause length (0.10 s vs 0.27–0.49 s), sample-exact against the
+monolithic decode; (4) *multi-token-prediction speculative decoding*
+characterized honestly as content-dependent (1.1–2.1×) and as a battery
+feature (2.29 vs 2.85 J/token). A cross-silicon
 study against Moshi on an RTX A5000 finds the remaining gap to
 speech-native models is structural (one decoded clause + one vocoder call,
 ~0.2 s) — and that the datacenter GPU buys only 1.7× over the 20 W board,
@@ -98,18 +103,26 @@ Contributions:
    prompt creates the flush points and cuts first audio from 1.21 s to
    0.82 s; finetuning for human pause placement is the identified production
    path.
-3. **A latency-anatomy protocol for local voice agents** (§4.1): the
+3. **A streaming vocoder from stock voices** (§4.4): the published piper
+   ONNX is monolithic, but exactly one tensor crosses into its HiFi-GAN
+   decoder; automatic graph surgery splits any stock voice there — no
+   retraining — and the decoder's finite receptive field makes
+   overlapped-chunk decode sample-exact (max diff 4e-7, two voices, two
+   machines). First PCM becomes O(1) in clause length: 0.10 s on the Orin
+   where the monolithic call took 0.27–0.49 s. The full ablation ladder:
+   first audio 1.21 → 0.82 (clause prompt) → 0.65 s (+streaming vocoder).
+4. **A latency-anatomy protocol for local voice agents** (§4.1): the
    decomposition TTFT → time-to-first-speakable → TTFB, measured client-side
    under three delivery modes (deferred / burst / paced-realtime), with
    warmup-discard and byte-identity discipline. TTFT alone is shown to be
    uninformative for the spoken experience.
-4. **The whole-system result** (§5): 0.82 s TTFB on 20 W; three latency/
+5. **The whole-system result** (§5): 0.65 s TTFB on 20 W; three latency/
    intelligence tiers from one runner (12B / E4B / E2B); 4.2 GB unreclaimable
    for ears+brain+mouth (8 GB-board feasible, with the measurement
    methodology that makes that number honest on Jetson); a decode rate that
    *beats* llama.cpp on the same board (1.17–1.26×) from ~6,000 lines of
    C/CUDA.
-5. **A cross-silicon study** (§5.8) against Moshi on its own class of
+6. **A cross-silicon study** (§5.8) against Moshi on its own class of
    hardware, locating the cascade's structural floor (one clause of decode +
    one VITS call) and showing the conversational regime is floor-bound: a
    datacenter GPU + desktop CPU improves end-to-end latency only 1.7× over
@@ -163,7 +176,7 @@ prior art we consume, not a contribution.
 **Speculative decoding.** EAGLE, Medusa, self-speculation [TODO cite]. Gemma
 4 ships a first-party MTP head; our contribution is not the mechanism but
 the honest characterization (content- and head-width-dependence) and the
-energy angle (§4.4), which the edge literature largely lacks.
+energy angle (§4.5), which the edge literature largely lacks.
 
 ## 3. System
 
@@ -199,7 +212,9 @@ Three processes, one GPU owner:
   overhead swamps ~20 MB of conv math) and only reaches 1.6× on long
   sentences; clause splitting (§4.3) moves TTS precisely into the regime
   where CPU wins, and on the Orin the iGPU would contend with decode for
-  the same LPDDR5 anyway.
+  the same LPDDR5 anyway. §4.4 removes the whole-clause wait itself: the
+  same voice files, split at the latent boundary, stream first PCM in
+  0.10 s.
 
 **Why external ASR when Gemma 4 is natively multimodal?** Because we
 measured the native path and it fails three ways (§7 for details): the
@@ -299,7 +314,39 @@ date; the vague baseline was defensible), and prompt-only is the bootstrap
 — the production path is a light finetune for *human* pause placement,
 which is often shorter than grammatical clauses.
 
-### 4.4 Speculative decoding as a latency and battery feature
+### 4.4 A streaming vocoder from stock voices
+
+After §4.2 and §4.3, the TTS call itself is 30–50% of what remains: VITS
+synthesizes a whole clause in one ONNX call, so first PCM waits for all
+of it. The fix exploits an asymmetry inside the model. The text encoder,
+duration predictor, and flow must see the whole clause — prosody is
+global — but they are cheap; the HiFi-GAN upsampler is most of the
+compute and is a pure convnet: finite receptive field, no attention, no
+recurrence. Anything with a finite receptive field can be decoded in
+overlapped chunks whose interiors are exact.
+
+piper ships monolithic ONNX files, but the graph names its decoder, and
+exactly one tensor crosses into it (the masked latent feeding the
+decoder's input conv). Our splitter finds that boundary automatically
+and extracts encoder/decoder halves from any stock voice file — no
+retraining, no re-export; verified identical on an official voice and on
+our own finetune. At overlap R=16 frames the chunked decode saturates at
+max sample difference 4e-7 vs the monolithic output (fp32 noise), on
+both test machines. The streaming service (a drop-in for
+`piper --output-raw`) then emits 0.12 s chunks as they decode.
+
+End-to-end on the Orin, everything included (phonemization, encoder,
+first chunk, pipe): **first PCM 0.10 s** where the monolithic call took
+0.27 s (voice-sys clause) — and 0.15 s even for a 21-word sentence whose
+monolithic call took 0.49 s. First byte is now O(1) in clause length;
+synthesis continues at 6–13× realtime under playback. The techniques
+compose: first audio 1.21 → 0.82 (§4.3) → **0.65 s**. One trade is
+inherent: streamed chunks cannot be peak-normalized (that needs the
+whole clause), so the service ships the voice's native level. This is
+the one architectural idea the cascade borrows from speech-native
+models: their codecs stream by construction; ours now does too.
+
+### 4.5 Speculative decoding as a latency and battery feature
 
 Gemma 4's first-party MTP head drafts the next N tokens; greedy
 verification makes output byte-identical to plain decoding *by
@@ -314,9 +361,9 @@ J/token on the Orin (the GPU is bandwidth-bound; fewer full passes per
 token is less DRAM traffic) — for a robot, spec decoding is a battery
 feature before it is a latency feature.
 
-### 4.5 The substrate, briefly
+### 4.6 The substrate, briefly
 
-None of §4.2–4.4 works if the kernels are slow. The runner's prefill is an
+None of §4.2–4.5 works if the kernels are slow. The runner's prefill is an
 int8 tensor-core (mma) path with warp-cooperative activation quantization
 and flash-attention prefill; decode is dp4a with split-K attention, frozen
 kernels, and CUDA-graph capture; weights are zero-copy on the integrated
@@ -357,7 +404,7 @@ Plain decode, tok/s (256 tokens, warm; llama-bench reference):
 | Orin | E4B | 16.80 | 13.36 | **1.26×** |
 | Orin | 12B | 8.27 | 7.04 | **1.17×** |
 
-MTP multiplies on top (§4.4). Where the design point shows is multimodal
+MTP multiplies on top (§4.5). Where the design point shows is multimodal
 turns: little-gemma reaches first-sentence on an image+question turn in
 **1.98 s (E4B) / 5.22 s (12B)** on the Orin vs 35.8 / 98.6 s for
 llama-server (which burns its lead in an unsuppressed thinking channel and
@@ -377,7 +424,7 @@ choices are TTFB choices, not throughput choices.
 (Burst delivery pays frame padding and is dominated by deferred — measured,
 not assumed; deferred runs reproduce to the millisecond.)
 
-### 5.4 End-to-end: the 0.82 s anatomy
+### 5.4 End-to-end: the 0.65 s anatomy
 
 E2B QAT, voice-sys prompt, streamed dictation of the 30-second spoken
 instruction, everything on-device:
@@ -385,10 +432,10 @@ instruction, everything on-device:
 ![Figure 2 — anatomy of first audio: baseline vs voice-sys prompt (E2B QAT,
 Orin NX)](fig-first-audio-anatomy.svg)
 
-*Figure 2: The same question, two system prompts. The voice-sys prompt cuts
-the first speakable unit from 21 to 8 words, which both starts synthesis
-earlier and makes it cheaper (VITS is ~linear in audio length): first audio
-1.21 → 0.82 s.*
+*Figure 2: The same question, three configurations. The voice-sys prompt
+cuts the first speakable unit from 21 to 8 words (1.21 → 0.82 s); the
+streaming vocoder (§4.4) then decouples first PCM from clause length
+entirely (0.82 → 0.65 s). Synthesis continues under playback.*
 
 With whisper.cpp's final-commit pass in the loop (base.en CUDA, ~0.55 s
 per invocation, invocation-cost-dominated), voicecat closes the turn ~1.0 s
@@ -402,9 +449,9 @@ One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 
 | tier | intelligence | TTFB (paced) | where it lands [TODO cite hamming] |
 |---|---|---:|---|
-| 12B | strongest open-weight ≤16GB | ~3.6 s | "common experience" (P90 region) |
-| E4B | high | ~1.5 s | industry median (1.4–1.7 s) |
-| E2B QAT | good | **0.82 s** | inside the "theoretical ideal", rarely achieved in production |
+| 12B | strongest open-weight ≤16GB | ~3.4 s | "common experience" (P90 region) |
+| E4B | high | ~1.35 s | just under the industry median (1.4–1.7 s) |
+| E2B QAT | good | **0.65 s** | inside the "theoretical ideal", rarely achieved in production |
 
 ![Figure 3 — the three tiers against production voice-AI latency
 bands](fig-tiers-vs-industry.svg)
@@ -434,7 +481,7 @@ measured on the NX 16GB against an 8 GB budget, not yet on the Nano SKU
 
 GPU-saturated decode peaks ~23 W (default profile; 40 W MAXN raises clocks
 but the workload is bandwidth-bound), idle-to-peak on a supply a robot
-already carries. MTP reduces J/token 2.85 → 2.29 (§4.4). Moshi's reference
+already carries. MTP reduces J/token 2.85 → 2.29 (§4.5). Moshi's reference
 deployment is an L4: 24 GB, ~72 W TDP datacenter card [TODO complete the
 note: "despite they got 100..." — finish this sentence from the Moshi paper
 data].
@@ -457,9 +504,10 @@ Model size has almost stopped mattering — 2B to 12B spans first-clause
 0.13–0.29 s once streaming hides prefill; *content* dominates (the E2B is
 slowest end-to-end because its clause contains a date that verbalizes to
 3.9 s of audio). (3) The datacenter card + desktop CPU beat the 20 W board
-by only ~1.7× end-to-end (0.48 vs 0.82 s): the conversational regime is
-floor-bound, not compute-bound, which is precisely the regime where an
-edge deployment loses nothing that matters.
+by only ~1.7× end-to-end (0.48 vs 0.82 s, monolithic-TTS configurations —
+the streaming vocoder shipped after this study and tightens both sides):
+the conversational regime is floor-bound, not compute-bound, which is
+precisely the regime where an edge deployment loses nothing that matters.
 
 ## 6. Discussion
 
@@ -514,13 +562,9 @@ axis — and why a 6,000-line runner can hold the design point at all.
 
 Finetune for human pause placement (shorter than grammatical clauses);
 persistent whisper service (flips the streaming-vs-endpass verdict
-unconditionally); **streaming vocoder synthesis** — with the LLM leg at
-0.1–0.3 s, TTS is now 30–50% of the loop, and the lever is not hardware
-(GPU TTS measured and falsified at clause length, §3) but chunked
-vocoder decode: VITS emits first PCM only after synthesizing the whole
-clause, where a streaming decoder would put first audio at tens of
-milliseconds on the same CPU — Moshi's codec streams by construction,
-and it is the one piece of its architecture the cascade should borrow;
+unconditionally); integrate the streaming vocoder (§4.4) into the
+live-mic loop and re-measure the composed 0.65 s as one system;
+re-run the A5000 cross-silicon table with streaming TTS on both sides;
 Nano 8GB SKU validation; barge-in latency characterization; camera+voice
 concurrent sessions (the A/V exclusion policy exists, the latency study
 does not).
@@ -528,7 +572,7 @@ does not).
 ## 9. Conclusion
 
 Fluent and cohesive do not require choosing. A 20 W board running
-unmodified open-weight models answers 0.82 s after you stop talking —
+unmodified open-weight models answers 0.65 s after you stop talking —
 because the pipeline stops wasting the seconds the user's own speech
 offers (prefill under speech), lets the model create the places speech can
 begin (the LLM as clause splitter), and measures the thing the ear
