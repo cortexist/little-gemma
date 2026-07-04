@@ -19,7 +19,7 @@
 // a learned 2-axis position table), audio is one linear layer over raw 640-
 // sample (40 ms @ 16 kHz) waveform frames. The whole projector is 11 tensors.
 // The E2B/E4B mmproj files carry a legacy 16-block vision transformer (also
-// implemented — media.c + media-cuda.cu) and a 12-block audio conformer,
+// implemented — media.c + media-kernel.cu) and a 12-block audio conformer,
 // which is not: legacy audio is rejected (use Whisper upstream, or the 12B).
 
 struct media;

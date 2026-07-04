@@ -1,7 +1,7 @@
 // No GPU backend in this build. media.c calls v_embed_image_gpu / v_gpu_free
 // unconditionally (no #ifdef), so a target without a GPU encoder (the CPU `run`)
 // links these no-op stubs: the GPU path returns NULL and media.c falls back to its
-// host encoder. A GPU target links its implementation (src/cuda/media-cuda.cu)
+// host encoder. A GPU target links its implementation (src/cuda/media-kernel.cu)
 // instead, which provides the real ones. (Same select-by-linked-file seam as
 // model-cpu.c vs src/cuda/model-cuda-*.cu.)
 #include "media-internal.h"

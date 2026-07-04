@@ -31,7 +31,7 @@ extern "C" {                     // the C headers carry no C++ linkage guards
 }
 
 #define VC_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
-    fprintf(stderr, "media-cuda: %s -> %s\n", #x, cudaGetErrorString(e_)); return NULL; } } while (0)
+    fprintf(stderr, "media-kernel: %s -> %s\n", #x, cudaGetErrorString(e_)); return NULL; } } while (0)
 
 // Device-side mirror of struct vlayer.
 struct vld {
@@ -383,7 +383,7 @@ static float *up_f(const float *src, size_t n) {       // norm weights -> device
 
 static struct vcuda *vcuda_init(struct media *md) {
     if (md->v_embd / md->v_head != 64) {                // kernels assume dh = 64
-        fprintf(stderr, "media-cuda: head dim %d != 64, using the host encoder\n", md->v_embd / md->v_head);
+        fprintf(stderr, "media-kernel: head dim %d != 64, using the host encoder\n", md->v_embd / md->v_head);
         return NULL;
     }
     struct vcuda *vc = (struct vcuda *)calloc(1, sizeof *vc);
@@ -405,7 +405,7 @@ static struct vcuda *vcuda_init(struct media *md) {
              (d->up = up_h(s->up)) && (d->down = up_h(s->down)) != NULL;
     }
     if (!ok) {
-        fprintf(stderr, "media-cuda: weight upload failed, using the host encoder\n");
+        fprintf(stderr, "media-kernel: weight upload failed, using the host encoder\n");
         free(vc->vl); free(vc);                        // leaked partial uploads are acceptable here:
         return NULL;                                   // this only happens out-of-memory at startup
     }
@@ -529,7 +529,7 @@ static struct uvcuda *uvcuda_init(struct media *md) {
              (vc->vpos = up_f(md->v_pos, (size_t)2 * md->pos_size * ne)) != NULL;
     if (ok && md->mm_a) ok = (vc->aw = up_h(md->mm_a)) != NULL;
     if (!ok) {
-        fprintf(stderr, "media-cuda: weight upload failed, using the host encoder\n");
+        fprintf(stderr, "media-kernel: weight upload failed, using the host encoder\n");
         free(vc);                                      // leaked partial uploads: OOM at startup only
         return NULL;
     }

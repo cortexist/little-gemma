@@ -70,12 +70,12 @@ if(CMAKE_CUDA_COMPILER)
     # run-cuda = readable f32-dequant matmul; run-cuda-i8 = int8 matmul with
     # wide loads from (re)aligned weights. (An earlier byte-load int8 variant
     # lives in git history — see the README.)
-    # media-cuda.cu: the gemma4v encoder on the GPU (~1 TFLOP/image — ~15 s on
+    # media-kernel.cu: the gemma4v encoder on the GPU (~1 TFLOP/image — ~15 s on
     # a good CPU, well under a second on the GPU). The host encoder stays in as
     # oracle and fallback. media.c calls the GPU seam unconditionally; the CPU run
-    # target links a no-op stub (media-gpu-stub.c), the CUDA targets link media-cuda.cu.
-    add_executable(run-cuda     ${CORE} src/cuda/model-cuda-f32.cu src/cuda/media-cuda.cu)
-    add_executable(run-cuda-i8  ${CORE} src/cuda/model-cuda-i8.cu src/cuda/media-cuda.cu)
+    # target links a no-op stub (media-gpu-stub.c), the CUDA targets link media-kernel.cu.
+    add_executable(run-cuda     ${CORE} src/cuda/model-cuda-f32.cu src/cuda/media-kernel.cu)
+    add_executable(run-cuda-i8  ${CORE} src/cuda/model-cuda-i8.cu src/cuda/media-kernel.cu)
     foreach(tgt run-cuda run-cuda-i8)
         target_include_directories(${tgt} PRIVATE include src)   # src/ for media-internal.h & mtp-internal.h
         if(WIN32)

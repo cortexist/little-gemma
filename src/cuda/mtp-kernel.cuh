@@ -1,4 +1,4 @@
-// mtp-cuda.cuh — the device side of MTP speculative decoding, split from
+// mtp-kernel.cuh — the device side of MTP speculative decoding, split from
 // model-cuda.cuh (same single-include unit: model-cuda.cuh includes this at
 // the point the code used to sit, so declaration order and codegen are
 // unchanged). Two halves: the VERIFY (the LG_MTP_N-token block through the
@@ -260,7 +260,7 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
             && cudaMalloc(&mc->logits, (size_t)t->n_vocab * 4) == cudaSuccess
             && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess
             && cudaMalloc(&mc->d_dpos, sizeof(int)) == cudaSuccess;
-    if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-cuda
+    if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-kernel.cu
         fprintf(stderr, "mtp: device upload failed, drafting disabled\n");
         free(mc->l); free(mc);
         return NULL;

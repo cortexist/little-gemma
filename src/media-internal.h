@@ -1,7 +1,7 @@
-// Shared between media.c (host embedders) and media-cuda.cu (the GPU gemma4v
+// Shared between media.c (host embedders) and media-kernel.cu (the GPU gemma4v
 // encoder). Not part of the public API — that is include/media.h. The CPU-only
 // build links a no-op stub (media-gpu-stub.c) for the GPU seam below; the CUDA
-// targets link media-cuda.cu instead, and the host path stays in as oracle + fallback
+// targets link media-kernel.cu instead, and the host path stays in as oracle + fallback
 // (set LG_MEDIA_VERIFY=1 to run both per image and print the max difference).
 #ifndef MEDIA_INTERNAL_H
 #define MEDIA_INTERNAL_H
@@ -38,7 +38,7 @@ struct media {
     int v_embd, v_head, v_layer, v_merge;      // 768, 12, 16, 3
     const struct gguf_tensor *v_patch16;       // [16,16,3 -> 768] conv, no bias
     struct vlayer *vl;
-    void *gpu;                                 // GPU backend state (media-cuda.cu), or NULL
+    void *gpu;                                 // GPU backend state (media-kernel.cu), or NULL
 };
 
 #ifdef __cplusplus
