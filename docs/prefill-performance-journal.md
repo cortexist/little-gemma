@@ -1508,3 +1508,38 @@ clash (fix: pip install --user --ignore-installed pandas), the package
 needs --responses_api_api_key even for local servers, one client
 connection per process lifetime, and pkill -f self-match over ssh bit
 again. Probe preserved as bench/s2s_probe.py.
+
+## 2026-07-04 — HF s2s, part two: the TTS is tighter than the LLM, and long input breaks it
+
+Reading their installed sources answers where the engineering went. The
+TTS layer is TWO-TIER: the CPU-viable backends (facebookMMS — what we
+benchmarked — and the melo/chatTTS/kokoro family) synthesize the WHOLE
+sentence in one call and chop it into 512-sample blocks afterwards —
+transport chunking, stock-piper behavior, first byte waits for the
+sentence. But their flagship backends genuinely stream: qwen3
+(faster-qwen3-tts) prefills the full target text then decodes codec
+tokens incrementally, 8 codec steps per chunk, with a CUDA-graph
+captured decode loop; pocket (Kyutai) yields 10–20 ms chunks by
+construction. The streaming lives in codec-token TTS architectures that
+stream natively — nobody retrofits streaming onto VITS the way our
+latent-boundary split does, and their streaming tier wants a GPU. The
+LLM side, by contrast, is a plain HTTP client with post-hoc nltk
+sent_tokenize and a batch-3-sentences default: sentence-level flushing
+only, no clause policy, no model-side split pressure.
+
+Long input, measured honestly: it BREAKS at defaults. A 31.8 s natural
+spoken question gets segmented at comma-length breath pauses (silero +
+min_silence 64 ms), and the pipeline REPLIES INTO THE USER'S ONGOING
+SPEECH — our probe clocked first audio 25–28 s BEFORE end of speech.
+Raising min_silence did not save it: silero assigns weak probabilities
+to our synthetic voice and only ever caught ~0.9 s FRAGMENTS (even the
+short-question benchmark ran on an 0.884 s fragment — which means the
+0.9 s TTFB we measured had an artificially LIGHT ASR leg; a real mic
+would score somewhat worse). The scaling legs, measured in isolation:
+faster-whisper base int8 on the Orin CPU takes 3.9 s for 31.8 s of
+audio (their tiny.en default ≈ 2 s), plus a full prompt prefill after
+end of speech — so even with perfect VAD their 30-second-utterance
+TTFB projects to ~3.5–5 s, growing linearly with utterance length,
+where ours is 0.65 s flat (the 929-token instruction is the measured
+case). Prefill-under-speech and streaming ASR commits are exactly the
+difference, as predicted.

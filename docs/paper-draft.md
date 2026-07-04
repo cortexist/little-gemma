@@ -541,6 +541,21 @@ sentences before the first TTS call; changing that one number is the
 reply length, where ours is ~O(1) after §4.2–4.4. VAD hang time is not
 the story on either side (their silence threshold is 64 ms).
 
+Two qualifications, both in their favor and against. Their flagship TTS
+backends (Qwen3-TTS via CUDA-graph codec decoding, Kyutai's Pocket) do
+stream natively — the whole-sentence behavior we measured is their
+CPU-viable tier — but the streaming tier is a different model
+architecture wanting a GPU, not a retrofit onto stock voices like §4.4.
+And their measured 0.9 s carried an artificially light ASR leg: the VAD
+only captured ~0.9 s fragments of our synthetic-voice question. On long
+input the comparison collapses entirely: a 31.8 s natural spoken
+question is segmented at breath pauses and answered INTO the user's
+ongoing speech (first audio 25–28 s before end of speech), and even
+with perfect segmentation the post-speech chain scales with utterance
+length (their ASR leg alone measures 3.9 s for 31.8 s of audio on this
+CPU) — where prefill-under-speech holds ours at 0.65 s regardless
+(§4.2's 929-token case is the measured proof).
+
 ## 6. Discussion
 
 What the cascade buys for its ~0.5 s of structural disadvantage: the brain
