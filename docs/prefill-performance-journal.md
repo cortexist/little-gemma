@@ -1470,3 +1470,41 @@ half-fixing it (V13_0 only) mixes 13.3 headers with 13.0 cudart
 (LNK2019: cudaGetDeviceProperties_v2). Export BOTH to v13.0 to build.
 Also caught: yesterday's "rebuild" was an MSBuild no-op (binary mtime
 unmoved) — check the timestamp, not the success banner.
+
+## 2026-07-04 — the third species measured: HF speech-to-speech on the same board, same brain
+
+huggingface/speech-to-speech (pip 0.2.10) is the closest published
+relative of our pipeline: a cascaded, open-weight, python-glue stack —
+VAD → STT → LLM over HTTP → TTS. On the Orin we ran it against the SAME
+brain we use (llama-server, GPU, the E2B QAT gguf — our llama.cpp fork
+build serves /v1/responses fine), with faster-whisper (CPU int8) ears
+and MMS-TTS (CPU VITS) mouth. Probe = end of speech (last live-paced
+16 kHz chunk) → first reply audio byte, spoken question synthesized by
+ozgirl, six trials per session.
+
+| configuration | warm TTFB (median) | spread | cold first turn |
+|---|---:|---|---:|
+| defaults | ~1.6 s | 0.9–2.2 s | 3.4–23 s |
+| tuned (--stream_batch_sentences 1) | **~0.9 s** | 0.67–1.69 s | ~2 s |
+
+Same board, same LLM, our pipeline composes 0.65 s — and the delta is
+the paper's thesis in one experiment, because everything else is held
+equal: their chain runs serially AFTER end of speech (full ASR pass,
+full prompt prefill, first-sentence decode, whole-first-sentence VITS
+synthesis), while ours hides ASR and prefill under the speech itself
+and streams the vocoder. Their default even batches THREE sentences
+before the first TTS call (stream_batch_sentences=3 — the difference
+between 1.6 and 0.9 medians). Their variance couples to reply length
+(first byte waits on the whole first sentence); ours is ~O(1).
+
+Also learned: torch 2.12 cu130 from PyPI cannot see the Tegra iGPU
+(cuda.is_available()=False), so their STT/TTS run CPU — the same
+division of labor we chose deliberately, reached by necessity. VAD
+min_silence is only 64 ms; the latency is compute, not hang time. The
+YouTube-demo feel is plausible on a desktop GPU with short replies; on
+a Jetson with an unmodified llama-server, ~0.9 s median is the honest
+tuned number. Setup traps for reproduction: apt-pandas/pip-numpy ABI
+clash (fix: pip install --user --ignore-installed pandas), the package
+needs --responses_api_api_key even for local servers, one client
+connection per process lifetime, and pkill -f self-match over ssh bit
+again. Probe preserved as bench/s2s_probe.py.

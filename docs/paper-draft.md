@@ -150,10 +150,14 @@ vision) regress to what the speech training preserved.
 
 **Cascaded voice pipelines.** Commercial stacks (Pipecat, LiveKit Agents,
 [TODO cite]) cascade ASR → LLM → TTS and already stream at *existing*
-sentence punctuation. Our measurements locate two latencies they leave on
-the table: prefill of the growing turn (hidden under speech, §4.2) and the
-absence of early punctuation to flush on (created by the model itself,
-§4.3).
+sentence punctuation. HuggingFace's speech-to-speech [TODO cite repo] is
+the closest published relative — open-weight, modular, LLM over an
+OpenAI-compatible HTTP endpoint — and we benchmark it head-to-head on our
+board with our exact LLM (§5.9). Our measurements locate the latencies
+these stacks leave on the table: prefill of the growing turn (hidden under
+speech, §4.2), the absence of early punctuation to flush on (created by
+the model itself, §4.3), and whole-sentence TTS synthesis before the
+first sample (§4.4).
 
 **Local inference runtimes.** llama.cpp [TODO cite] is the gold-standard
 general local runtime, and its throughput numbers are the reference we
@@ -511,6 +515,31 @@ by only ~1.7× end-to-end (0.48 vs 0.82 s, monolithic-TTS configurations —
 the streaming vocoder shipped after this study and tightens both sides):
 the conversational regime is floor-bound, not compute-bound, which is
 precisely the regime where an edge deployment loses nothing that matters.
+
+### 5.9 Same board, same brain: the cascade baseline
+
+The cleanest ablation of our techniques is another cascade with
+everything else held equal. HuggingFace's speech-to-speech pipeline ran
+on the same Orin NX against the same Gemma E2B QAT weights (served by an
+unmodified llama-server on the GPU; faster-whisper and MMS-TTS on CPU —
+the same ears/mouth placement we chose, reached there by necessity since
+PyPI CUDA wheels cannot see the Tegra iGPU). End of speech → first reply
+audio, live-paced 16 kHz socket input, warm medians:
+
+| pipeline | warm TTFB | spread |
+|---|---:|---|
+| HF speech-to-speech, defaults | ~1.6 s | 0.9–2.2 s |
+| HF speech-to-speech, tuned (sentence batch 1) | ~0.9 s | 0.7–1.7 s |
+| ours (§5.4) | **0.65 s** | reproducible legs |
+
+The remaining difference is precisely the paper's contribution list run
+in reverse: their chain is serial after end of speech — a full ASR pass,
+a full prompt prefill, the first sentence's decode, and a
+whole-first-sentence VITS synthesis (their default even batches THREE
+sentences before the first TTS call; changing that one number is the
+1.6 → 0.9 difference). Their first-audio latency therefore scales with
+reply length, where ours is ~O(1) after §4.2–4.4. VAD hang time is not
+the story on either side (their silence threshold is 64 ms).
 
 ## 6. Discussion
 
