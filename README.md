@@ -37,8 +37,9 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
  ┌───────────────┐  ┌──────────────────────────────────────────────────────┐
  │  model-cpu.c  │  │              model-cuda.cuh (shared)                 │
  │ scalar+OpenMP;│  │ forward, kv cache (rings, f16), CUDA graphs, chunked │
- │ doubles as the│  │ prefill, B=2 verify, device MTP draft — plus the GPU │
- │ reference spec│  │ vision encoder (media-cuda.cu)                       │
+ │ doubles as the│  │ prefill — plus MTP verify + device draft             │
+ │ reference spec│  │ (mtp-cuda.cuh) and the GPU vision encoder            │
+ │               │  │ (media-cuda.cu)                                      │
  └───────────────┘  ├───────────────────────────┬──────────────────────────┤
                     │     model-cuda-f32.cu     │    model-cuda-i8.cu     │
                     │   readable f32 matmul     │  int8 dp4a + wide loads  │
