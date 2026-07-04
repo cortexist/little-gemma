@@ -4,7 +4,7 @@ Everything behind the "last word → first audio in 0.65 s" result, as
 runnable commands. Three processes and two pipes: **voicecat** (VAD +
 streaming whisper, committed words become `'T'` frames in the open turn)
 → **little-gemma serve** (the LLM; prefills while you speak, replies as
-a raw token stream) → **clause_pipe** (strips scaffolding, emits one
+a raw token stream) → **clausecat** (strips scaffolding, emits one
 line per clause) → **piper `--stream`** (first PCM after one decoder
 chunk) → **aplay**.
 
@@ -14,7 +14,7 @@ chunk) → **aplay**.
 |---|---|---|
 | Jetson Orin NX 16GB | JetPack 6.2.1, NVMe | the reference board; any CUDA GPU works |
 | little-gemma | this repo | `cmake -B build && cmake --build build -j` → `build/run-cuda-i8` |
-| voicecat | sibling repo `little-gemma-tools` | needs `ffmpeg` for mic capture |
+| voicecat, clausecat | sibling repo `little-gemma-tools` | voicecat needs `ffmpeg` for mic capture |
 | whisper.cpp | upstream, CUDA build | model `ggml-base.en.bin` |
 | piper | our fork `cortexist/piper1-gpl`, branch `vits-streaming` | `pip install -e .` |
 | LLM weights | `gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` — Unsloth's GGUF of Google's QAT release [TODO: pin HF link] | 12B/E4B: `Q4_K_M` ggufs |
@@ -41,7 +41,7 @@ python3 -m piper.split ~/voices/en_US-kristin-medium.onnx
 voicecat /tmp/lg.sock \
     --whisper-bin   ~/repos/whisper.cpp/build/bin/whisper-cli \
     --whisper-model ~/repos/whisper.cpp/models/ggml-base.en.bin \
-  | python3 bench/clause_pipe.py \
+  | clausecat \
   | piper -m ~/voices/en_US-kristin-medium.onnx --output-raw --stream \
   | aplay -r 22050 -f S16_LE -t raw -c 1 -
 ```
@@ -82,7 +82,7 @@ jetson_clocks --restore f`), llama.cpp ratios only from same-day pairs.
 | `tts_time.py` / `tts_stream_time.py` | TTS first byte, stock vs streaming | persistent service, clocked through the pipe (in-process clocks omit espeak) |
 | `piper_mem.py` / `mempeak.sh` | peak memory, the Jetson way | smaps_rollup Anonymous + nvmap — never VmHWM/MemAvailable |
 | `bench-serve-orin.sh` / `bench-serve.ps1` | serve-mode prefill tok/s | N identical turns, one connection each, first discarded |
-| `clause_pipe.py` | (glue, not a probe) | also the harness for the end-to-end single-run measurement |
+| `clause_pipe.py` | (policy sandbox, not a probe) | python twin of clausecat (little-gemma-tools) — try split-policy changes here first; the two are kept byte-identical by differential feed |
 
 Reply byte-identity across delivery modes is the correctness gate: if a
 streamed run's reply differs from the deferred run's, the measurement
