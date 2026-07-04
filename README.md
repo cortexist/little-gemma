@@ -410,10 +410,13 @@ prefills through arch-tuned tensor-core GEMMs at large batch — and the
 | A5000 | E2B QAT | **~6,680** | — |
 | Orin  | 12B | ~102 → **~173** | **0.80×** |
 | Orin  | E4B | ~192 → **~417** | **0.82×** |
-| Orin  | E2B QAT | **~798** | — |
+| Orin  | E2B QAT | **~815** | **0.80×** |
 
 (The E2B rows are Google's QAT release — all q4_0 weights — running the
-same m16n8k32 kernel's q4_0 flavor over q4_K-shaped repacked superblocks.)
+same m16n8k32 kernel's q4_0 flavor over q4_K-shaped repacked superblocks.
+The Orin E2B ratio is a same-day pair under pinned clocks: little-gemma
+serve 815 tok/s vs llama-bench pp929 1,021 (best of fa0/fa1); an E4B
+cross-check reproduced its reference within 3%.)
 
 Most steps were gated byte-identical; the f16 SWA rings and warp-row norms
 ship under the same determinism + quality gate as the original f16-KV step

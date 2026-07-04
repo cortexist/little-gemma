@@ -1404,3 +1404,30 @@ voice needed), full suite 22/22. i7 CLI first byte 0.19 → 0.05 s /
 0.37 → 0.09 s. Upstream PR candidate once proven general. Repo
 convention note: piper models now live under local/ (gitignored), not
 data/ — both machines.
+
+## 2026-07-03 — the missing reference: llama.cpp on the QAT E2B
+
+The prefill finals table had one hole: no llama.cpp number for the QAT
+E2B (the Windows attempt died in llama-completion's chat-template code;
+llama-bench never applies templates, so it was always the right tool).
+On the Orin, fork build 83efbcc79 loads the QAT file fine.
+
+Same-day pair under pinned clocks (stored + restored via jetson_clocks):
+llama-bench pp929 871 (fa0) / **1,021 tok/s** (fa1, best); little-gemma
+serve re-measured in the same session: warm turns 813.7-815.4 →
+**~815 tok/s**. Ratio **0.80×** — dead consistent with 12B 0.80× / E4B
+0.82×. Methodology check: the E4B llama reference reproduced at 524 vs
+~509 recorded (3% day drift) — which is exactly why the pair had to be
+same-day; the recorded 798 against today's 1,021 would have understated
+us at 0.78×.
+
+Also captured while pinned: llama tg32 **37.8 tok/s** (fa1) vs our
+recorded 28.5 plain decode — llama.cpp LEADS on q4_0 decode (~0.75×),
+plausibly because q4_0 is their oldest and most-tuned quant while ours
+rides the q4_K-shaped repack path. Flagged, not printed: our side of
+that pair needs a pinned-clocks re-measure first. Honest weak spot
+either way — the E2B decode win memory (“25% faster”) was the OLD Q3_K
+model, and does not transfer to the QAT release.
+
+Harness preserved: .scratch/bench-serve-orin.sh (the PS1 bench's bash
+twin — one connection per turn, first discarded).

@@ -398,7 +398,7 @@ Serve-mode prefill, tok/s (929-token turn, warm):
 |---|---|---:|---|
 | Orin | 12B | ~173 | 0.80× |
 | Orin | E4B | ~417 | 0.82× |
-| Orin | E2B QAT | ~798 | — [TODO llama.cpp E2B reference] |
+| Orin | E2B QAT | ~815 | **0.80×** |
 
 Plain decode, tok/s (256 tokens, warm; llama-bench reference):
 
@@ -599,10 +599,13 @@ submission.]
 
 ## Appendix B: numbers still to fill / verify
 
-- [ ] llama.cpp reference for E2B QAT prefill/decode (no fork support at
-      measurement time?)
-- [ ] E2B Orin plain-decode number for §5.2 table (dictation reply ran
-      31.6 tok/s with MTP at 39.5% acceptance)
+- [x] llama.cpp E2B QAT references measured (2026-07-03, pinned clocks,
+      same-day pair): pp929 1,021 tok/s (fa1) vs our 815 = 0.80×; tg32
+      37.8 tok/s vs our recorded 28.5 plain = ~0.75× — llama.cpp LEADS
+      on q4_0 decode (their most-tuned quant); re-pair our decode number
+      under pinned clocks before printing the decode ratio.
+- [ ] E2B Orin plain-decode re-measure paired with the tg32 37.8 reference
+      (recorded 28.5; dictation reply ran 31.6 tok/s with MTP at 39.5%)
 - [ ] Kokoro comparison number, or drop the "faster than Kokoro" claim
 - [ ] Moshi note completion ("despite they got 100...")
 - [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
