@@ -588,14 +588,17 @@ a good trade for most embodied products.
 
 ## Appendix A: Reproducibility
 
-Every number traces to a committed harness: the dictation clients
-(client-side clocks, three delivery modes), the TTS timing scripts, the
-memory sampler (anon+nvmap), and the engineering journals including
-falsified attempts. Replies are byte-identical across delivery modes and
-quantization levels by gate. The streaming vocoder ships in our piper fork
-(split tool + streaming API + tests); [TODO: decide what of the remaining
-measurement harnesses gets promoted into a companion artifact for
-submission.]
+Every number traces to a committed harness: the repository's `bench/`
+directory carries the dictation clients (client-side clocks, three
+delivery modes), the standard 929-token stimulus, the TTS timing scripts,
+the memory samplers (anon+nvmap), the serve-prefill bench harnesses for
+both machines, and the clause-flushing glue that makes the pipeline a
+single shell command; `docs/voice-pipeline.md` is the runnable
+reproduction guide (exact command lines, protocol rules, and the honest
+gaps). The streaming vocoder ships in our piper fork (split tool +
+streaming API + tests). The engineering journals include the falsified
+attempts. Replies are byte-identical across delivery modes and
+quantization levels by gate.
 
 ## Appendix B: numbers still to fill / verify
 

@@ -370,6 +370,9 @@ software-pipelined weight staging, and warp-cooperative activation
 quantization, every step gated byte-identical. The full logs, dead ends and
 bisections included, are **[docs/performance-journal.md](docs/performance-journal.md)**
 and **[docs/prefill-performance-journal.md](docs/prefill-performance-journal.md)**.
+The complete voice pipeline — mic → whisper → serve → streaming piper, with
+runnable commands and every measurement harness — is
+**[docs/voice-pipeline.md](docs/voice-pipeline.md)** + **[bench/](bench/)**.
 
 Where things stand — same day, same machine, same prompt (little-gemma =
 `run-cuda-i8`, 256 generated tokens, warm; llama.cpp = `llama-bench` tg32,
