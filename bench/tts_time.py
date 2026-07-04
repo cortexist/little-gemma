@@ -6,7 +6,7 @@
 # ONNX call, so first-byte ~= whole-sentence synthesis; both are reported.
 import json, os, select, subprocess, sys, time
 
-MODEL = os.path.expanduser("~/repos/piper/local/model/en_US-ozgirl_v6-step18500.onnx")
+MODEL = os.path.expanduser("~/repos/piper/data/model/en_US-ozgirl_v6-step18500.onnx")
 PIPER = os.path.expanduser("~/repos/piper/.venv/bin/piper")
 SENT = ("Paris became the capital of France primarily due to its historical "
         "significance and its role as a major cultural and political center.")

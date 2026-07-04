@@ -8,7 +8,7 @@ import os, select, subprocess, sys, time
 PY = os.path.expanduser("~/repos/piper/.venv/bin/python")
 HOME = os.path.expanduser("~")
 CMD = [PY, HOME + "/piper_stream.py",
-       HOME + "/repos/piper/local/model/en_US-ozgirl_v6-step18500.onnx",
+       HOME + "/repos/piper/data/model/en_US-ozgirl_v6-step18500.onnx",
        HOME + "/en_US-ozgirl_v6-step18500-enc.onnx",
        HOME + "/en_US-ozgirl_v6-step18500-dec.onnx"] + sys.argv[1:]
 
