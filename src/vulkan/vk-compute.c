@@ -1,7 +1,9 @@
 // Vulkan compute harness: device bring-up, quantized-matmul pipelines, weight
 // residency. See vk-compute.h for the contract and model-vulkan.c for the
-// caller. Deliberately one dispatch per submit with a fence wait — simple and
-// correct first; the journal culture measures before batching.
+// caller. One submit carries up to VKC_MAX_JOBS independent dispatches over a
+// shared input (q/k/v in one fence round-trip instead of three); dependent
+// matmuls still block on their fence — the CPU needs each result before it
+// can build the next input.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,28 +15,71 @@
 #include "vk-compute.h"
 #include "quant.h"
 
-// SPIR-V for shaders/matmul.comp, one compilation per weight type (CMake runs
-// glslc -DQTYPE=<id> -mfmt=num, which emits the words as C initializer text).
-static const uint32_t spv_f32[] = {
+// SPIR-V for shaders/matmul.comp: per weight type, NB=1 (decode) and NB=16
+// (wide, for chunked prefill). CMake runs glslc -DQTYPE=<id> -DNB=<n>
+// -mfmt=num, which emits the words as C initializer text.
+static const uint32_t spv_f32[]    = {
 #include "matmul_f32.spv.inc"
 };
-static const uint32_t spv_f16[] = {
+static const uint32_t spv_f32_w[]  = {
+#include "matmul_f32_w.spv.inc"
+};
+static const uint32_t spv_f32_s[] = {
+#include "matmul_f32_s.spv.inc"
+};
+static const uint32_t spv_f16[]    = {
 #include "matmul_f16.spv.inc"
 };
-static const uint32_t spv_q4_0[] = {
+static const uint32_t spv_f16_w[]  = {
+#include "matmul_f16_w.spv.inc"
+};
+static const uint32_t spv_f16_s[] = {
+#include "matmul_f16_s.spv.inc"
+};
+static const uint32_t spv_q4_0[]   = {
 #include "matmul_q4_0.spv.inc"
 };
-static const uint32_t spv_q8_0[] = {
+static const uint32_t spv_q4_0_w[] = {
+#include "matmul_q4_0_w.spv.inc"
+};
+static const uint32_t spv_q4_0_s[] = {
+#include "matmul_q4_0_s.spv.inc"
+};
+static const uint32_t spv_q8_0[]   = {
 #include "matmul_q8_0.spv.inc"
 };
-static const uint32_t spv_q4_K[] = {
+static const uint32_t spv_q8_0_w[] = {
+#include "matmul_q8_0_w.spv.inc"
+};
+static const uint32_t spv_q8_0_s[] = {
+#include "matmul_q8_0_s.spv.inc"
+};
+static const uint32_t spv_q4_K[]   = {
 #include "matmul_q4_K.spv.inc"
 };
-static const uint32_t spv_q6_K[] = {
+static const uint32_t spv_q4_K_w[] = {
+#include "matmul_q4_K_w.spv.inc"
+};
+static const uint32_t spv_q4_K_s[] = {
+#include "matmul_q4_K_s.spv.inc"
+};
+static const uint32_t spv_q6_K[]   = {
 #include "matmul_q6_K.spv.inc"
 };
-static const uint32_t spv_bf16[] = {
+static const uint32_t spv_q6_K_w[] = {
+#include "matmul_q6_K_w.spv.inc"
+};
+static const uint32_t spv_q6_K_s[] = {
+#include "matmul_q6_K_s.spv.inc"
+};
+static const uint32_t spv_bf16[]   = {
 #include "matmul_bf16.spv.inc"
+};
+static const uint32_t spv_bf16_w[] = {
+#include "matmul_bf16_w.spv.inc"
+};
+static const uint32_t spv_bf16_s[] = {
+#include "matmul_bf16_s.spv.inc"
 };
 
 #define NTYPES 32              // ggml type ids fit (BF16 = 30 is the largest)
@@ -55,12 +100,14 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      pl;
     VkDescriptorPool      dpool;
-    VkDescriptorSet       ds;
-    VkPipeline            pipe[NTYPES];
+    VkDescriptorSet       ds[VKC_MAX_JOBS];
+    VkPipeline            pipe[NTYPES];    // NB=1 (decode)
+    VkPipeline            pipes[NTYPES];   // NB=4 (MTP verify, short tails)
+    VkPipeline            pipew[NTYPES];   // NB=16 (wide/prefill)
     VkPhysicalDeviceMemoryProperties mem;
-    uint32_t              max_range;      // maxStorageBufferRange
+    uint32_t              max_range;       // maxStorageBufferRange
 
-    // activation I/O: persistently mapped, host-coherent, grown on demand
+    // activation I/O: persistently mapped, grown on demand
     VkBuffer       xbuf, obuf;
     VkDeviceMemory xmem, omem;
     void          *xmap, *omap;
@@ -77,6 +124,9 @@ static struct {
 
     // upload fallback: per-tensor buffers, cached by data pointer
     struct wslot   slots[NSLOTS];
+
+    float *xt;                            // transpose scratch for the wide path
+    size_t xt_cap;                        // in floats
 
     int ready;                            // 0 = untried, 1 = up, -1 = failed
 } g;
@@ -98,6 +148,7 @@ static int find_mem_type(uint32_t type_bits, VkMemoryPropertyFlags want) {
 // memcpy's INTO these, which write-combining handles fine. The out buffer is
 // the opposite: the GPU writes it once, the CPU reads it back, and CPU reads
 // from write-combined memory are the slow thing — prefer host-cached there.
+// (Moving `out` to host-cached memory doubled decode throughput; measured.)
 enum buf_kind { BUF_GPU_READ, BUF_CPU_READ };
 
 static int pick_hostvis(uint32_t type_bits, enum buf_kind kind) {
@@ -330,6 +381,10 @@ static VkPipeline make_pipe(const uint32_t *spv, size_t bytes) {
 
 int vkc_ready(void) { return g.ready == 1; }
 
+int vkc_supported(uint32_t t) {
+    return g.ready == 1 && t < NTYPES && g.pipe[t] != VK_NULL_HANDLE;
+}
+
 void vkc_destroy(void) {
     if (!g.dev) { if (g.inst) vkDestroyInstance(g.inst, NULL); memset(&g, 0, sizeof g); return; }
     vkDeviceWaitIdle(g.dev);
@@ -342,8 +397,12 @@ void vkc_destroy(void) {
     if (g.imp)  vkFreeMemory(g.dev, g.imp, NULL);
     if (g.xbuf) { vkDestroyBuffer(g.dev, g.xbuf, NULL); vkFreeMemory(g.dev, g.xmem, NULL); }
     if (g.obuf) { vkDestroyBuffer(g.dev, g.obuf, NULL); vkFreeMemory(g.dev, g.omem, NULL); }
-    for (int i = 0; i < NTYPES; i++)
-        if (g.pipe[i]) vkDestroyPipeline(g.dev, g.pipe[i], NULL);
+    for (int i = 0; i < NTYPES; i++) {
+        if (g.pipe[i])  vkDestroyPipeline(g.dev, g.pipe[i], NULL);
+        if (g.pipes[i]) vkDestroyPipeline(g.dev, g.pipes[i], NULL);
+        if (g.pipew[i]) vkDestroyPipeline(g.dev, g.pipew[i], NULL);
+    }
+    free(g.xt);
     if (g.dpool) vkDestroyDescriptorPool(g.dev, g.dpool, NULL);
     if (g.pl)    vkDestroyPipelineLayout(g.dev, g.pl, NULL);
     if (g.dsl)   vkDestroyDescriptorSetLayout(g.dev, g.dsl, NULL);
@@ -452,7 +511,7 @@ int vkc_init(const struct gguf_context *ctx) {
     if (vkAllocateCommandBuffers(g.dev, &cbi, &g.cb) != VK_SUCCESS) return -1;
     if (vkCreateFence(g.dev, &fi, NULL, &g.fence) != VK_SUCCESS) return -1;
 
-    // one layout for every pipeline: W, x, out storage buffers + 20B push consts
+    // one layout for every pipeline: W, x, out storage buffers + 24B push consts
     VkDescriptorSetLayoutBinding binds[3];
     for (int i = 0; i < 3; i++)
         binds[i] = (VkDescriptorSetLayoutBinding){
@@ -465,7 +524,7 @@ int vkc_init(const struct gguf_context *ctx) {
     };
     if (vkCreateDescriptorSetLayout(g.dev, &dli, NULL, &g.dsl) != VK_SUCCESS) return -1;
     VkPushConstantRange pc = {
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 5 * sizeof(uint32_t),
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 6 * sizeof(uint32_t),
     };
     VkPipelineLayoutCreateInfo pli = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -474,28 +533,48 @@ int vkc_init(const struct gguf_context *ctx) {
     };
     if (vkCreatePipelineLayout(g.dev, &pli, NULL, &g.pl) != VK_SUCCESS) return -1;
 
-    VkDescriptorPoolSize dps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 };
+    // one descriptor set per possible job in a submit
+    VkDescriptorPoolSize dps = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 * VKC_MAX_JOBS,
+    };
     VkDescriptorPoolCreateInfo dpi = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &dps,
+        .maxSets = VKC_MAX_JOBS, .poolSizeCount = 1, .pPoolSizes = &dps,
     };
     if (vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayout dsls[VKC_MAX_JOBS];
+    for (int i = 0; i < VKC_MAX_JOBS; i++) dsls[i] = g.dsl;
     VkDescriptorSetAllocateInfo dsi = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl,
+        .descriptorPool = g.dpool, .descriptorSetCount = VKC_MAX_JOBS, .pSetLayouts = dsls,
     };
-    if (vkAllocateDescriptorSets(g.dev, &dsi, &g.ds) != VK_SUCCESS) return -1;
+    if (vkAllocateDescriptorSets(g.dev, &dsi, g.ds) != VK_SUCCESS) return -1;
 
-    g.pipe[GGML_TYPE_F32]  = make_pipe(spv_f32,  sizeof spv_f32);
-    g.pipe[GGML_TYPE_F16]  = make_pipe(spv_f16,  sizeof spv_f16);
-    g.pipe[GGML_TYPE_Q4_0] = make_pipe(spv_q4_0, sizeof spv_q4_0);
-    g.pipe[GGML_TYPE_Q8_0] = make_pipe(spv_q8_0, sizeof spv_q8_0);
-    g.pipe[GGML_TYPE_Q4_K] = make_pipe(spv_q4_K, sizeof spv_q4_K);
-    g.pipe[GGML_TYPE_Q6_K] = make_pipe(spv_q6_K, sizeof spv_q6_K);
-    g.pipe[GGML_TYPE_BF16] = make_pipe(spv_bf16, sizeof spv_bf16);
+    g.pipe[GGML_TYPE_F32]   = make_pipe(spv_f32,    sizeof spv_f32);
+    g.pipew[GGML_TYPE_F32]  = make_pipe(spv_f32_w,  sizeof spv_f32_w);
+    g.pipes[GGML_TYPE_F32] = make_pipe(spv_f32_s, sizeof spv_f32_s);
+    g.pipe[GGML_TYPE_F16]   = make_pipe(spv_f16,    sizeof spv_f16);
+    g.pipew[GGML_TYPE_F16]  = make_pipe(spv_f16_w,  sizeof spv_f16_w);
+    g.pipes[GGML_TYPE_F16] = make_pipe(spv_f16_s, sizeof spv_f16_s);
+    g.pipe[GGML_TYPE_Q4_0]  = make_pipe(spv_q4_0,   sizeof spv_q4_0);
+    g.pipew[GGML_TYPE_Q4_0] = make_pipe(spv_q4_0_w, sizeof spv_q4_0_w);
+    g.pipes[GGML_TYPE_Q4_0] = make_pipe(spv_q4_0_s, sizeof spv_q4_0_s);
+    g.pipe[GGML_TYPE_Q8_0]  = make_pipe(spv_q8_0,   sizeof spv_q8_0);
+    g.pipew[GGML_TYPE_Q8_0] = make_pipe(spv_q8_0_w, sizeof spv_q8_0_w);
+    g.pipes[GGML_TYPE_Q8_0] = make_pipe(spv_q8_0_s, sizeof spv_q8_0_s);
+    g.pipe[GGML_TYPE_Q4_K]  = make_pipe(spv_q4_K,   sizeof spv_q4_K);
+    g.pipew[GGML_TYPE_Q4_K] = make_pipe(spv_q4_K_w, sizeof spv_q4_K_w);
+    g.pipes[GGML_TYPE_Q4_K] = make_pipe(spv_q4_K_s, sizeof spv_q4_K_s);
+    g.pipe[GGML_TYPE_Q6_K]  = make_pipe(spv_q6_K,   sizeof spv_q6_K);
+    g.pipew[GGML_TYPE_Q6_K] = make_pipe(spv_q6_K_w, sizeof spv_q6_K_w);
+    g.pipes[GGML_TYPE_Q6_K] = make_pipe(spv_q6_K_s, sizeof spv_q6_K_s);
+    g.pipe[GGML_TYPE_BF16]  = make_pipe(spv_bf16,   sizeof spv_bf16);
+    g.pipew[GGML_TYPE_BF16] = make_pipe(spv_bf16_w, sizeof spv_bf16_w);
+    g.pipes[GGML_TYPE_BF16] = make_pipe(spv_bf16_s, sizeof spv_bf16_s);
 
-    // LG_VK_NO_IMPORT forces the upload path — the A/B for the question the
-    // memory-type comments above answer (snooped host pages vs GTT).
+    // LG_VK_NO_IMPORT forces the upload path — the A/B that showed zero-copy
+    // decodes as fast as uploaded GTT here (snooped host reads were NOT the
+    // bottleneck) at half the RAM.
     int zero_copy = !getenv("LG_VK_NO_IMPORT") && import_blob(ctx) == 0;
     fprintf(stderr, "vulkan: %s — weights %s\n", props.deviceName,
             zero_copy ? "zero-copy (GGUF blob imported in place)"
@@ -508,7 +587,7 @@ int vkc_init(const struct gguf_context *ctx) {
 
 static int io_reserve(size_t xbytes, size_t obytes) {
     if (xbytes > g.xcap) {
-        size_t cap = g.xcap ? g.xcap : 1 << 18;
+        size_t cap = g.xcap ? g.xcap : 1 << 20;
         while (cap < xbytes) cap *= 2;
         if (g.xbuf) {
             vkDeviceWaitIdle(g.dev);
@@ -520,7 +599,7 @@ static int io_reserve(size_t xbytes, size_t obytes) {
         g.xcap = cap;
     }
     if (obytes > g.ocap) {
-        size_t cap = g.ocap ? g.ocap : 1 << 20;
+        size_t cap = g.ocap ? g.ocap : 1 << 21;
         while (cap < obytes) cap *= 2;
         if (g.obuf) {
             vkDeviceWaitIdle(g.dev);
@@ -534,46 +613,90 @@ static int io_reserve(size_t xbytes, size_t obytes) {
     return 0;
 }
 
-int vkc_matmul(float *out, const struct gguf_tensor *t, const float *x, int k, int m) {
-    if (g.ready != 1 || (uint32_t)t->type >= NTYPES || !g.pipe[t->type]) return -1;
-    if (k <= 0 || m <= 0 || k % 32 != 0) return -1;
-    int blck = ggml_blck_size(t->type);
-    if (blck == 0 || k % blck != 0) return -1;
+int vkc_matmul_x(const float *x, int k, int nb, const struct vkc_job *jobs, int njobs) {
+    if (g.ready != 1 || njobs < 1 || njobs > VKC_MAX_JOBS) return -1;
+    if (k <= 0 || k % 32 != 0 || nb < 1 || nb > VKC_NB_MAX) return -1;
 
-    size_t bytes = (size_t)(k / blck) * ggml_type_size(t->type) * (size_t)m;
-    VkBuffer wbuf;
-    uint32_t wbase;
-    if (weight_locate(t, bytes, &wbuf, &wbase) != 0) return -1;
-    if (io_reserve((size_t)k * 4, (size_t)m * 4) != 0) return -1;
+    // pipeline family: the padded columns cost real MAC, so use the smallest
+    // NB that fits (nb=3 through the NB=16 pipeline would pay 16 columns)
+    int fam = nb == 1 ? 1 : nb <= VKC_NB_MID ? VKC_NB_MID : VKC_NB_MAX;
+    VkBuffer  wbuf[VKC_MAX_JOBS];
+    uint32_t  wbase[VKC_MAX_JOBS];
+    size_t    out_off[VKC_MAX_JOBS];     // in floats
+    size_t    total_out = 0;
+    for (int j = 0; j < njobs; j++) {
+        const struct gguf_tensor *t = jobs[j].t;
+        VkPipeline p = (uint32_t)t->type >= NTYPES ? VK_NULL_HANDLE
+                     : fam == 1 ? g.pipe[t->type]
+                     : fam == VKC_NB_MID ? g.pipes[t->type] : g.pipew[t->type];
+        if (!p || jobs[j].m <= 0) return -1;
+        int blck = ggml_blck_size(t->type);
+        if (blck == 0 || k % blck != 0) return -1;
+        size_t bytes = (size_t)(k / blck) * ggml_type_size(t->type) * (size_t)jobs[j].m;
+        if (weight_locate(t, bytes, &wbuf[j], &wbase[j]) != 0) return -1;
+        out_off[j] = total_out;
+        total_out += (size_t)nb * jobs[j].m;
+    }
+    size_t xfloats = (size_t)k * fam;
+    if (io_reserve(xfloats * 4, total_out * 4) != 0) return -1;
 
-    memcpy(g.xmap, x, (size_t)k * 4);       // host-coherent: visible at submit
+    if (nb == 1) {
+        memcpy(g.xmap, x, (size_t)k * 4);    // host-coherent: visible at submit
+    } else {
+        // The wide shader reads x TRANSPOSED, [k][NB]: one element's NB
+        // column values sit contiguous so it MACs them as vec4s. Dead
+        // columns (nb < NB) duplicate column 0 — their outputs are never
+        // written. Transpose into a normal-memory scratch first: strided
+        // 4-byte stores straight into write-combined memory defeat the
+        // combining, one contiguous memcpy doesn't.
+        if (g.xt_cap < xfloats) {
+            free(g.xt);
+            g.xt = malloc(xfloats * 4);
+            if (!g.xt) { g.xt_cap = 0; return -1; }
+            g.xt_cap = xfloats;
+        }
+        for (int b = 0; b < fam; b++) {
+            const float *col = x + (size_t)(b < nb ? b : 0) * k;
+            float *dst = g.xt + b;
+            for (int e = 0; e < k; e++) dst[(size_t)e * fam] = col[e];
+        }
+        memcpy(g.xmap, g.xt, xfloats * 4);
+    }
 
-    VkDescriptorBufferInfo bw = { .buffer = wbuf,   .offset = 0, .range = VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bx = { .buffer = g.xbuf, .offset = 0, .range = VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bo = { .buffer = g.obuf, .offset = 0, .range = VK_WHOLE_SIZE };
-    VkWriteDescriptorSet wr[3];
-    VkDescriptorBufferInfo *bi[3] = { &bw, &bx, &bo };
-    for (int i = 0; i < 3; i++)
-        wr[i] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.ds,
-            .dstBinding = (uint32_t)i, .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = bi[i],
-        };
-    vkUpdateDescriptorSets(g.dev, 3, wr, 0, NULL);   // set idle: fence was waited
-
-    uint32_t pcv[5] = { (uint32_t)k, (uint32_t)m, wbase, 0, 0 };
-    uint32_t gx = m < 32768 ? (uint32_t)m : 32768u;
-    uint32_t gy = ((uint32_t)m + 32767u) / 32768u;
+    VkDescriptorBufferInfo bi[VKC_MAX_JOBS][3];
+    VkWriteDescriptorSet   wr[VKC_MAX_JOBS * 3];
+    for (int j = 0; j < njobs; j++) {
+        bi[j][0] = (VkDescriptorBufferInfo){ .buffer = wbuf[j], .offset = 0, .range = VK_WHOLE_SIZE };
+        bi[j][1] = (VkDescriptorBufferInfo){ .buffer = g.xbuf,  .offset = 0, .range = VK_WHOLE_SIZE };
+        bi[j][2] = (VkDescriptorBufferInfo){ .buffer = g.obuf,  .offset = 0, .range = VK_WHOLE_SIZE };
+        for (int i = 0; i < 3; i++)
+            wr[j * 3 + i] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.ds[j],
+                .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[j][i],
+            };
+    }
+    vkUpdateDescriptorSets(g.dev, (uint32_t)(njobs * 3), wr, 0, NULL);   // sets idle: fence waited
 
     VkCommandBufferBeginInfo bgi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(g.cb, &bgi);
-    vkCmdBindPipeline(g.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe[t->type]);
-    vkCmdBindDescriptorSets(g.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.ds, 0, NULL);
-    vkCmdPushConstants(g.cb, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
-    vkCmdDispatch(g.cb, gx, gy, 1);
+    for (int j = 0; j < njobs; j++) {
+        // no barriers between jobs: same read-only x, disjoint out regions
+        uint32_t m = (uint32_t)jobs[j].m;
+        uint32_t pcv[6] = { (uint32_t)k, m, wbase[j], 0, (uint32_t)out_off[j], (uint32_t)nb };
+        // every pipeline computes VKC_TM rows per workgroup (see matmul.comp)
+        uint32_t groups = (m + VKC_TM - 1) / VKC_TM;
+        vkCmdBindPipeline(g.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          fam == 1 ? g.pipe[jobs[j].t->type]
+                        : fam == VKC_NB_MID ? g.pipes[jobs[j].t->type]
+                        : g.pipew[jobs[j].t->type]);
+        vkCmdBindDescriptorSets(g.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.ds[j], 0, NULL);
+        vkCmdPushConstants(g.cb, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
+        vkCmdDispatch(g.cb, groups < 32768 ? groups : 32768u, (groups + 32767u) / 32768u, 1);
+    }
     VkMemoryBarrier mb = {                    // shader writes -> host reads
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
@@ -590,6 +713,8 @@ int vkc_matmul(float *out, const struct gguf_tensor *t, const float *x, int k, i
     if (vkQueueSubmit(g.queue, 1, &si, g.fence) != VK_SUCCESS) return -1;
     if (vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return -1;
 
-    memcpy(out, g.omap, (size_t)m * 4);
+    for (int j = 0; j < njobs; j++)
+        memcpy(jobs[j].out, (const float *)g.omap + out_off[j],
+               (size_t)nb * jobs[j].m * 4);
     return 0;
 }

@@ -115,20 +115,36 @@ if(Vulkan_FOUND AND TARGET Vulkan::glslc)
     set(LG_VK_SPV_INCS "")
     # name=ggml type id (quant.h); each becomes matmul_<name>.spv.inc, a
     # comma-separated word list (-mfmt=num) included into a uint32_t[] in
-    # vk-compute.c. Adding a quant type = one line here + one #elif in the
-    # shader + one make_pipe line.
+    # vk-compute.c. Every type compiles TWICE: NB=1 (decode: one activation
+    # column) and NB=16 (the wide pipeline: 16 columns per weight pass — what
+    # makes chunked prefill ~free per extra token). Adding a quant type = one
+    # line here + one #elif in the shader + one make_pipe line.
     foreach(variant "f32=0" "f16=1" "q4_0=2" "q8_0=8" "q4_K=12" "q6_K=14" "bf16=30")
         string(REPLACE "=" ";" v ${variant})
         list(GET v 0 vname)
         list(GET v 1 vid)
-        set(inc ${LG_VK_SPV_DIR}/matmul_${vname}.spv.inc)
-        add_custom_command(OUTPUT ${inc}
-            COMMAND Vulkan::glslc -O --target-env=vulkan1.1 -DQTYPE=${vid} -mfmt=num
-                    -o ${inc} ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/shaders/matmul.comp
-            DEPENDS src/vulkan/shaders/matmul.comp
-            COMMENT "glslc matmul.comp (${vname})"
-            VERBATIM)
-        list(APPEND LG_VK_SPV_INCS ${inc})
+        foreach(nb 1 4 16)
+            if(nb EQUAL 1)
+                set(inc ${LG_VK_SPV_DIR}/matmul_${vname}.spv.inc)
+                set(tm 4)   # row tiling pays on the matvec too: 4x fewer
+                            # workgroups and x reads (measured, like the rest)
+            elseif(nb EQUAL 4)
+                # the MTP batch-verify width: an LG_MTP_N block padded to 16
+                # columns would pay 16 columns of MAC for 3 live ones
+                set(inc ${LG_VK_SPV_DIR}/matmul_${vname}_s.spv.inc)
+                set(tm 4)
+            else()
+                set(inc ${LG_VK_SPV_DIR}/matmul_${vname}_w.spv.inc)
+                set(tm 4)   # rows per workgroup — must match VKC_TM in vk-compute.h
+            endif()
+            add_custom_command(OUTPUT ${inc}
+                COMMAND Vulkan::glslc -O --target-env=vulkan1.1 -DQTYPE=${vid} -DNB=${nb} -DTM=${tm}
+                        -mfmt=num -o ${inc} ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/shaders/matmul.comp
+                DEPENDS src/vulkan/shaders/matmul.comp
+                COMMENT "glslc matmul.comp (${vname} NB=${nb} TM=${tm})"
+                VERBATIM)
+            list(APPEND LG_VK_SPV_INCS ${inc})
+        endforeach()
     endforeach()
     add_custom_target(vk-shaders DEPENDS ${LG_VK_SPV_INCS})
 

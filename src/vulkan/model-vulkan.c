@@ -4,12 +4,20 @@
 // (norms, RoPE, attention over the host KV cache, GELU) stays the CPU
 // reference code: on the integrated GPUs this backend targets, device memory
 // IS system RAM, so the activation handoff each way is a memcpy, not a bus.
-// The CUDA journey ran the same route — correctness first, then move the
-// forward across piece by measured piece.
+//
+// The forward is written over a CHUNK of B positions (decode: B=1). Prefill
+// is bandwidth-bound — each token's forward streams every weight matrix
+// through DRAM — so the chunk form lets one weight pass serve B tokens (the
+// wide NB=16 shader), which is most of prefill's cost; and it groups the
+// independent matmuls (q/k/v, gate/up) into single submits, one fence
+// round-trip instead of three. Each wide column accumulates in the same
+// element order as the narrow kernel, so chunked prefill is bit-identical to
+// token-at-a-time — same words out, only the clock moves.
 //
 // LG_VK_VERIFY=1 runs every GPU matmul beside the host oracle and reports the
-// max difference (the LG_MEDIA_VERIFY pattern): expected ~1e-5-scale, pure
+// max difference (the LG_MEDIA_VERIFY pattern): expected ~1e-4-scale, pure
 // summation-order reassociation — the dequantized values are bit-identical.
+// LG_VK_PREFILL_B=n clamps the prefill chunk width (1..16).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,9 +28,20 @@
 #include "quant.h"
 #include "vulkan/vk-compute.h"
 
-// ---- math kernels (host f32; the matmul below is the part the GPU takes) ---
+#define CHUNK_MAX VKC_NB_MAX      // prefill chunk width; SWA rings pad by this
 
 const int model_kv_host = 1;     // this backend's kvcache rows are host memory
+
+static int chunk_width(void) {
+    static int b = 0;
+    if (!b) {
+        const char *e = getenv("LG_VK_PREFILL_B");
+        b = e ? atoi(e) : CHUNK_MAX;
+        if (b < 1) b = 1;
+        if (b > CHUNK_MAX) b = CHUNK_MAX;
+    }
+    return b;
+}
 
 void kvcache_save_prefix(struct kvcache *kv, int n) {
     kv->px_k = calloc((size_t)kv->n_layer, sizeof(void *));
@@ -51,17 +70,9 @@ void kvcache_restore_prefix(struct kvcache *kv, int n) {
     }
 }
 
-// The MTP verify, sequentially — LG_MTP_N forwards, byte-identical to plain decode by
-// construction (they ARE the same forwards). The next forward only runs while the
-// previous draft held, so last_hidden lands on the last valid position automatically.
-int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out) {
-    int j = 0;
-    do {
-        out[j] = model_forward_next(m, kv, toks[j], pos + j);
-        j++;
-    } while (j < LG_MTP_N && out[j - 1] == toks[j]);
-    return j;
-}
+// model_forward_spec lives below forward_chunk: the MTP verify runs as ONE
+// batched chunk — the weights cross memory once for the whole block, which
+// is what makes an accepted draft nearly free.
 
 // The host draft path in mtp.c does all the work on this backend (the KV cache
 // is host memory, exactly what it needs).
@@ -167,42 +178,65 @@ static void matmul_host(float *out, const struct gguf_tensor *t, const float *x,
     }
 }
 
-// out[m] = W . x — on the GPU when a pipeline exists for the weight type,
-// on the host otherwise (announced once per type, never silently).
-static void matmul_q(float *out, const struct gguf_tensor *t, const float *x, int k, int m) {
+// njobs matmuls over one shared x of nb columns: GPU as one submit, host
+// column-by-column when a weight type has no shader (announced once per
+// type, never silently).
+static void matmul_jobs(struct vkc_job *jobs, int njobs, const float *x, int k, int nb) {
     static int verify = -1;
     static uint32_t warned = 0;               // one bit per ggml type id
     if (verify < 0) verify = getenv("LG_VK_VERIFY") != NULL;
 
-    if (vkc_matmul(out, t, x, k, m) != 0) {
-        if (t->type < 32 && !(warned & (1u << t->type))) {
-            warned |= 1u << t->type;
-            fprintf(stderr, "vulkan: no %s pipeline — %s stays on the host matmul\n",
-                    ggml_type_name(t->type), t->name);
+    if (vkc_matmul_x(x, k, nb, jobs, njobs) != 0) {
+        for (int j = 0; j < njobs; j++) {
+            uint32_t ty = jobs[j].t->type;
+            if (!vkc_supported(ty) && ty < 32 && !(warned & (1u << ty))) {
+                warned |= 1u << ty;
+                fprintf(stderr, "vulkan: no %s pipeline — %s stays on the host matmul\n",
+                        ggml_type_name(ty), jobs[j].t->name);
+            }
+            for (int b = 0; b < nb; b++)
+                matmul_host(jobs[j].out + (size_t)b * jobs[j].m, jobs[j].t,
+                            x + (size_t)b * k, k, jobs[j].m);
         }
-        matmul_host(out, t, x, k, m);
         return;
     }
     if (verify) {
         static float worst = 0.0f;
         static int calls = 0;
-        float *ref = malloc((size_t)m * sizeof(float));
-        if (!ref) return;
-        matmul_host(ref, t, x, k, m);
-        float md = 0.0f, scale = 0.0f;
-        for (int i = 0; i < m; i++) {
-            float d = fabsf(out[i] - ref[i]);
-            if (d > md) md = d;
-            float a = fabsf(ref[i]);
-            if (a > scale) scale = a;
+        for (int j = 0; j < njobs; j++) {
+            float *ref = malloc((size_t)jobs[j].m * sizeof(float));
+            if (!ref) return;
+            float md = 0.0f, scale = 0.0f;
+            for (int b = 0; b < nb; b++) {
+                matmul_host(ref, jobs[j].t, x + (size_t)b * k, k, jobs[j].m);
+                const float *got = jobs[j].out + (size_t)b * jobs[j].m;
+                for (int i = 0; i < jobs[j].m; i++) {
+                    float d = fabsf(got[i] - ref[i]);
+                    if (d > md) md = d;
+                    float a = fabsf(ref[i]);
+                    if (a > scale) scale = a;
+                }
+            }
+            calls++;
+            if (calls <= 16 || md > worst)
+                fprintf(stderr, "vulkan verify[%d]: %-6s %6d x %-6d nb=%-2d max|gpu-host| %.3e  (max|host| %.3e)\n",
+                        calls, ggml_type_name(jobs[j].t->type), k, jobs[j].m, nb, md, scale);
+            if (md > worst) worst = md;
+            free(ref);
         }
-        calls++;
-        if (calls <= 16 || md > worst)
-            fprintf(stderr, "vulkan verify[%d]: %-6s %6d x %-6d  max|gpu-host| %.3e  (max|host| %.3e)\n",
-                    calls, ggml_type_name(t->type), k, m, md, scale);
-        if (md > worst) worst = md;
-        free(ref);
     }
+}
+
+// out[m] = W . x, the single-matmul shape.
+static void matmul_q(float *out, const struct gguf_tensor *t, const float *x, int k, int m) {
+    struct vkc_job job = { .t = t, .out = out, .m = m };
+    matmul_jobs(&job, 1, x, k, 1);
+}
+
+// B-column form: out[b*m + row] = W . x_b.
+static void matmul_qb(float *out, const struct gguf_tensor *t, const float *x, int k, int m, int B) {
+    struct vkc_job job = { .t = t, .out = out, .m = m };
+    matmul_jobs(&job, 1, x, k, B);
 }
 
 // ---- per-layer geometry helpers (shared shape, set up in model.c) -----------
@@ -275,11 +309,16 @@ int kvcache_init(struct kvcache *kv, const struct model *m, int max_seq) {
     for (int L = 0; L < c->n_layer; L++) {
         kv->kv_dim[L] = m->n_head_kv[L] * head_dim_at(m, L);
         if (L >= c->n_kv_start) continue;     // reuses kv_src's buffers: k/v stay NULL
-        // Sliding-window layers keep a ring of window rows; single-token
-        // forwards write p % seq over the row that just slid out of reach.
+        // Sliding-window layers keep a ring of window rows, PADDED by the
+        // prefill chunk width: a chunk writes all B of its rows before any of
+        // its attention runs, and with an exact-window ring row (p % window)
+        // for the chunk's last token would land on a position the chunk's
+        // FIRST token still attends. window+B rows make every clobbered row
+        // one that no token of the chunk can reach — the same padding the
+        // CUDA cache applies for its prefill chunks (see model-cpu.c).
         int seq = max_seq;
-        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window < max_seq)
-            seq = c->sliding_window;
+        if (m->is_local[L] && c->sliding_window > 0 && c->sliding_window + CHUNK_MAX < max_seq)
+            seq = c->sliding_window + CHUNK_MAX;
         kv->seq[L] = seq;
         kv->f16[L] = !m->is_local[L];         // global rows are f16 (see model.h)
         size_t n = (size_t)seq * kv->kv_dim[L];
@@ -302,8 +341,11 @@ void kvcache_free(struct kvcache *kv) {
 
 // ---- the forward pass ---------------------------------------------------------
 
-// Build the per-layer input vectors (PLE): one n_embd_per_layer slice per layer.
-static float *build_per_layer(struct model *m, int token, const float *inp_scaled) {
+// Per-layer input vectors (PLE) for a whole chunk: token b's [n_layer][ple]
+// block at ret + b*total. One batched projection instead of B — the 55 MB
+// per_layer_model_proj crosses DRAM once per chunk.
+static float *build_per_layer_chunk(struct model *m, const int *toks,
+                                    const float *x /*[B][n_embd]*/, int B) {
     const struct config *c = &m->cfg;
     const int ple = c->n_embd_per_layer;
     if (ple <= 0) return NULL;
@@ -311,36 +353,45 @@ static float *build_per_layer(struct model *m, int token, const float *inp_scale
     if (!pte) return NULL;
     const int64_t total = (int64_t)ple * c->n_layer;
 
-    // token's per-layer embedding row, scaled by sqrt(n_embd_per_layer)
-    float *tok = dequantize_row(pte, token, total);   // per token, not cached
-    if (!tok) return NULL;
-    float te_scale = sqrtf((float)ple);
-    for (int64_t i = 0; i < total; i++) tok[i] *= te_scale;
+    float *proj = malloc((size_t)B * total * sizeof(float));
+    if (!proj) return NULL;
+    matmul_qb(proj, wq(m, "per_layer_model_proj.weight"), x, c->n_embd, (int)total, B);
 
-    // project the main embedding: per_layer_model_proj @ inp_scaled, scaled by 1/sqrt(n_embd)
-    float *proj = malloc((size_t)total * sizeof(float));
-    matmul_q(proj, wq(m, "per_layer_model_proj.weight"), inp_scaled, c->n_embd, (int)total);
-    float pscale = 1.0f / sqrtf((float)c->n_embd);
-    for (int64_t i = 0; i < total; i++) proj[i] *= pscale;
-
-    // RMS normalization each per-layer slice, then combine: (proj + tok) / sqrt(2)
     const float *pn = fptr(m, "per_layer_proj_norm.weight");
-    for (int L = 0; L < c->n_layer; L++) rmsnorm(proj + L * ple, proj + L * ple, pn, ple, c->rms_eps);
-    float inv_sqrt2 = 1.0f / sqrtf(2.0f);
-    for (int64_t i = 0; i < total; i++) proj[i] = (proj[i] + tok[i]) * inv_sqrt2;
-    free(tok);
-    return proj; // [ple, n_layer], slice for layer L at proj + L*ple
+    const float pscale = 1.0f / sqrtf((float)c->n_embd);
+    const float te_scale = sqrtf((float)ple);
+    const float inv_sqrt2 = 1.0f / sqrtf(2.0f);
+    for (int b = 0; b < B; b++) {
+        float *pb = proj + (size_t)b * total;
+        for (int64_t i = 0; i < total; i++) pb[i] *= pscale;
+        for (int L = 0; L < c->n_layer; L++)
+            rmsnorm(pb + (size_t)L * ple, pb + (size_t)L * ple, pn, ple, c->rms_eps);
+        // token b's per-layer embedding row, scaled by sqrt(ple)
+        float *tok = dequantize_row(pte, toks[b], total);   // per token, not cached
+        if (!tok) { free(proj); return NULL; }
+        for (int64_t i = 0; i < total; i++) pb[i] = (pb[i] + tok[i] * te_scale) * inv_sqrt2;
+        free(tok);
+    }
+    return proj;
 }
 
-// The decoder body, fed an already-built input row (see model-cpu.c: token
-// embeddings arrive pre-scaled by sqrt(n_embd), media rows as the projector
-// made them; ple_token picks the per-layer-input row, -1 for none).
-static void forward_core(struct model *m, struct kvcache *kv, const float *x_in, int ple_token,
-                         int pos, float *logits) {
+// The decoder body over a CHUNK of B consecutive positions pos0..pos0+B-1.
+// x_in is [B][n_embd], each row exactly as the layers should see it (token
+// embeddings pre-scaled by sqrt(n_embd), media rows as the projector made
+// them). ple_tok[b] picks position b's per-layer-input row (media positions
+// pass the padding token, 0 — the reference does the same for embedding
+// batches). When `logits` is non-NULL the head runs for the last `nlogits`
+// positions (decode: 1; MTP verify: the whole block) — during prefill nobody
+// reads any, and the head is the largest matmul in the model. hidden_out, if
+// given, receives those positions' post-norm hiddens ([nlogits][n_embd]).
+static void forward_chunk(struct model *m, struct kvcache *kv, const float *x_in,
+                          const int *ple_tok, int pos0, int B,
+                          float *logits, int nlogits, float *hidden_out) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const int n_ff = c->n_ff, ple = c->n_embd_per_layer;
     const float eps = c->rms_eps;
+    const int pos_last = pos0 + B - 1;
 
     // scratch sized for the widest layer (head_dim and n_head_kv vary per layer)
     int maxhd = 0, max_kvdim = 0;
@@ -352,28 +403,40 @@ static void forward_core(struct model *m, struct kvcache *kv, const float *x_in,
     const int q_max  = n_head * maxhd;
     const int kv_max = max_kvdim;
 
-    float *x   = malloc((size_t)n_embd * sizeof(float));
-    float *h   = malloc((size_t)n_embd * sizeof(float));
-    float *q   = malloc((size_t)q_max  * sizeof(float));
-    float *kb  = malloc((size_t)kv_max * sizeof(float));
-    float *vb  = malloc((size_t)kv_max * sizeof(float));
-    float *xb  = malloc((size_t)q_max  * sizeof(float));
-    float *o   = malloc((size_t)n_embd * sizeof(float));
-    float *g1  = malloc((size_t)n_ff   * sizeof(float));
-    float *g2  = malloc((size_t)n_ff   * sizeof(float));
-    // per-head attention scores: the head loop threads across cores here (the
-    // GPU holds the matmuls, so untouched, attention would become the new
-    // serial bottleneck as the context grows)
-    float *att = malloc((size_t)n_head * (size_t)(pos + 1) * sizeof(float));
-    float *pg  = ple > 0 ? malloc((size_t)ple * sizeof(float)) : NULL;
+    // per-chunk scratch: [B][len], contiguous so a whole matrix uploads as one
+    // memcpy and reads back the same way
+    float *x   = malloc((size_t)B * n_embd * sizeof(float));
+    float *h   = malloc((size_t)B * n_embd * sizeof(float));
+    float *q   = malloc((size_t)B * q_max  * sizeof(float));
+    float *kb  = malloc((size_t)B * kv_max * sizeof(float));
+    float *vb  = malloc((size_t)B * kv_max * sizeof(float));
+    float *xb  = malloc((size_t)B * q_max  * sizeof(float));
+    float *o   = malloc((size_t)B * n_embd * sizeof(float));
+    float *g1  = malloc((size_t)B * n_ff   * sizeof(float));
+    float *g2  = malloc((size_t)B * n_ff   * sizeof(float));
+    // per-head attention scores (reused per token): threads across cores — the
+    // GPU holds the matmuls, so untouched, attention would become the serial
+    // bottleneck as the context grows
+    float *att = malloc((size_t)n_head * (size_t)(pos_last + 1) * sizeof(float));
+    float *pg  = ple > 0 ? malloc((size_t)B * ple * sizeof(float)) : NULL;
+    // f32 staging for the f16-stored global-layer KV rows: scalar f16->f32 per
+    // element inside the attention loops dominated long-context time (every
+    // q-head of a GQA group re-converted its kv-head's rows, every token of
+    // the chunk again) — converting each row ONCE per layer per chunk makes
+    // attention pure f32 math over shared staging
+    float *kf32 = malloc((size_t)(pos_last + 1) * kv_max * sizeof(float));
+    float *vf32 = malloc((size_t)(pos_last + 1) * kv_max * sizeof(float));
 
-    memcpy(x, x_in, (size_t)n_embd * sizeof(float));
+    memcpy(x, x_in, (size_t)B * n_embd * sizeof(float));
 
-    // per-layer inputs (built from the position's input row)
-    float *inp_per_layer = ple_token >= 0 ? build_per_layer(m, ple_token, x) : NULL;
+    // per-layer inputs for the whole chunk (from each position's input row)
+    float *inp_per_layer = build_per_layer_chunk(m, ple_tok, x, B);
+    const int64_t ple_total = (int64_t)ple * c->n_layer;
 
     // rope_freqs (freq_factors, stored f32) used by global/full layers only
     const float *rope_freqs = fptr(m, "rope_freqs.weight");
+
+    int staged_src = -1;   // which layer's f16 rows currently sit in kf32/vf32
 
     for (int L = 0; L < c->n_layer; L++) {
         const int local = m->is_local[L];
@@ -384,108 +447,183 @@ static void forward_core(struct model *m, struct kvcache *kv, const float *x_in,
         const float *ff = local ? NULL : rope_freqs;
 
         // ---- attention ----
-        rmsnorm(h, x, fptr_layer(m, L, "attn_norm.weight"), n_embd, eps);
+        for (int b = 0; b < B; b++)
+            rmsnorm(h + (size_t)b * n_embd, x + (size_t)b * n_embd,
+                    fptr_layer(m, L, "attn_norm.weight"), n_embd, eps);
 
-        matmul_q(q, wq_layer(m, L, "attn_q.weight"), h, n_embd, q_dim);
+        // q, k, v: independent matmuls over the same h — ONE submit. Layers
+        // past n_kv_start reuse an earlier ring and have no k/v projections.
+        const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
+        struct vkc_job jobs[3] = {
+            { .t = wq_layer(m, L, "attn_q.weight"), .out = q,  .m = q_dim  },
+            { .t = wq_layer(m, L, "attn_k.weight"), .out = kb, .m = kv_dim },
+            { .t = wv,                              .out = vb, .m = kv_dim },
+        };
+        int own = L < c->n_kv_start;
+        matmul_jobs(jobs, own ? (wv ? 3 : 2) : 1, h, n_embd, B);
+
         const float *qn = fptr_layer(m, L, "attn_q_norm.weight");
-        for (int hh = 0; hh < n_head; hh++) rmsnorm(q + hh * hd, q + hh * hd, qn, hd, eps);
-        for (int hh = 0; hh < n_head; hh++) rope_neox(q + hh * hd, hd, pos, base, ff);
+        for (int b = 0; b < B; b++) {
+            float *qb_ = q + (size_t)b * q_dim;
+            for (int hh = 0; hh < n_head; hh++) rmsnorm(qb_ + hh * hd, qb_ + hh * hd, qn, hd, eps);
+            for (int hh = 0; hh < n_head; hh++) rope_neox(qb_ + hh * hd, hd, pos0 + b, base, ff);
+        }
 
         int src = kv_src(m, L);
-        if (L < c->n_kv_start) {                 // this layer owns its KV
-            matmul_q(kb, wq_layer(m, L, "attn_k.weight"), h, n_embd, kv_dim);
-            const struct gguf_tensor *wv = wq_layer(m, L, "attn_v.weight");
-            if (wv) matmul_q(vb, wv, h, n_embd, kv_dim);
-            else    memcpy(vb, kb, (size_t)kv_dim * sizeof(float)); // no V proj: V = K projection
+        if (own) {                               // this layer owns its KV
             const float *kn = fptr_layer(m, L, "attn_k_norm.weight");
-            for (int hh = 0; hh < n_head_kv; hh++) rmsnorm(kb + hh * hd, kb + hh * hd, kn, hd, eps);
-            for (int hh = 0; hh < n_head_kv; hh++) rmsnorm_plain(vb + hh * hd, vb + hh * hd, hd, eps);
-            for (int hh = 0; hh < n_head_kv; hh++) rope_neox(kb + hh * hd, hd, pos, base, ff);
-            int row = pos % kv->seq[L];                  // ring write (identity on global layers)
-            if (kv->f16[L]) {                            // global rows round through f16 once here
-                uint16_t *kr = (uint16_t *)kv->k[L] + (size_t)row * kv_dim;
-                uint16_t *vr = (uint16_t *)kv->v[L] + (size_t)row * kv_dim;
-                for (int i = 0; i < kv_dim; i++) { kr[i] = f16_of(kb[i]); vr[i] = f16_of(vb[i]); }
-            } else {
-                memcpy((float *)kv->k[L] + (size_t)row * kv_dim, kb, (size_t)kv_dim * sizeof(float));
-                memcpy((float *)kv->v[L] + (size_t)row * kv_dim, vb, (size_t)kv_dim * sizeof(float));
+            for (int b = 0; b < B; b++) {
+                float *kbb = kb + (size_t)b * kv_dim;
+                float *vbb = vb + (size_t)b * kv_dim;
+                if (!wv) memcpy(vbb, kbb, (size_t)kv_dim * sizeof(float)); // no V proj: V = K projection
+                for (int hh = 0; hh < n_head_kv; hh++) rmsnorm(kbb + hh * hd, kbb + hh * hd, kn, hd, eps);
+                for (int hh = 0; hh < n_head_kv; hh++) rmsnorm_plain(vbb + hh * hd, vbb + hh * hd, hd, eps);
+                for (int hh = 0; hh < n_head_kv; hh++) rope_neox(kbb + hh * hd, hd, pos0 + b, base, ff);
+                int row = (pos0 + b) % kv->seq[L];           // ring write (identity on global layers)
+                if (kv->f16[L]) {                            // global rows round through f16 once here
+                    uint16_t *kr = (uint16_t *)kv->k[L] + (size_t)row * kv_dim;
+                    uint16_t *vr = (uint16_t *)kv->v[L] + (size_t)row * kv_dim;
+                    for (int i = 0; i < kv_dim; i++) { kr[i] = f16_of(kbb[i]); vr[i] = f16_of(vbb[i]); }
+                } else {
+                    memcpy((float *)kv->k[L] + (size_t)row * kv_dim, kbb, (size_t)kv_dim * sizeof(float));
+                    memcpy((float *)kv->v[L] + (size_t)row * kv_dim, vbb, (size_t)kv_dim * sizeof(float));
+                }
             }
         }
-        const void *Kc = kv->k[src], *Vc = kv->v[src];
         const int seq = kv->seq[src];                    // ring length of the owning layer
         const int kf16 = kv->f16[src];
-
-        int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
-                  ? pos - c->sliding_window + 1 : 0;
-
         const int gqa = n_head / n_head_kv;
-        int hh;
-        #pragma omp parallel for schedule(static)
-        for (hh = 0; hh < n_head; hh++) {
-            const float *qh = q + hh * hd;
-            float *ah = att + (size_t)hh * (pos + 1);
-            int kvh = hh / gqa;
-            for (int t = start; t <= pos; t++) {
-                size_t off = (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
-                float s = 0.0f;
-                for (int i = 0; i < hd; i++) s += qh[i] * kv_at(Kc, off + i, kf16);
-                ah[t] = s; // Gemma4 attention scale is 1.0 (no 1/sqrt(d))
+
+        // f16 layers: stage rows 0..pos_last as f32 once, indexed by POSITION
+        // (globals never wrap, but go through the ring map anyway); f32 rings
+        // are read in place. Every token and every head then does f32 math.
+        const float *Kf, *Vf;
+        int by_pos = kf16;
+        if (kf16) {
+            if (src != staged_src) {   // reusing layers share one source: stage once
+                const uint16_t *K16 = kv->k[src], *V16 = kv->v[src];
+                int t;
+                #pragma omp parallel for schedule(static)
+                for (t = 0; t <= pos_last; t++) {
+                    size_t src_off = (size_t)(t % seq) * kv_dim;
+                    size_t dst_off = (size_t)t * kv_dim;
+                    for (int i = 0; i < kv_dim; i++) {
+                        kf32[dst_off + i] = f16_to_f32(K16[src_off + i]);
+                        vf32[dst_off + i] = f16_to_f32(V16[src_off + i]);
+                    }
+                }
+                staged_src = src;
             }
-            softmax(ah + start, pos - start + 1);
-            float *outh = xb + hh * hd;
-            for (int i = 0; i < hd; i++) outh[i] = 0.0f;
-            for (int t = start; t <= pos; t++) {
-                size_t off = (size_t)(t % seq) * kv_dim + (size_t)kvh * hd;
-                float a = ah[t];
-                for (int i = 0; i < hd; i++) outh[i] += a * kv_at(Vc, off + i, kf16);
+            Kf = kf32; Vf = vf32;
+        } else {
+            Kf = kv->k[src]; Vf = kv->v[src];
+        }
+
+        // all B rows of this layer's KV are seated above; token b attends
+        // positions <= pos0+b, all of which now exist — causality needs only
+        // completed prefixes, exactly why chunked prefill is legal at all
+        for (int b = 0; b < B; b++) {
+            const int pos = pos0 + b;
+            int start = (local && c->sliding_window > 0 && pos - c->sliding_window + 1 > 0)
+                      ? pos - c->sliding_window + 1 : 0;
+            float *qb_ = q + (size_t)b * q_dim;
+            float *xbb = xb + (size_t)b * q_dim;
+            int hh;
+            #pragma omp parallel for schedule(static)
+            for (hh = 0; hh < n_head; hh++) {
+                const float *qh = qb_ + hh * hd;
+                float *ah = att + (size_t)hh * (pos + 1);
+                int kvh = hh / gqa;
+                for (int t = start; t <= pos; t++) {
+                    size_t off = (size_t)(by_pos ? t : t % seq) * kv_dim + (size_t)kvh * hd;
+                    const float *kr = Kf + off;
+                    float s = 0.0f;
+                    for (int i = 0; i < hd; i++) s += qh[i] * kr[i];
+                    ah[t] = s; // Gemma4 attention scale is 1.0 (no 1/sqrt(d))
+                }
+                softmax(ah + start, pos - start + 1);
+                float *outh = xbb + hh * hd;
+                for (int i = 0; i < hd; i++) outh[i] = 0.0f;
+                for (int t = start; t <= pos; t++) {
+                    size_t off = (size_t)(by_pos ? t : t % seq) * kv_dim + (size_t)kvh * hd;
+                    const float *vr = Vf + off;
+                    float a = ah[t];
+                    for (int i = 0; i < hd; i++) outh[i] += a * vr[i];
+                }
             }
         }
 
-        matmul_q(o, wq_layer(m, L, "attn_output.weight"), xb, q_dim, n_embd);
-        rmsnorm(o, o, fptr_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
-        for (int i = 0; i < n_embd; i++) x[i] += o[i];   // attn residual -> attn_out
+        matmul_qb(o, wq_layer(m, L, "attn_output.weight"), xb, q_dim, n_embd, B);
+        for (int b = 0; b < B; b++)
+            rmsnorm(o + (size_t)b * n_embd, o + (size_t)b * n_embd,
+                    fptr_layer(m, L, "post_attention_norm.weight"), n_embd, eps);
+        for (size_t i = 0; i < (size_t)B * n_embd; i++) x[i] += o[i];   // attn residual
 
         // ---- feed-forward (GeGLU); width is per-layer (elastic FFN) ----
         const int nff = m->ffn_len[L];
-        rmsnorm(h, x, fptr_layer(m, L, "ffn_norm.weight"), n_embd, eps);
-        matmul_q(g1, wq_layer(m, L, "ffn_gate.weight"), h, n_embd, nff);
-        matmul_q(g2, wq_layer(m, L, "ffn_up.weight"),   h, n_embd, nff);
-        for (int i = 0; i < nff; i++) g1[i] = gelu(g1[i]) * g2[i];
-        matmul_q(o, wq_layer(m, L, "ffn_down.weight"), g1, nff, n_embd);
-        rmsnorm(o, o, fptr_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
-        for (int i = 0; i < n_embd; i++) x[i] += o[i];   // ffn residual
+        for (int b = 0; b < B; b++)
+            rmsnorm(h + (size_t)b * n_embd, x + (size_t)b * n_embd,
+                    fptr_layer(m, L, "ffn_norm.weight"), n_embd, eps);
+        // gate and up share h: one submit. Columns pack at stride nff (the
+        // LAYER'S width) so the down matmul's input columns are contiguous.
+        struct vkc_job fjobs[2] = {
+            { .t = wq_layer(m, L, "ffn_gate.weight"), .out = g1, .m = nff },
+            { .t = wq_layer(m, L, "ffn_up.weight"),   .out = g2, .m = nff },
+        };
+        matmul_jobs(fjobs, 2, h, n_embd, B);
+        {
+            long i;
+            #pragma omp parallel for schedule(static)
+            for (i = 0; i < (long)B * nff; i++) g1[i] = gelu(g1[i]) * g2[i];
+        }
+        matmul_qb(o, wq_layer(m, L, "ffn_down.weight"), g1, nff, n_embd, B);
+        for (int b = 0; b < B; b++)
+            rmsnorm(o + (size_t)b * n_embd, o + (size_t)b * n_embd,
+                    fptr_layer(m, L, "post_ffw_norm.weight"), n_embd, eps);
+        for (size_t i = 0; i < (size_t)B * n_embd; i++) x[i] += o[i];   // ffn residual
 
         // ---- per-layer input (PLE) ----
         if (inp_per_layer) {
-            const float *ile = inp_per_layer + (size_t)L * ple;
-            matmul_q(pg, wq_layer(m, L, "inp_gate.weight"), x, n_embd, ple);
-            for (int i = 0; i < ple; i++) pg[i] = gelu(pg[i]) * ile[i];
-            matmul_q(o, wq_layer(m, L, "proj.weight"), pg, ple, n_embd);
-            rmsnorm(o, o, fptr_layer(m, L, "post_norm.weight"), n_embd, eps);
-            for (int i = 0; i < n_embd; i++) x[i] += o[i];   // PLE residual
+            matmul_qb(pg, wq_layer(m, L, "inp_gate.weight"), x, n_embd, ple, B);
+            for (int b = 0; b < B; b++) {
+                const float *ile = inp_per_layer + (size_t)b * ple_total + (size_t)L * ple;
+                float *pgb = pg + (size_t)b * ple;
+                for (int i = 0; i < ple; i++) pgb[i] = gelu(pgb[i]) * ile[i];
+            }
+            matmul_qb(o, wq_layer(m, L, "proj.weight"), pg, ple, n_embd, B);
+            for (int b = 0; b < B; b++)
+                rmsnorm(o + (size_t)b * n_embd, o + (size_t)b * n_embd,
+                        fptr_layer(m, L, "post_norm.weight"), n_embd, eps);
+            for (size_t i = 0; i < (size_t)B * n_embd; i++) x[i] += o[i];   // PLE residual
         }
 
         // ---- per-layer output scale (f32 scalar) ----
         const float *os = fptr_layer(m, L, "layer_output_scale.weight");
-        if (os) { for (int i = 0; i < n_embd; i++) x[i] *= os[0]; }
+        if (os) { for (size_t i = 0; i < (size_t)B * n_embd; i++) x[i] *= os[0]; }
     }
 
-    // final norm + tied output projection (logits = token_embd . x), then softcap.
-    // Skipped entirely for prefill (logits == NULL): a prompt token only needs
-    // its kv writes, and the head is the largest matmul in the model.
-    if (logits) {
-        rmsnorm(x, x, fptr(m, "output_norm.weight"), n_embd, eps);
+    // final norm + tied output projection (logits = token_embd . x), then
+    // softcap — for the chunk's last nlogits positions only; prefill
+    // positions have no reader and the head is the largest matmul in the model.
+    if (logits && nlogits > 0) {
+        float *xt0 = x + (size_t)(B - nlogits) * n_embd;
+        for (int t = 0; t < nlogits; t++)
+            rmsnorm(xt0 + (size_t)t * n_embd, xt0 + (size_t)t * n_embd,
+                    fptr(m, "output_norm.weight"), n_embd, eps);
+        if (hidden_out)
+            memcpy(hidden_out, xt0, (size_t)nlogits * n_embd * sizeof(float));
         if (m->last_hidden)                       // h_prev for the MTP draft head
-            memcpy(m->last_hidden, x, (size_t)n_embd * sizeof(float));
-        matmul_q(logits, wq(m, "token_embd.weight"), x, n_embd, c->n_vocab);
+            memcpy(m->last_hidden, x + (size_t)(B - 1) * n_embd, (size_t)n_embd * sizeof(float));
+        matmul_qb(logits, wq(m, "token_embd.weight"), xt0, n_embd, c->n_vocab, nlogits);
         if (c->logit_softcap > 0.0f) {
             float sc = c->logit_softcap;
-            for (int v = 0; v < c->n_vocab; v++) logits[v] = sc * tanhf(logits[v] / sc);
+            for (size_t v = 0; v < (size_t)nlogits * c->n_vocab; v++)
+                logits[v] = sc * tanhf(logits[v] / sc);
         }
     }
 
     free(x); free(h); free(q); free(kb); free(vb); free(xb);
-    free(o); free(g1); free(g2); free(att); free(pg);
+    free(o); free(g1); free(g2); free(att); free(pg); free(kf32); free(vf32);
     free(inp_per_layer);   // rope_freqs and all weights are owned by the cache
 }
 
@@ -494,19 +632,61 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
     const int n_embd = m->cfg.n_embd;
     float *erow = dequantize_row(wq(m, "token_embd.weight"), token, n_embd);
     for (int i = 0; i < n_embd; i++) erow[i] *= sqrtf((float)n_embd);
-    forward_core(m, kv, erow, token, pos, logits);
+    forward_chunk(m, kv, erow, &token, pos, 1, logits, 1, NULL);
     free(erow);
+}
+
+// The MTP verify as one batched chunk: LG_MTP_N tokens forward together, the
+// head runs over all of them, and greedy argmax walks the block. Byte-
+// identical to sequential verification by construction — each wide column
+// accumulates in the narrow kernel's element order, and out[j] is only read
+// while every earlier draft held, exactly the positions whose cache rows
+// were seated with the correct tokens (rows past the first miss hold draft
+// garbage until the real tokens rewrite them, and nothing reads them first).
+int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out) {
+    const int B = LG_MTP_N, n_embd = m->cfg.n_embd, n_vocab = m->cfg.n_vocab;
+    static float *logits = NULL, *hidden = NULL, *rows = NULL;
+    if (!logits) {
+        logits = malloc((size_t)B * n_vocab * sizeof(float));
+        hidden = malloc((size_t)B * n_embd * sizeof(float));
+        rows   = malloc((size_t)B * n_embd * sizeof(float));
+        if (!logits || !hidden || !rows) return -1;
+    }
+    const float esc = sqrtf((float)n_embd);
+    for (int b = 0; b < B; b++) {
+        float *erow = dequantize_row(wq(m, "token_embd.weight"), toks[b], n_embd);
+        if (!erow) return -1;
+        for (int i = 0; i < n_embd; i++) rows[(size_t)b * n_embd + i] = erow[i] * esc;
+        free(erow);
+    }
+    forward_chunk(m, kv, rows, toks, pos, B, logits, B, hidden);
+
+    int j = 0;
+    do {
+        const float *lb = logits + (size_t)j * n_vocab;
+        int best = 0;
+        for (int v = 1; v < n_vocab; v++) if (lb[v] > lb[best]) best = v;
+        out[j] = best;
+        j++;
+    } while (j < B && out[j - 1] == toks[j]);
+    // h_prev for the next draft: the last VALID position's hidden
+    memcpy(m->last_hidden, hidden + (size_t)(j - 1) * n_embd, (size_t)n_embd * sizeof(float));
+    return j;
 }
 
 void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
     // On PLE models a media position takes the PADDING token's (id 0)
     // per-layer row beside the usual projection of its embedding.
-    for (int i = 0; i < n; i++)
-        forward_core(m, kv, rows + (size_t)i * m->cfg.n_embd, 0, pos0 + i, NULL);
+    static const int zeros[CHUNK_MAX];
+    const int W = chunk_width();
+    for (int i = 0; i < n; i += W) {
+        int B = n - i < W ? n - i : W;
+        forward_chunk(m, kv, rows + (size_t)i * m->cfg.n_embd, zeros, pos0 + i, B, NULL, 0, NULL);
+    }
 }
 
 // Forward + greedy pick. The logits still cross back from the GPU each token
-// (a device argmax would send 4 bytes instead — a measured next step, not v1).
+// (a device argmax would send 4 bytes instead — a measured next step, not now).
 int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) {
     static float *lbuf = NULL;
     if (!lbuf) {
@@ -520,19 +700,56 @@ int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos) 
 }
 
 void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
-    // No chunking yet: each prompt token is one forward that skips the head,
-    // like the CPU backend. Chunked prefill (each weight matrix crossing DRAM
-    // once per chunk instead of once per token) is THE known next step here —
-    // it is most of the CUDA backends' prefill speed.
-    for (int i = 0; i < n; i++) model_forward(m, kv, tokens[i], pos0 + i, NULL);
+    // Chunked: W tokens share each weight pass through the wide pipeline —
+    // prefill is bandwidth-bound, so that factor is most of its cost. The
+    // outputs are bit-identical to token-at-a-time (same kernel, same order
+    // per column); only the clock moves.
+    const int n_embd = m->cfg.n_embd;
+    const int W = chunk_width();
+    const float esc = sqrtf((float)n_embd);
+    float *rows = malloc((size_t)W * n_embd * sizeof(float));
+    if (!rows) return;
+    for (int i = 0; i < n; i += W) {
+        int B = n - i < W ? n - i : W;
+        for (int b = 0; b < B; b++) {
+            float *erow = dequantize_row(wq(m, "token_embd.weight"), tokens[i + b], n_embd);
+            if (!erow) { free(rows); return; }
+            for (int j = 0; j < n_embd; j++) rows[(size_t)b * n_embd + j] = erow[j] * esc;
+            free(erow);
+        }
+        forward_chunk(m, kv, rows, tokens + i, pos0 + i, B, NULL, 0, NULL);
+    }
+    free(rows);
 }
 
 void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
                          const int *ids, int n, int pos0) {
-    // "Mixed" is just dispatch here: the packing this API exists for is a
-    // chunk-boundary story, and this backend has no chunks yet.
-    for (int i = 0; i < n; i++) {
-        if (ids[i] >= 0) model_forward(m, kv, ids[i], pos0 + i, NULL);
-        else forward_core(m, kv, rows + (size_t)(-ids[i] - 1) * m->cfg.n_embd, 0, pos0 + i, NULL);
+    // One stream, chunked without regard to the text/media seams — that is
+    // the point of this API (a turn prefilled as separate segments pays a
+    // weight pass per segment; see model.h).
+    const int n_embd = m->cfg.n_embd;
+    const int W = chunk_width();
+    const float esc = sqrtf((float)n_embd);
+    float *xin = malloc((size_t)W * n_embd * sizeof(float));
+    int ple_tok[CHUNK_MAX];
+    if (!xin) return;
+    for (int i = 0; i < n; i += W) {
+        int B = n - i < W ? n - i : W;
+        for (int b = 0; b < B; b++) {
+            int id = ids[i + b];
+            if (id >= 0) {                       // text token: embed + scale
+                float *erow = dequantize_row(wq(m, "token_embd.weight"), id, n_embd);
+                if (!erow) { free(xin); return; }
+                for (int j = 0; j < n_embd; j++) xin[(size_t)b * n_embd + j] = erow[j] * esc;
+                free(erow);
+                ple_tok[b] = id;
+            } else {                             // media row: entered as given
+                memcpy(xin + (size_t)b * n_embd,
+                       rows + (size_t)(-id - 1) * n_embd, (size_t)n_embd * sizeof(float));
+                ple_tok[b] = 0;
+            }
+        }
+        forward_chunk(m, kv, xin, ple_tok, pos0 + i, B, NULL, 0, NULL);
     }
+    free(xin);
 }

@@ -106,42 +106,66 @@ of all:
 cmake --build build --config Release --target run-vulkan
 ```
 
-Same CLI as `run`. The layering is the CPU backend's with one substitution:
-the forward stays `model-cpu.c`'s readable host code (norms, RoPE, attention
-over the host KV cache), and the quantized matmul — nearly all of a token's
-weight traffic and compute — runs as a compute shader
-(`src/vulkan/shaders/matmul.comp`, compiled per weight type by `glslc` at
-build time and embedded; q4_K, q6_K, q8_0, q4_0, f16, bf16, f32). Weights stay
-in their GGUF quantized form on the GPU, dequantized in the shader exactly as
-`quant.c` does — and on an integrated GPU they are not even copied: the GGUF
-blob is imported in place (`VK_EXT_external_memory_host`), so a 5.3 GB model
-costs 5.3 GB of the shared DRAM, once. The same zero-copy instinct as the
-Orin build, arrived at from the other side: a 16 GB laptop cannot afford the
-model twice.
+Same CLI as `run`, MTP (`-mtp`) included. The layering is the CPU backend's
+with one substitution: the forward stays `model-cpu.c`'s readable host code
+(norms, RoPE, attention over the host KV cache), and the quantized matmul —
+nearly all of a token's weight traffic and compute — runs as a compute shader
+(`src/vulkan/shaders/matmul.comp`, compiled per weight type × batch width by
+`glslc` at build time and embedded; q4_K, q6_K, q8_0, q4_0, f16, bf16, f32).
+Weights stay in their GGUF quantized form on the GPU, dequantized in the
+shader exactly as `quant.c` does — and on an integrated GPU they are not even
+copied: the GGUF blob is imported in place (`VK_EXT_external_memory_host`),
+so a 5.3 GB model costs 5.3 GB of the shared DRAM, once. The same zero-copy
+instinct as the Orin build, arrived at from the other side: a 16 GB laptop
+cannot afford the model twice.
+
+The forward runs over CHUNKS (decode: width 1): prefill batches 16 tokens
+through wide pipelines so each weight matrix crosses DRAM once per chunk
+instead of once per token; q/k/v and gate/up go down in one submit each (one
+fence round-trip, not three); and the MTP verify runs its whole block as one
+chunk through a middle-width pipeline, which is what makes an accepted draft
+nearly free. Chunked prefill and batch verify are bit-identical to
+token-at-a-time by construction — every wide column accumulates in the narrow
+kernel's element order — and the full stdout was diffed against the CPU
+reference to prove it.
 
 Measured on the machine this backend was written for (AMD Radeon integrated
-GPU, 16 GB shared DDR, Windows) — E4B Q4_K_M, same prompt, same greedy
-tokens on all three:
+GPU, 16 GB shared DDR, Windows) — E4B Q4_K_M, identical greedy tokens on
+every row:
 
-| backend                   | generation |
-|---------------------------|-----------:|
-| `run` (scalar + OpenMP)   | 1.1 tok/s  |
-| `run-vulkan`, v1 shader   | 0.8 tok/s  |
-| `run-vulkan`, coalesced   | 2.5 tok/s  |
+| backend / step                     | decode | prefill (898-tok prompt) |
+|------------------------------------|-------:|-------------------------:|
+| `run` (scalar + OpenMP)            | 1.1    | ~1.4 |
+| `run-vulkan` v1 (naive shader)     | 0.8    | 0.8  |
+| + coalesced lanes, cached readback | 2.5    | 2.5  |
+| + chunked prefill, fused submits, row tiling, staged f16 KV | **3.0** | **7.5** |
+| + MTP (`-mtp`), counting           | **3.5** | — |
 
-The two shader rows are the whole GPU lesson in miniature: v1 gave each lane
-its own 32-element group, adjacent lanes read ~144 bytes apart, and almost
-nothing coalesced; the rewrite lays lanes across each superblock so adjacent
-lanes read adjacent words, and it is 3× faster before any real tuning. The
-second doubling came from a memory-type fix on the *output* buffer — the CPU
-was reading logits back from write-combined memory, which is exactly the
-direction write-combining is slow in. `LG_VK_VERIFY=1` runs every GPU matmul
-beside the host oracle and reports the max difference (~1e-4 on 1e2-scale
-outputs: summation-order reassociation only, the dequantized values are
-bit-identical); `LG_VK_NO_IMPORT=1` forces the upload path (the A/B that
+Each step was a measured lesson: v1's lanes read ~144 bytes apart and
+coalesced nothing (~4 GB/s); logits readback from write-combined memory cost
+a 2× before the out buffer moved to host-cached; the first wide kernel did 16
+scalar x loads per weight element and prefilled a chunk no faster than
+token-at-a-time (fixed: transposed x, vec4 reads); one row per workgroup
+re-read all of x per row and drowned the chunk in L2 traffic (fixed: 4-row
+tiles); and scalar f16→f32 in the attention loop dominated long contexts
+(fixed: stage each layer's rows once per chunk). An int8 path in the CUDA
+`-i8` spirit was investigated and NOT built: this class of iGPU reports no
+accelerated integer dot product (`integerDotProduct4x8BitPackedSigned-
+Accelerated = false`), so packed int math would lower to the same scalar
+multiply-adds the float path already does. MTP on this backend pays ~1.6× a
+plain forward per verify block, so it wins on structured output (counting
+above; the CUDA table's shape) and breaks even on prose — measure your
+workload before shipping `-mtp`.
+
+Env knobs: `LG_VK_VERIFY=1` runs every GPU matmul beside the host oracle and
+reports the max difference (~1e-4 on 1e2-scale outputs: summation-order
+reassociation only, the dequantized values are bit-identical);
+`LG_VK_PREFILL_B=n` clamps the prefill chunk width (1..16, and B=1 vs B=16
+outputs diff clean); `LG_VK_NO_IMPORT=1` forces the upload path (the A/B that
 proved zero-copy costs ~nothing here); `LG_VK_DEVICE=n` picks a GPU,
-`LG_VK_VALIDATE=1` enables validation layers. Known next steps, in the CUDA
-journey's order: batch the per-matmul submits, then chunked prefill.
+`LG_VK_VALIDATE=1` enables validation layers. The known next step is the
+CUDA journey's big one: move attention and the small ops onto the GPU so a
+token is one submit instead of ~250.
 
 ## Usage
 

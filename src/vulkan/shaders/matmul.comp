@@ -1,19 +1,28 @@
 #version 450
-// The quantized matvec as a compute shader: out[row] = W[row,:] . x, weights
-// read directly in their GGUF quantized form — no f32 copy exists anywhere,
-// exactly like matmul_q in model-cpu.c. Compiled once per weight type with
-// -DQTYPE=<ggml type id> (CMake drives glslc); the dequantization is ported
-// from src/quant.c and must stay bit-identical to it — the only difference
-// vs the CPU backend is summation order (a parallel tree here, serial
-// there), the same reassociation the CUDA backends accept.
+// The quantized matmul as a compute shader: out[b][row] = W[row,:] . x[b] for
+// NB activation columns at once, weights read directly in their GGUF
+// quantized form — no f32 copy exists anywhere, exactly like matmul_q in
+// model-cpu.c. Compiled per weight type AND shape with -DQTYPE=<ggml id>
+// -DNB=<columns> -DTM=<rows per workgroup> (CMake drives glslc): NB=1/TM=1 is
+// the decode matvec, NB=16/TM=4 the wide pipeline that makes chunked prefill
+// nearly free per extra token — the weights cross DRAM once per chunk instead
+// of once per token. Each column accumulates in the same element order as the
+// NB=1 kernel, so a batched forward is bit-identical to token-at-a-time.
 //
-// Geometry: one 64-lane workgroup per output row (matches an RDNA wave);
-// rows beyond 65535 use the y dispatch dimension (n_vocab = 262144 rows for
-// the logits head). Within the row the lanes are laid out so that ADJACENT
-// LANES READ ADJACENT WORDS of the weight stream — a naive one-group-per-
-// lane version read lane-strided bytes instead, coalesced almost nothing,
-// and measured ~4 GB/s where the DRAM does tens (v1 of this file; the
-// rewrite is the same lesson every backend here learned once).
+// The wide shape earned both its numbers the hard way:
+//  - x is TRANSPOSED ([k][NB], vec4-read): the column-major first cut did NB
+//    scalar x loads per weight element and prefilled a chunk no faster than
+//    token-at-a-time.
+//  - TM rows share one pass over x: one row per workgroup re-read all of x
+//    per row — m*k*NB*4 bytes of L2 traffic per matmul, seconds per chunk of
+//    a laptop iGPU's L2. TM-row tiles load each x quad once and MAC it into
+//    TM rows' accumulators, dividing that traffic by TM.
+//
+// Geometry: one 64-lane workgroup per TM consecutive rows (matches an RDNA
+// wave); dispatches beyond 65535 groups use the y dimension (n_vocab =
+// 262144 rows for the logits head). Within a row the lanes are laid out so
+// ADJACENT LANES READ ADJACENT WORDS of the weight stream — the naive
+// one-group-per-lane version coalesced almost nothing and measured ~4 GB/s.
 //
 // Alignment: tensor offsets are 32-aligned (GGUF general.alignment), so
 // w_base is word-aligned — but q6_K blocks are 210 bytes and q8_0 blocks 34,
@@ -25,16 +34,29 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#ifndef NB
+#define NB 1
+#endif
+#ifndef TM
+#define TM 1
+#endif
+
 layout(std430, set = 0, binding = 0) readonly  buffer W  { uint  w[]; };
+#if NB == 1
 layout(std430, set = 0, binding = 1) readonly  buffer Xb { float x[]; };
+#else
+#define NQ (NB / 4)
+layout(std430, set = 0, binding = 1) readonly  buffer Xb { vec4 x4[]; };   // [k][NB] transposed
+#endif
 layout(std430, set = 0, binding = 2) writeonly buffer Ob { float o[]; };
 
 layout(push_constant) uniform PC {
     uint k;        // row length in elements (multiple of the block size)
     uint m;        // number of rows
     uint w_base;   // byte offset of the tensor inside the bound buffer (32-aligned)
-    uint x_off;    // x offset, in floats
-    uint out_off;  // out offset, in floats
+    uint x_off;    // x offset in floats (narrow pipeline only; wide x starts at 0)
+    uint out_off;  // out offset, in floats; column b writes out_off + b*m + row
+    uint nb;       // live columns, 1..NB
 } pc;
 
 // ggml type ids (mirror include/quant.h)
@@ -52,9 +74,33 @@ uint  b8(uint o)    { return (w[o >> 2] >> ((o & 3u) << 3)) & 0xFFu; }    // any
 uint  bx(uint v, uint i) { return (v >> (i << 3u)) & 0xFFu; }             // byte i of a word
 int   sx8(uint b)   { return int(b << 24) >> 24; }                        // sign-extend a byte
 
-// This lane's share of dot(W[row,:], x); the 64 partials tree-reduce in main.
-float lane_acc(uint row, uint tid) {
-    float acc = 0.0;
+// Per-lane accumulators: TM rows x NB columns. wv[] holds the TM rows'
+// dequantized values of ONE element position; MAC() folds them against that
+// element's x, loaded once.
+#if NB == 1
+float acc1[TM];
+void MAC(const float wv[TM], uint e) {
+    float xv = x[pc.x_off + e];
+    for (uint r = 0u; r < TM; ++r) acc1[r] += wv[r] * xv;
+}
+#else
+vec4 acc4[TM][NQ];
+void MAC(const float wv[TM], uint e) {
+    uint xq = e * NQ;
+    for (uint j = 0u; j < NQ; ++j) {
+        vec4 xv = x4[xq + j];
+        for (uint r = 0u; r < TM; ++r) acc4[r][j] += wv[r] * xv;
+    }
+}
+#endif
+
+// Walk this lane's share of rows row0..row0+TM-1, emitting each element
+// position once (all TM rows together). Rows past m compute garbage against
+// row m-1's bytes? No — they clamp to row 0's stream and are never written.
+void lane_run(uint row0, uint tid) {
+    uint rr[TM];
+    for (uint r = 0u; r < TM; ++r) rr[r] = row0 + r < pc.m ? row0 + r : 0u;
+    float wv[TM];
 
 #if QTYPE == T_Q4_K
     // block_q4_K, 144 bytes = 36 words: d f16, dmin f16, scales[12], qs[128].
@@ -63,18 +109,20 @@ float lane_acc(uint row, uint tid) {
     // qs byte j of 32-byte chunk c holds elements c*64+j (low nibble) and
     // c*64+32+j (high); sub-block 2c scales the lows, 2c+1 the highs.
     uint nsb = pc.k >> 8u;
-    uint rb  = (pc.w_base >> 2u) + row * nsb * 36u;
+    uint rb  = pc.w_base >> 2u;
     uint qw  = tid & 31u;
     uint c   = qw >> 3u;              // 64-chunk 0..3
     uint j   = (qw & 7u) << 2u;       // first of this word's 4 bytes in the chunk
     for (uint sb = tid >> 5u; sb < nsb; sb += 2u) {
-        uint b = rb + sb * 36u;
-        vec2 dd = unpackHalf2x16(w[b]);                    // (d, dmin)
-        uint s0 = w[b + 1u], s1 = w[b + 2u], s2 = w[b + 3u];
-        // get_scale_min_k4 for sub-blocks 2c and 2c+1 (6-bit packed scales)
-        float scl, mnl, sch, mnh;
-        {
-            uint i0 = c << 1u, i1 = i0 + 1u;               // 2c < 8 always
+        float dl[TM], ml[TM], dh[TM], mh[TM];
+        uint  qv[TM];
+        for (uint r = 0u; r < TM; ++r) {
+            uint b = rb + (rr[r] * nsb + sb) * 36u;
+            vec2 dd = unpackHalf2x16(w[b]);                    // (d, dmin)
+            uint s0 = w[b + 1u], s1 = w[b + 2u], s2 = w[b + 3u];
+            // get_scale_min_k4 for sub-blocks 2c and 2c+1 (6-bit packed scales)
+            float scl, mnl, sch, mnh;
+            uint i0 = c << 1u, i1 = i0 + 1u;                   // 2c < 8 always
             if (i0 < 4u) { scl = float(bx(s0, i0) & 63u); mnl = float(bx(s1, i0) & 63u); }
             else { uint i = i0 - 4u;
                    scl = float((bx(s2, i) & 0xFu) | ((bx(s0, i) >> 6u) << 4u));
@@ -83,17 +131,17 @@ float lane_acc(uint row, uint tid) {
             else { uint i = i1 - 4u;
                    sch = float((bx(s2, i) & 0xFu) | ((bx(s0, i) >> 6u) << 4u));
                    mnh = float((bx(s2, i) >> 4u)  | ((bx(s1, i) >> 6u) << 4u)); }
+            dl[r] = dd.x * scl; ml[r] = dd.y * mnl;            // y = d1*q - m1, as quant.c
+            dh[r] = dd.x * sch; mh[r] = dd.y * mnh;
+            qv[r] = w[b + 4u + qw];
         }
-        uint q  = w[b + 4u + qw];
-        uint xb = pc.x_off + sb * 256u + c * 64u + j;
-        float sql = 0.0, sxl = 0.0, sqh = 0.0, sxh = 0.0;
+        uint e0 = sb * 256u + c * 64u + j;
         for (uint i = 0u; i < 4u; ++i) {
-            uint by = bx(q, i);
-            float xl = x[xb + i], xh = x[xb + 32u + i];
-            sql += xl * float(by & 0xFu);  sxl += xl;
-            sqh += xh * float(by >> 4u);   sxh += xh;
+            for (uint r = 0u; r < TM; ++r) wv[r] = dl[r] * float(bx(qv[r], i) & 0xFu) - ml[r];
+            MAC(wv, e0 + i);
+            for (uint r = 0u; r < TM; ++r) wv[r] = dh[r] * float(bx(qv[r], i) >> 4u)  - mh[r];
+            MAC(wv, e0 + 32u + i);
         }
-        acc += dd.x * (scl * sql + sch * sqh) - dd.y * (mnl * sxl + mnh * sxh);
     }
 
 #elif QTYPE == T_Q6_K
@@ -101,110 +149,162 @@ float lane_acc(uint row, uint tid) {
     // only 2-aligned, hence u16 fetches. Lanes 0-31 take 128-half 0, 32-63
     // half 1; lane t covers elements 2t,2t+1 (ql low nibbles) and +64 (high).
     // Element e of a half uses qh[e&31] shifted by 2*(e>>5), and scale
-    // (half*128+e)>>4 — quant.c's dequant_q6_K, relaid per lane.
+    // (half*128+e)>>4 — quant.c's dequant_q6_K, relaid per lane. 2t and 2t+1
+    // never straddle a 16-element scale group (2t is even), so one scale
+    // pair covers a lane's superblock share.
     uint nsb = pc.k >> 8u;
-    uint rb  = pc.w_base + row * nsb * 210u;
     uint ch  = tid >> 5u;
     uint t   = tid & 31u;
     uint shl = (t >= 16u) ? 2u : 0u;             // qh shift for elems 2t,2t+1
     for (uint sb = 0u; sb < nsb; ++sb) {
-        uint b   = rb + sb * 210u;
-        float d  = f16e(b + 208u);
-        uint ql  = u16(b + ch * 64u + 2u * t);             // bytes 2t, 2t+1
-        uint qh  = u16(b + 128u + ch * 32u + ((2u * t) & 31u));
-        uint scb = b + 192u + ch * 8u;
-        uint xb  = pc.x_off + sb * 256u + ch * 128u + 2u * t;
-        float s = 0.0;
-        for (uint i = 0u; i < 2u; ++i) {
-            uint qlv = bx(ql, i), qhv = bx(qh, i);
-            uint e   = 2u * t + i;                       // low element, 0..63 in the half
-            int lo = int((qlv & 0xFu) | (((qhv >> shl)        & 3u) << 4u)) - 32;
-            int hi = int((qlv >> 4u)  | (((qhv >> (shl + 4u)) & 3u) << 4u)) - 32;
-            float sl = float(sx8(b8(scb + (e >> 4u))));        // i8 scale, elems e
-            float sh = float(sx8(b8(scb + 4u + (e >> 4u))));   // i8 scale, elems e+64
-            s += sl * float(lo) * x[xb + i] + sh * float(hi) * x[xb + 64u + i];
+        float dsl[TM], dsh[TM];
+        uint  qlv[TM], qhv[TM];
+        for (uint r = 0u; r < TM; ++r) {
+            uint b   = pc.w_base + (rr[r] * nsb + sb) * 210u;
+            float d  = f16e(b + 208u);
+            uint scb = b + 192u + ch * 8u;
+            dsl[r] = d * float(sx8(b8(scb + (t >> 3u))));        // elems 2t,2t+1
+            dsh[r] = d * float(sx8(b8(scb + 4u + (t >> 3u))));   // elems +64
+            qlv[r] = u16(b + ch * 64u + 2u * t);                 // bytes 2t, 2t+1
+            qhv[r] = u16(b + 128u + ch * 32u + ((2u * t) & 31u));
         }
-        acc += d * s;
+        uint e0 = sb * 256u + ch * 128u + 2u * t;
+        for (uint i = 0u; i < 2u; ++i) {
+            for (uint r = 0u; r < TM; ++r) {
+                uint ql = bx(qlv[r], i), qh = bx(qhv[r], i);
+                wv[r] = dsl[r] * float(int((ql & 0xFu) | (((qh >> shl) & 3u) << 4u)) - 32);
+            }
+            MAC(wv, e0 + i);
+            for (uint r = 0u; r < TM; ++r) {
+                uint ql = bx(qlv[r], i), qh = bx(qhv[r], i);
+                wv[r] = dsh[r] * float(int((ql >> 4u) | (((qh >> (shl + 4u)) & 3u) << 4u)) - 32);
+            }
+            MAC(wv, e0 + 64u + i);
+        }
     }
 
 #elif QTYPE == T_Q8_0
     // block_q8_0, 34 bytes: d f16, qs[32] i8 — 2-aligned. Four blocks in
     // flight: lane = (block, u16 slot of its 16), two elements per lane.
-    uint nb = pc.k >> 5u;
-    uint rb = pc.w_base + row * nb * 34u;
+    uint nblk = pc.k >> 5u;
     uint t  = tid & 15u;
-    for (uint blk = tid >> 4u; blk < nb; blk += 4u) {
-        uint b  = rb + blk * 34u;
-        float d = f16e(b);
-        uint v  = u16(b + 2u + 2u * t);
-        uint xb = pc.x_off + (blk << 5u) + 2u * t;
-        acc += d * (float(sx8(bx(v, 0u))) * x[xb] + float(sx8(bx(v, 1u))) * x[xb + 1u]);
+    for (uint blk = tid >> 4u; blk < nblk; blk += 4u) {
+        float d[TM];
+        uint  v[TM];
+        for (uint r = 0u; r < TM; ++r) {
+            uint b = pc.w_base + (rr[r] * nblk + blk) * 34u;
+            d[r] = f16e(b);
+            v[r] = u16(b + 2u + 2u * t);
+        }
+        uint e0 = (blk << 5u) + 2u * t;
+        for (uint r = 0u; r < TM; ++r) wv[r] = d[r] * float(sx8(bx(v[r], 0u)));
+        MAC(wv, e0);
+        for (uint r = 0u; r < TM; ++r) wv[r] = d[r] * float(sx8(bx(v[r], 1u)));
+        MAC(wv, e0 + 1u);
     }
 
 #elif QTYPE == T_Q4_0
     // block_q4_0, 18 bytes: d f16, qs[16] — element j low nibble, j+16 high.
     // Eight blocks in flight: lane = (block, u16 slot of its 8).
-    uint nb = pc.k >> 5u;
-    uint rb = pc.w_base + row * nb * 18u;
+    uint nblk = pc.k >> 5u;
     uint t  = tid & 7u;
-    for (uint blk = tid >> 3u; blk < nb; blk += 8u) {
-        uint b  = rb + blk * 18u;
-        float d = f16e(b);
-        uint v  = u16(b + 2u + 2u * t);
-        uint xb = pc.x_off + (blk << 5u) + 2u * t;
+    for (uint blk = tid >> 3u; blk < nblk; blk += 8u) {
+        float d[TM];
+        uint  v[TM];
+        for (uint r = 0u; r < TM; ++r) {
+            uint b = pc.w_base + (rr[r] * nblk + blk) * 18u;
+            d[r] = f16e(b);
+            v[r] = u16(b + 2u + 2u * t);
+        }
+        uint e0 = (blk << 5u) + 2u * t;
         for (uint i = 0u; i < 2u; ++i) {
-            uint by = bx(v, i);
-            acc += d * (float(int(by & 0xFu) - 8) * x[xb + i]
-                      + float(int(by >> 4u)  - 8) * x[xb + 16u + i]);
+            for (uint r = 0u; r < TM; ++r) wv[r] = d[r] * float(int(bx(v[r], i) & 0xFu) - 8);
+            MAC(wv, e0 + i);
+            for (uint r = 0u; r < TM; ++r) wv[r] = d[r] * float(int(bx(v[r], i) >> 4u)  - 8);
+            MAC(wv, e0 + 16u + i);
         }
     }
 
 #elif QTYPE == T_F16
     // lane-strided whole words: perfectly coalesced, two elements per load
     uint words = pc.k >> 1u;
-    uint rw = (pc.w_base >> 2u) + row * words;
     for (uint wi = tid; wi < words; wi += 64u) {
-        vec2 hv = unpackHalf2x16(w[rw + wi]);
-        uint xb = pc.x_off + 2u * wi;
-        acc += hv.x * x[xb] + hv.y * x[xb + 1u];
+        vec2 hv[TM];
+        for (uint r = 0u; r < TM; ++r)
+            hv[r] = unpackHalf2x16(w[(pc.w_base >> 2u) + rr[r] * words + wi]);
+        for (uint r = 0u; r < TM; ++r) wv[r] = hv[r].x;
+        MAC(wv, 2u * wi);
+        for (uint r = 0u; r < TM; ++r) wv[r] = hv[r].y;
+        MAC(wv, 2u * wi + 1u);
     }
 
 #elif QTYPE == T_BF16
     // bf16 is the top 16 bits of an f32; a word is a (lo, hi) element pair
     uint words = pc.k >> 1u;
-    uint rw = (pc.w_base >> 2u) + row * words;
     for (uint wi = tid; wi < words; wi += 64u) {
-        uint pair = w[rw + wi];
-        uint xb = pc.x_off + 2u * wi;
-        acc += uintBitsToFloat(pair << 16)          * x[xb]
-             + uintBitsToFloat(pair & 0xFFFF0000u) * x[xb + 1u];
+        uint pair[TM];
+        for (uint r = 0u; r < TM; ++r)
+            pair[r] = w[(pc.w_base >> 2u) + rr[r] * words + wi];
+        for (uint r = 0u; r < TM; ++r) wv[r] = uintBitsToFloat(pair[r] << 16);
+        MAC(wv, 2u * wi);
+        for (uint r = 0u; r < TM; ++r) wv[r] = uintBitsToFloat(pair[r] & 0xFFFF0000u);
+        MAC(wv, 2u * wi + 1u);
     }
 
 #elif QTYPE == T_F32
-    uint rw = (pc.w_base >> 2u) + row * pc.k;
-    for (uint e = tid; e < pc.k; e += 64u)
-        acc += uintBitsToFloat(w[rw + e]) * x[pc.x_off + e];
+    for (uint e = tid; e < pc.k; e += 64u) {
+        for (uint r = 0u; r < TM; ++r)
+            wv[r] = uintBitsToFloat(w[(pc.w_base >> 2u) + rr[r] * pc.k + e]);
+        MAC(wv, e);
+    }
 
 #else
 #error "unknown QTYPE"
 #endif
-
-    return acc;
 }
 
+#if NB == 1
 shared float red[64];
+#else
+shared vec4 red4[64 * NQ];
+#endif
 
 void main() {
-    // row index: y extends the dispatch past the 65535-per-dimension limit
-    uint row = gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x;
-    if (row >= pc.m) return;               // uniform per workgroup: safe before barrier()
+    // TM rows per workgroup; y extends past the 65535-per-dimension limit
+    uint row0 = (gl_WorkGroupID.y * 32768u + gl_WorkGroupID.x) * uint(TM);
+    if (row0 >= pc.m) return;              // uniform per workgroup: safe before barrier()
     uint tid = gl_LocalInvocationID.x;
-    red[tid] = lane_acc(row, tid);
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (tid < s) red[tid] += red[tid + s];
+#if NB == 1
+    for (uint r = 0u; r < TM; ++r) acc1[r] = 0.0;
+    lane_run(row0, tid);
+    for (uint r = 0u; r < TM; ++r) {
+        red[tid] = acc1[r];
         barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        if (tid == 0u && row0 + r < pc.m)
+            o[pc.out_off + row0 + r] = red[0];
+        barrier();                         // red is reused by the next r
     }
-    if (tid == 0u)
-        o[pc.out_off + row] = red[0];
+#else
+    for (uint r = 0u; r < TM; ++r)
+        for (uint j = 0u; j < NQ; ++j) acc4[r][j] = vec4(0.0);
+    lane_run(row0, tid);
+    for (uint r = 0u; r < TM; ++r) {
+        for (uint j = 0u; j < NQ; ++j) red4[tid * NQ + j] = acc4[r][j];
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s)
+                for (uint j = 0u; j < NQ; ++j)
+                    red4[tid * NQ + j] += red4[(tid + s) * NQ + j];
+            barrier();
+        }
+        if (tid == 0u && row0 + r < pc.m)
+            for (uint b = 0u; b < pc.nb; ++b)
+                o[pc.out_off + b * pc.m + row0 + r] = red4[b >> 2u][b & 3u];
+        barrier();                         // red4 is reused by the next r
+    }
+#endif
 }
