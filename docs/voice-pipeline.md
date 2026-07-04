@@ -47,10 +47,10 @@ voicecat /tmp/lg.sock \
 ```
 
 To replay a recording as if it were live (for reproducible runs), swap
-the mic for `--stdin-pcm --rt` and pipe mono 16 kHz s16 PCM in; `--rt`
-deadline-paces the file at wall-clock rate so ASR passes overlap
+the mic for `--stdin-pcm --realtime` and pipe mono 16 kHz s16 PCM in;
+`--realtime` deadline-paces the file at wall-clock rate so ASR passes overlap
 "capture" exactly as they would against a real mic. (A live mic needs no
-`--rt` — the hardware paces itself.)
+pacing flag — the hardware paces itself.)
 
 Variants:
 
