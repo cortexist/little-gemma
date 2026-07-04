@@ -333,7 +333,10 @@ retraining, no re-export; verified identical on an official voice and on
 our own finetune. At overlap R=16 frames the chunked decode saturates at
 max sample difference 4e-7 vs the monolithic output (fp32 noise), on
 both test machines. The streaming service (a drop-in for
-`piper --output-raw`) then emits 0.12 s chunks as they decode.
+`piper --output-raw`) then emits 0.12 s chunks as they decode. The
+implementation ships in our piper fork as `python -m piper.split` plus a
+`--stream` CLI flag and `synthesize_stream()` API, with an exactness test
+suite; it is a candidate for an upstream contribution.
 
 End-to-end on the Orin, everything included (phonemization, encoder,
 first chunk, pipe): **first PCM 0.10 s** where the monolithic call took
@@ -589,8 +592,10 @@ Every number traces to a committed harness: the dictation clients
 (client-side clocks, three delivery modes), the TTS timing scripts, the
 memory sampler (anon+nvmap), and the engineering journals including
 falsified attempts. Replies are byte-identical across delivery modes and
-quantization levels by gate. [TODO: decide what of .scratch/ gets promoted
-into the repo or a companion artifact for submission.]
+quantization levels by gate. The streaming vocoder ships in our piper fork
+(split tool + streaming API + tests); [TODO: decide what of the remaining
+measurement harnesses gets promoted into a companion artifact for
+submission.]
 
 ## Appendix B: numbers still to fill / verify
 

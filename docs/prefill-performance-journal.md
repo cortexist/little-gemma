@@ -1394,3 +1394,13 @@ the whole clause); the service ships VITS's native level with a fixed
 gain. And one measurement note: the in-process bench understated first
 byte by the espeak phonemization cost — the service-level number (0.10)
 is the honest one; always clock through the pipe.
+
+Productionized same day in our piper fork (cortexist/piper1-gpl, branch
+vits-streaming, 7e03c15): `python -m piper.split <voice>` writes the
+halves, `PiperVoice.load(streaming=True)` + `synthesize_stream()` or the
+CLI's `--output-raw --stream` consume them; boundary discovery is
+automatic, tests build a miniature VITS graph by hand (no bundled
+voice needed), full suite 22/22. i7 CLI first byte 0.19 → 0.05 s /
+0.37 → 0.09 s. Upstream PR candidate once proven general. Repo
+convention note: piper models now live under local/ (gitignored), not
+data/ — both machines.
