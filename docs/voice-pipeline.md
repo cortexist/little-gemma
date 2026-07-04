@@ -38,13 +38,19 @@ python3 -m piper.split ~/voices/en_US-kristin-medium.onnx
     -s   /tmp/lg.sock &
 
 # 2. ears | glue | mouth — one shell pipeline, mic to speaker
-voicecat /tmp/lg.sock --rt \
+voicecat /tmp/lg.sock \
     --whisper-bin   ~/repos/whisper.cpp/build/bin/whisper-cli \
     --whisper-model ~/repos/whisper.cpp/models/ggml-base.en.bin \
   | python3 bench/clause_pipe.py \
   | piper -m ~/voices/en_US-kristin-medium.onnx --output-raw --stream \
   | aplay -r 22050 -f S16_LE -t raw -c 1 -
 ```
+
+To replay a recording as if it were live (for reproducible runs), swap
+the mic for `--stdin-pcm --rt` and pipe mono 16 kHz s16 PCM in; `--rt`
+deadline-paces the file at wall-clock rate so ASR passes overlap
+"capture" exactly as they would against a real mic. (A live mic needs no
+`--rt` — the hardware paces itself.)
 
 Variants:
 
