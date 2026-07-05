@@ -107,15 +107,29 @@ like any other frame.
 - The `M` payload is the raw meta string — the pipe does not interpret it;
   meaning belongs to the two ends (the finetuned model and the rig).
 
-## Reliability: the finetune, not the prompt
+## Reliability: prompt-only is a tier question (measured 2026-07-05)
 
-Small models cannot be trusted to emit strict formats from prompting alone
-(known from tool calling; measured here when style pressure made the 2B
-confidently wrong). Mood tags join the existing finetune plan — human pause
-placement and early clause boundaries are the same species of task:
-**speech-production annotations woven into generated text**. One training
-story covers all three, and strict-format reliability is exactly what a
-finetune buys.
+With the tool taught in `voice-sys.txt` (exact span + the four emotion
+names), raw probes on the Orin:
+
+- **E2B QAT**: emits *nothing* — "please comfort me, and sound sad" produces
+  pure prose with no tool-call attempt at all. Prompt-only does not reach
+  the 2B tier.
+- **12B**: emits the span **exactly**, first try, both directions — sad
+  prompt → `set_voice{…sad…}` then prose; "sound cheerful" →
+  `set_voice{…happy…}` then the joke — and correctly emits *no* span on a
+  neutral factual question ("what is two plus two"). On the 12B tier the
+  emotion face works today, prompt-only.
+
+So the finetune is the gating item **for the small models only** — and mood
+tags join the existing finetune plan there. Human pause placement and early
+clause boundaries are the same species of task: **speech-production
+annotations woven into generated text**. One training story covers all
+three, and strict-format reliability is exactly what a finetune buys.
+
+(Operational note: the 12B does not co-reside with the E2B serve on a 16GB
+Orin — 5.5GB + 7.1GB blobs OOM NvMap; probing the 12B means stopping the
+E2B stack first, and the 12B load wants `drop_caches`, same as llama-bench.)
 
 ## Pointers
 
