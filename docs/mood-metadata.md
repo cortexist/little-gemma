@@ -1,9 +1,9 @@
 # Mood metadata through the voice pipeline — design note
 
-*Status: designed, deferred. 2026-07-04. The plumbing is a ~day of work; the
-gating item is a finetune. Written down now because humanoids and visual
-assistants are drawing attention fast, and this requirement may arrive
-sooner than planned.*
+*Status: PLUMBING SHIPPED 2026-07-05; the finetune remains the gating item
+for the model emitting tags reliably. The mechanism chosen is in-band
+tool-call control lines (below), which replaced the JSON-lines idea from the
+first draft of this note.*
 
 ## The requirement
 
@@ -38,7 +38,36 @@ LLM (mood tags in the reply stream)
 - **The demo mouth is `currentColor` line art** — tinting the face by mood
   is a CSS one-liner.
 
-## The two doors to build
+## The mechanism, as shipped
+
+The LLM emits a tool-call span; clausecat passes allowed spans through as
+their own lines; piper consumes them and reports downstream:
+
+```
+<|tool_call>call:set_voice{speaker_id:<|"|>happy<|"|>}<tool_call|>
+```
+
+- `clausecat --allow-control-token '<|tool_call>call:set_voice{*}<tool_call|>'`
+  passes matching spans through verbatim, ordered against the clauses;
+  non-matching spans are dropped WHOLE (fixing a latent leak: a tool call's
+  payload used to reach TTS as speech). Twin: `bench/clause_pipe.py`,
+  differential feed `bench/clause_cases.txt`.
+- piper (fork branch `phoneme-stream`): `piper.control` parses the line
+  (marker-token dialect agnostic); `set_voice` retargets the speaker by name
+  (the voice's `speaker_id_map` — e.g. happy/sad/neutral) or number for every
+  following clause; `--output-mux` writes it as an `M` frame BEFORE the audio
+  it colors; `piper.demux` prints `meta<TAB>payload` events.
+- Multi-speaker voices condition their decoder on the speaker embedding — a
+  SECOND boundary tensor — so the split carries all crossing tensors and the
+  streaming decode feeds conditioning whole to every chunk (verified on
+  en_US-arctic-medium, 18 speakers: distinct audio per speaker, chunked ==
+  monolithic to fp32 noise).
+
+Not yet wired: voicedemo's inline clause splitter (the browser demo) does not
+pass control spans yet — add its allowlist when the browser should react to
+`M` frames (mood-tinting the mouth is a CSS one-liner).
+
+## The original design sketch (superseded where it disagrees)
 
 **1. The clause policy becomes parse-don't-strip.** Today `speakable()`
 removes *anything* in angle brackets (`<[^<>]{1,24}>`) — a mood marker like

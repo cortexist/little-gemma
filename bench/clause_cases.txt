@@ -1,0 +1,6 @@
+<|channel>think hard<channel|>Paris became the capital, of France in 1806. Napoleon moved it there.<turn|>
+Happy now. <|tool_call>call:set_voice{speaker_id:<|"|>happy<|"|>}<tool_call|>This clause is happy, isn't it? Yes.<turn|>
+Before. <|tool_call>call:do_other{x:1}<tool_call|>The other call payload must not be spoken. After.<turn|>
+Mid, clause <|tool_call>call:set_voice{speaker_id:<|"|>sad<|"|>}<tool_call|>then sad text. Done.<turn|>
+<|tool_call>unterminated span at turn end, never spoken
+Ratio is 5:5 not a clause, but this is one, right? Yes.<turn|>
