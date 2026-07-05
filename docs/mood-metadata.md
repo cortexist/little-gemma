@@ -63,9 +63,12 @@ their own lines; piper consumes them and reports downstream:
   en_US-arctic-medium, 18 speakers: distinct audio per speaker, chunked ==
   monolithic to fp32 noise).
 
-Not yet wired: voicedemo's inline clause splitter (the browser demo) does not
-pass control spans yet — add its allowlist when the browser should react to
-`M` frames (mood-tinting the mouth is a CSS one-liner).
+voicedemo is wired too (2026-07-05): its inline splitter runs the same
+span machine, forwards `set_voice` lines to piper, and the page shows the
+active voice next to the lipsync — one-stroke faces for
+happy/sad/neutral/angry, a bust plus the name otherwise, in the mouth's
+line-art language. In mux mode piper's validated `M` frame drives it; in
+raw mode the app reports the value itself.
 
 ## The original design sketch (superseded where it disagrees)
 
