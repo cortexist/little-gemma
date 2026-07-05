@@ -112,17 +112,21 @@ like any other frame.
 With the tool taught in `voice-sys.txt` (exact span + the four emotion
 names), raw probes on the Orin:
 
-- **E2B QAT**: emits *nothing* — "please comfort me, and sound sad" produces
-  pure prose with no tool-call attempt at all. Prompt-only does not reach
-  the 2B tier.
+- **E2B QAT**: "please comfort me, and sound sad" produces pure prose with
+  no tool-call attempt — *implicit* emotional content does not elicit the
+  span. But a **direct instruction works**: "tell me a story in happy voice"
+  emitted the span and turned the face happy in the live demo (user-observed,
+  2026-07-05). The 2B follows explicit commands, not tone inference.
 - **12B**: emits the span **exactly**, first try, both directions — sad
   prompt → `set_voice{…sad…}` then prose; "sound cheerful" →
   `set_voice{…happy…}` then the joke — and correctly emits *no* span on a
   neutral factual question ("what is two plus two"). On the 12B tier the
   emotion face works today, prompt-only.
 
-So the finetune is the gating item **for the small models only** — and mood
-tags join the existing finetune plan there. Human pause placement and early
+So the finetune is the gating item **for implicit emotion on the small
+models only** (community tool-calling finetunes of the same class — e.g.
+supergemma on HF — are the known remedy), and mood tags join the existing
+finetune plan there. Human pause placement and early
 clause boundaries are the same species of task: **speech-production
 annotations woven into generated text**. One training story covers all
 three, and strict-format reliability is exactly what a finetune buys.
