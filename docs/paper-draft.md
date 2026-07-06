@@ -24,9 +24,9 @@ A voice assistant is *fluent* when its reply begins within the human
 turn-taking window — first audio in well under a second — and *cohesive* when
 the thing replying is a full large language model rather than an intent
 router. Production voice AI today gets one or the other: datacenter cascades
-median 1.4–1.7 s to first audio [TODO cite hamming.ai], and the systems that
+median 1.4–1.7 s to first audio [1,2], and the systems that
 beat the window do it with purpose-trained speech-to-speech models (Moshi
-[TODO cite arXiv:2410.00037]) that give up the text LLM's generality. We show
+[3]) that give up the text LLM's generality. We show
 both are achievable at the same time, entirely on a 20 W, credit-card-sized
 edge board, using unmodified state-of-the-art open-weight models.
 
@@ -58,12 +58,12 @@ compute-bound.
 
 ## 1. Introduction
 
-Conversation has a clock. Human turn transitions cluster around 200–500 ms
-[TODO cite arXiv:2404.16053 + Stivers et al. 2009]; beyond one second a
-reply reads as hesitation, and industry telemetry places the median
-production voice agent at 1.4–1.7 s with a P90 of 3–5 s — the region of
-talk-overs and user frustration [TODO cite hamming.ai]. We name the two
-properties this paper pursues:
+Conversation has a clock. Human turn transitions cluster tightly around a
+near-zero modal gap, with a cross-linguistic mean of roughly 200 ms [4];
+beyond one second a reply reads as hesitation, and industry telemetry
+places the median production voice agent at 1.4–1.7 s with a P90 of
+3.3–3.8 s (P95 4.3–5.4 s) — the region of talk-overs and user frustration
+[1,2]. We name the two properties this paper pursues:
 
 - **Fluent**: time from end of user speech to the first audio sample of the
   reply (TTFB) under one second — inside or adjacent to the human window.
@@ -74,7 +74,7 @@ properties this paper pursues:
 
 The two properties pull apart because of where each is cheap. Datacenter
 cascades are cohesive but pay network, queueing, and orchestration latency.
-Speech-native full-duplex models such as Moshi [TODO cite] are strikingly
+Speech-native full-duplex models such as Moshi [3] are strikingly
 fluent — we measure ~130 ms TTFB on an RTX A5000 — but are purpose-trained
 speech models (a ~7B Helium backbone fused to a neural codec), trained once,
 at great cost, with the conversational behavior baked in: no drop-in model
@@ -130,10 +130,13 @@ Contributions:
 
 ## 2. Related work
 
-**Speech-native duplex models.** Moshi [TODO cite arXiv:2410.00037] fuses a
+**Speech-native duplex models.** Moshi [3] fuses a
 7B text backbone with the Mimi streaming codec and full-duplex dialogue
-training; it reports ~160 ms theoretical / 200 ms practical latency on an
-NVIDIA L4 (24 GB, ~72 W TDP datacenter card); we measure ~130 ms TTFB warm on
+training; the paper itself reports a theoretical latency of 160 ms, 200 ms
+in practice [3] (the reference implementation attributes this practical
+figure to an NVIDIA L4 — 24 GB, ~72 W TDP datacenter card — a hardware
+detail from the project repository rather than the paper text [5,6]); we
+measure ~130 ms TTFB warm on
 an RTX A5000 (trials 252/129/135 ms; the ~23 ms WebSocket handshake is
 excluded by construction — the clock starts when the client begins streaming
 audio, after the handshake byte). Two disclosures make this number
@@ -141,17 +144,16 @@ conservative in Moshi's favor: our run used the uncompiled PyTorch q8 path
 (torch.compile is broken on Windows), and the clock anchors at the *start*
 of input streaming, measuring the full-duplex loop latency (~one 80 ms Mimi
 frame + one model step) rather than a turn response; §7 discusses the anchor
-mismatch with our end-of-speech metric. Mini-omni and successors [TODO cite] follow the
+mismatch with our end-of-speech metric. Mini-Omni and its successor [7,8] follow the
 same species. These systems set the fluency bar, at the price of a fixed,
 purpose-trained model: the backbone is frozen into a speech topology, so the
 brain cannot be swapped for next quarter's better open-weight release, and
 text-ecosystem capabilities (tools, structured output, long instructions,
 vision) regress to what the speech training preserved.
 
-**Cascaded voice pipelines.** Commercial stacks (Pipecat, LiveKit Agents,
-[TODO cite]) cascade ASR → LLM → TTS and already stream at *existing*
-sentence punctuation. HuggingFace's speech-to-speech (v0.2.10 [TODO cite
-repo]) is the closest published relative — open-weight, modular, LLM over
+**Cascaded voice pipelines.** Commercial stacks (Pipecat [9], LiveKit Agents
+[10]) cascade ASR → LLM → TTS and already stream at *existing*
+sentence punctuation. HuggingFace's speech-to-speech (v0.2.10 [11]) is the closest published relative — open-weight, modular, LLM over
 an OpenAI-compatible HTTP endpoint — and we benchmark it head-to-head on
 our board with our exact LLM (§5.9). Our measurements locate the latencies
 these stacks leave on the table: prefill of the growing turn (hidden under
@@ -159,7 +161,7 @@ speech, §4.2), the absence of early punctuation to flush on (created by
 the model itself, §4.3), and whole-sentence TTS synthesis before the
 first sample (§4.4).
 
-**Local inference runtimes.** llama.cpp [TODO cite] is the gold-standard
+**Local inference runtimes.** llama.cpp [12] is the gold-standard
 general local runtime, and its throughput numbers are the reference we
 benchmark against (§5.2). The pursuit of TTFB, however, is a different race
 than tokens/second: it rewards an *appendable* conversation abstraction
@@ -173,11 +175,11 @@ does not: on the same Orin, matching ~0.8× of llama.cpp's prefill while
 — reaching first-sentence 18–48× earlier on multimodal turns (§5.2, thought
 suppression and encode-off-critical-path).
 
-**Streaming ASR.** whisper_streaming / LocalAgreement-2 [TODO cite Machacek
-et al.] provides the commit semantics our prefill rides on; the ASR side is
+**Streaming ASR.** whisper_streaming / LocalAgreement-2 [13]
+provides the commit semantics our prefill rides on; the ASR side is
 prior art we consume, not a contribution.
 
-**Speculative decoding.** EAGLE, Medusa, self-speculation [TODO cite]. Gemma
+**Speculative decoding.** EAGLE [14], Medusa [15], self-speculation. Gemma
 4 ships a first-party MTP head; our contribution is not the mechanism but
 the honest characterization (content- and head-width-dependence) and the
 energy angle (§4.5), which the edge literature largely lacks.
@@ -186,8 +188,9 @@ energy angle (§4.5), which the edge literature largely lacks.
 
 Hardware: Jetson Orin NX 16GB module (Ampere iGPU, shared LPDDR5), NVMe SSD,
 JetPack 6.2.1, headless. Rationale: the NX is the robotics operating point —
-credit-card footprint, 10–25 W envelope (40 W MAXN available), ~$700-class
-[TODO verify price]. The AGX buys performance with a power/cost step that
+credit-card footprint, 10–25 W envelope (40 W MAXN available), ~$600-class
+as a bare module (1KU pricing) or ~$900-class as a complete carrier-board
+dev kit [16]. The AGX buys performance with a power/cost step that
 changes the product class; the Nano 8GB cannot hold the 12B tier (§5.6
 qualifies what it *can* hold).
 
@@ -379,7 +382,7 @@ mmap'd and unpinned where the quantization is repacked anyway. Every
 optimization is gated byte-identical against a f32 reference and, for the
 speculative path, by acceptance-rate tripwires (which caught three real
 bugs). Full engineering logs, including the falsified dead ends, are in the
-repository journals [TODO cite repo]. The result on the Orin: ~0.8× of
+repository journals [17]. The result on the Orin: ~0.8× of
 llama.cpp's prefill throughput and 1.17–1.26× its decode, from a codebase a
 single reviewer can actually read (~6,000 lines).
 
@@ -454,7 +457,7 @@ likely pulls live-mic TTFB near the dictation number].
 
 One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 
-| tier | intelligence | TTFB (paced) | where it lands [TODO cite hamming] |
+| tier | intelligence | TTFB (paced) | where it lands [1,2] |
 |---|---|---:|---|
 | 12B | strongest open-weight ≤16GB | ~3.4 s | "common experience" (P90 region) |
 | E4B | high | ~1.35 s | just under the industry median (1.4–1.7 s) |
@@ -489,9 +492,11 @@ measured on the NX 16GB against an 8 GB budget, not yet on the Nano SKU
 GPU-saturated decode peaks ~23 W (default profile; 40 W MAXN raises clocks
 but the workload is bandwidth-bound), idle-to-peak on a supply a robot
 already carries. MTP reduces J/token 2.85 → 2.29 (§4.5). Moshi's reference
-deployment is an L4: 24 GB, ~72 W TDP datacenter card [TODO complete the
-note: "despite they got 100..." — finish this sentence from the Moshi paper
-data].
+deployment is an L4: 24 GB, ~72 W TDP datacenter card [5,6]
+[TODO: the "despite they got 100..." comparison could not be verified against
+the Moshi paper — its only "H100" mention is for TRAINING compute ("all
+models are trained on H100 GPUs"), not an inference-latency comparison;
+either complete this from a source outside the paper, or drop the aside].
 
 ### 5.8 Cross-silicon: the cascade vs Moshi on Moshi's hardware class
 
@@ -671,6 +676,77 @@ a good trade for most embodied products.
 
 ---
 
+## References
+
+[1] S. Sharma. "Voice AI Latency: What's Fast, What's Slow, and How to Fix
+    It." Hamming AI, Jan. 12, 2026.
+    https://hamming.ai/resources/voice-ai-latency-whats-fast-whats-slow-how-to-fix-it
+
+[2] Hamming AI. "Voice Agent Evaluation Metrics: Definitions, Formulas &
+    Benchmarks." Jan. 18, 2026.
+    https://hamming.ai/resources/voice-agent-evaluation-metrics-guide
+    (methodology: 4M+ production voice-agent calls, 10K+ agents, 2025-2026)
+
+[3] A. Défossez, L. Mazaré, M. Orsini, A. Royer, P. Pérez, H. Jégou,
+    E. Grave, N. Zeghidour. "Moshi: a speech-text foundation model for
+    real-time dialogue." arXiv:2410.00037, 2024.
+    https://arxiv.org/abs/2410.00037
+
+[4] T. Stivers, N. J. Enfield, P. Brown, C. Englert, M. Hayashi,
+    T. Heinemann, G. Hoymann, F. Rossano, J. P. de Ruiter, K.-E. Yoon,
+    S. C. Levinson. "Universals and cultural variation in turn-taking in
+    conversation." Proceedings of the National Academy of Sciences,
+    106(26), 10587-10592, 2009. DOI: 10.1073/pnas.0903616106
+
+[5] Kyutai Labs. "Moshi" (GitHub repository).
+    https://github.com/kyutai-labs/moshi — source of the L4/24GB
+    deployment detail; not stated in [3] itself.
+
+[6] NVIDIA. "NVIDIA L4 Tensor Core GPU" datasheet.
+    https://www.nvidia.com/en-us/data-center/l4/
+
+[7] Z. Xie, C. Wu. "Mini-Omni: Language Models Can Hear, Talk While
+    Thinking in Streaming." arXiv:2408.16725, 2024.
+    https://arxiv.org/abs/2408.16725
+
+[8] Z. Xie, C. Wu. "Mini-Omni2: Towards Open-source GPT-4o with Vision,
+    Speech and Duplex Capabilities." arXiv:2410.11190, 2024.
+    https://arxiv.org/abs/2410.11190
+
+[9] Pipecat (Daily). GitHub repository.
+    https://github.com/pipecat-ai/pipecat
+
+[10] LiveKit Agents. GitHub repository.
+     https://github.com/livekit/agents
+
+[11] Hugging Face. "speech-to-speech" (v0.2.10). GitHub repository.
+     https://github.com/huggingface/speech-to-speech
+
+[12] G. Gerganov et al. "llama.cpp: LLM inference in C/C++." GitHub
+     repository. https://github.com/ggml-org/llama.cpp
+
+[13] D. Macháček, R. Dabre, O. Bojar. "Turning Whisper into Real-Time
+     Transcription System." arXiv:2307.14743, 2023. IJCNLP-AACL 2023
+     (System Demonstrations). https://arxiv.org/abs/2307.14743
+
+[14] Y. Li, F. Wei, C. Zhang, H. Zhang. "EAGLE: Speculative Sampling
+     Requires Rethinking Feature Uncertainty." arXiv:2401.15077, 2024.
+     ICML 2024. https://arxiv.org/abs/2401.15077
+
+[15] T. Cai, Y. Li, Z. Geng, H. Peng, J. D. Lee, D. Chen, T. Dao. "Medusa:
+     Simple LLM Inference Acceleration Framework with Multiple Decoding
+     Heads." arXiv:2401.10774, 2024. https://arxiv.org/abs/2401.10774
+
+[16] NVIDIA. Jetson Orin NX 16GB module, 1KU pricing ($599).
+     https://developer.nvidia.com/embedded/buy-jetson — dev-kit price
+     ($899) per Seeed Studio reComputer J4012,
+     https://www.seeedstudio.com/reComputer-J4012-p-5586.html
+
+[17] Cortexist. "little-gemma" (GitHub repository).
+     https://github.com/cortexist/little-gemma
+
+---
+
 ## Appendix A: Reproducibility
 
 Every number traces to a committed harness: the repository's `bench/`
@@ -695,7 +771,11 @@ quantization levels by gate.
 - [ ] E2B Orin plain-decode re-measure paired with the tg32 37.8 reference
       (recorded 28.5; dictation reply ran 31.6 tok/s with MTP at 39.5%)
 - [ ] Kokoro comparison number, or drop the "faster than Kokoro" claim
-- [ ] Moshi note completion ("despite they got 100...")
+- [ ] Moshi note completion ("despite they got 100..."): searched the full
+      arXiv:2410.00037 text (2026-07-06) — no wattage/GPU-class comparison
+      exists near its latency claims; the only "H100" mention is for
+      TRAINING compute, unrelated to inference latency. Complete from a
+      source outside the paper, or drop the aside (see §5.7's inline TODO).
 - [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
       at the question's final word (script change needed in measure_ttfb.py)
 - [ ] Moshi session-aging study: GitHub reports (unverified) say latency
@@ -709,5 +789,28 @@ quantization levels by gate.
       the 8K context fills (SWA rings bound memory, but global-layer KV and
       attention cost grow) — preempt the symmetric reviewer question.
 - [ ] whisper-server (persistent) live-mic TTFB
-- [ ] price of Orin NX 16GB module for §3
+- [x] price of Orin NX 16GB module for §3 (2026-07-06): NVIDIA 1KU module
+      price $599; Seeed Studio reComputer J4012 dev kit $899 — "$700-class"
+      didn't match either; §3 now says "$600-class module / $900-class dev
+      kit" [ref 16].
 - [ ] burst-mode row values if the matrix table keeps all three deliveries
+- [x] Related-work / intro citations filled (2026-07-06, References section
+      added, refs [1]-[17]): hamming.ai (2 companion articles, exact P50/P90/
+      P95/P99 pulled from their published table), Moshi (arXiv:2410.00037,
+      full author list, L4 detail correctly re-attributed to the GitHub repo
+      since it is NOT in the paper text), Stivers et al. 2009 (verified PNAS
+      citation — but see correction below), Mini-Omni + Mini-Omni2, Pipecat,
+      LiveKit Agents, HF speech-to-speech, llama.cpp, whisper_streaming
+      (Macháček et al., arXiv:2307.14743), EAGLE (arXiv:2401.15077), Medusa
+      (arXiv:2401.10774), little-gemma's own repo. "self-speculation" in §2
+      left uncited (no specific paper verified for that generic term).
+      **Correction made**: arXiv:2404.16053 ("Human Latency Conversational
+      Turns for Spoken Avatar Systems," Jacoby et al. 2024) was cited
+      alongside Stivers et al. 2009 for the "200-500ms turn-transition"
+      claim, but it is a mismatched citation — it's an engineering paper
+      about predicting responses before a speaker finishes, not an
+      empirical turn-timing study, and doesn't report that statistic. It
+      was dropped from that sentence. Also, Stivers et al. reports a
+      cross-linguistic MODE near 0 ms and MEAN of +208 ms — not literally
+      "200-500ms" — the intro text was tightened to match what the paper
+      actually reports.
