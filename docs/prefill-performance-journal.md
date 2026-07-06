@@ -1585,3 +1585,8 @@ equal and roughly constant.
   coherent questions synthesized on the spot.
 - Harnesses: bench/ttfb_vs_length.py (ours + deferred),
   bench/asr_leg_vs_length.py (base/tiny ASR), docs/gen-fig-ttfb-vs-length.py.
+- Version pin: all HF speech-to-speech measurements in this journal
+  (2026-07-03/04 entries and this one's composed floor) were taken against
+  **speech-to-speech v0.2.10** (PyPI, released 2026-06-11). Their codebase
+  moves quickly — reinstalls must pin `speech-to-speech==0.2.10` to
+  reproduce these numbers.

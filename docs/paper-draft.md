@@ -150,10 +150,10 @@ vision) regress to what the speech training preserved.
 
 **Cascaded voice pipelines.** Commercial stacks (Pipecat, LiveKit Agents,
 [TODO cite]) cascade ASR → LLM → TTS and already stream at *existing*
-sentence punctuation. HuggingFace's speech-to-speech [TODO cite repo] is
-the closest published relative — open-weight, modular, LLM over an
-OpenAI-compatible HTTP endpoint — and we benchmark it head-to-head on our
-board with our exact LLM (§5.9). Our measurements locate the latencies
+sentence punctuation. HuggingFace's speech-to-speech (v0.2.10 [TODO cite
+repo]) is the closest published relative — open-weight, modular, LLM over
+an OpenAI-compatible HTTP endpoint — and we benchmark it head-to-head on
+our board with our exact LLM (§5.9). Our measurements locate the latencies
 these stacks leave on the table: prefill of the growing turn (hidden under
 speech, §4.2), the absence of early punctuation to flush on (created by
 the model itself, §4.3), and whole-sentence TTS synthesis before the
@@ -519,7 +519,9 @@ precisely the regime where an edge deployment loses nothing that matters.
 ### 5.9 Same board, same brain: the cascade baseline
 
 The cleanest ablation of our techniques is another cascade with
-everything else held equal. HuggingFace's speech-to-speech pipeline ran
+everything else held equal. HuggingFace's speech-to-speech pipeline
+(v0.2.10, the June 2026 PyPI release — their codebase moves quickly, so
+the pin matters) ran
 on the same Orin NX against the same Gemma E2B QAT weights (served by an
 unmodified llama-server on the GPU; faster-whisper and MMS-TTS on CPU —
 the same ears/mouth placement we chose, reached there by necessity since

@@ -3,6 +3,9 @@
 # Streams [0.5s silence][spoken question][silence...] at real-time pace in
 # 1024-byte chunks (512 samples / 32 ms at 16 kHz), like a live mic. Clocks:
 # t_end = last speech chunk sent -> first reply audio byte received.
+# All published numbers (paper §5.9, journal 2026-07-03/04) were taken
+# against speech-to-speech v0.2.10 (PyPI) — pin it when reproducing; their
+# codebase moves quickly.
 import socket, sys, threading, time, wave
 
 HOST = "127.0.0.1"
