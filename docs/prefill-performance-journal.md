@@ -1543,3 +1543,45 @@ TTFB projects to ~3.5–5 s, growing linearly with utterance length,
 where ours is 0.65 s flat (the 929-token instruction is the measured
 case). Prefill-under-speech and streaming ASR commits are exactly the
 difference, as predicted.
+
+## 2026-07-05 — Figure 4: TTFB vs prompt length, and it's all ASR placement
+
+Swept the §5.9 comparison across length (docs/fig-ttfb-vs-length.svg,
+paper §5.9). Six coherent questions of increasing length on one Orin NX,
+same E2B QAT weights, each leg clocked separately.
+
+**Ours is flat.** Streamed `ttft` (prefill-under-speech) held 0.09–0.12 s
+across all six lengths; the deferred (one-shot line) `ttft` rose only
+0.09 → 0.20 s at 90 words. So at conversational lengths (11–90 words) the
+LLM prefill is NOT a differentiator — deferred prefill of a short prompt is
+already sub-0.2 s. The streaming win (5.37 → 0.55 s) was a 929-TOKEN
+artifact; for a normal spoken question, prefill is cheap either way.
+
+**The divergence is the ASR leg.** faster-whisper base-int8 on the six
+synthesized clips: 1.20 s at 3.8 s of audio → 3.52 s at 32.1 s (the 32 s
+point reproduces the old 3.9 s / 31.8 s anchor). HF runs this serially
+AFTER end of speech; ours streams commits DURING speech, leaving one
+constant final pass. HF perfect-VAD floor = measured base ASR + 0.45 s
+downstream (prefill + first-sentence decode + first MMS-TTS, anchored to
+their measured 0.9 s tuned point) → ~1.6 s at 5 s, ~3.9 s at 30 s. Ours:
+0.65 s (streamed text) / ~1.0 s (live-mic, +streaming-ASR final commit),
+flat. The chart's whole gap is ASR placement; everything else is roughly
+equal and roughly constant.
+
+**Measurement gotchas (cost most of the session):**
+- Whisper temperature-fallback 5x-inflated synthetic speech: a 5.5 s clip
+  took 27 s at defaults, 5.3 s with `temperature=[0.0],
+  condition_on_previous_text=False`. Run-on / truncated / repeated
+  synthetic text triggers the retry machinery. Use temp0-no-fallback and
+  COHERENT stimulus.
+- Orin shared-memory SoC: a GPU serve running alongside 3–4x's a CPU-bound
+  int8 whisper pass (LPDDR5 bandwidth contention). Measure the ASR leg with
+  serve+app STOPPED and jetson_clocks pinned — otherwise non-monotonic
+  garbage (16→20→19 s for 5→10 s clips). This is the same "measure anon,
+  isolate the SoC" lesson as the memory bench notes.
+- Every ~/ test clip (alice, t2s, t11s, demo10/30) was the SAME repeated
+  piper phrase "Would the form never come to an end?" — whisper collapses
+  repetition at temp0, so prefix-slicing them is degenerate. Needed fresh
+  coherent questions synthesized on the spot.
+- Harnesses: bench/ttfb_vs_length.py (ours + deferred),
+  bench/asr_leg_vs_length.py (base/tiny ASR), docs/gen-fig-ttfb-vs-length.py.
