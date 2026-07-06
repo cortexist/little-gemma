@@ -556,6 +556,33 @@ length (their ASR leg alone measures 3.9 s for 31.8 s of audio on this
 CPU) — where prefill-under-speech holds ours at 0.65 s regardless
 (§4.2's 929-token case is the measured proof).
 
+Figure 4 makes the divergence explicit. We swept six spoken questions of
+increasing length (3.8–32 s, synthesized and measured on the same board)
+and clocked each leg. Our prefill-under-speech term is flat: the streamed
+`ttft` stays at 0.09–0.12 s across the whole range, because the prompt is
+already resident by the time the user stops talking. The HuggingFace
+floor is not a line we could measure end-to-end — its VAD replies into our
+synthetic speech past ~15 s — so we compose its *best case*: the measured
+faster-whisper base-int8 ASR pass (1.20 s at 3.8 s of audio, rising to
+3.52 s at 32 s) plus a 0.45 s downstream constant (prefill, first-sentence
+decode, first MMS-TTS call) anchored to their measured 0.9 s tuned point.
+Even granting perfect segmentation, the floor rises from ~1.6 s at a 5 s
+prompt to ~3.9 s at 30 s. The gap the reader sees is entirely the ASR
+placement: run serially after end of speech it scales with the utterance;
+committed *during* speech it costs one final pass, a constant. Everything
+else — the LLM prefill, the first-clause decode, the vocoder — is
+roughly equal and roughly constant on both sides.
+
+![Figure 4 — time to first audio vs. spoken prompt length (E2B QAT, one
+Orin NX)](fig-ttfb-vs-length.svg)
+
+*Figure 4: The same board and E2B weights, swept over prompt length. Our
+TTFB is flat (0.65 s streamed-text; ≈1.0 s live-mic once the streaming-ASR
+final commit is included, still inside the conversational band). The
+HuggingFace perfect-VAD floor rises with the serial ASR pass. Points are
+measured; the HF line is its best case — real long input replies into
+ongoing speech, which is worse than the floor shown.*
+
 ## 6. Discussion
 
 What the cascade buys for its ~0.5 s of structural disadvantage: the brain
