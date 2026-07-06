@@ -16,6 +16,7 @@ static int sock_init(void) { WSADATA w; return WSAStartup(MAKEWORD(2, 2), &w); }
 static int sock_err(void) { return WSAGetLastError(); }
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <signal.h>
@@ -566,6 +567,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
 // ---- minimal client (-c) ----------------------------------------------------
 // For systems without socat (native Windows): pump stdin lines to the server
 // and copy each streamed model turn to stdout, reading until its "<turn|>".
+// On POSIX the pump is full-duplex like socat itself: stdin forwards the
+// moment it arrives, replies stream back concurrently. That is what lets an
+// application deliver the one-byte MEDIA_BARGE signal MID-reply — a client
+// that only reads stdin between turns would queue the barge behind the very
+// reply it is meant to interrupt. Windows keeps the simple half-duplex loop
+// (no select() on pipes); there a barge degrades to a between-turns no-op,
+// which the server ignores by design.
 static void client(const char *path) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
@@ -579,6 +587,44 @@ static void client(const char *path) {
     if (connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
         fprintf(stderr, "connect to %s failed\n", path); return;
     }
+#ifndef _WIN32
+    static const char MARK[] = "<turn|>";
+    char buf[8192], last = '\n';
+    int pending = 0, eof = 0, m = 0;    // newlines sent = replies owed
+    while (!eof || pending > 0) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        if (!eof) FD_SET(0, &rd);
+        FD_SET(s, &rd);
+        if (select((int)s + 1, &rd, NULL, NULL, NULL) < 0) break;
+        if (FD_ISSET(0, &rd)) {
+            ssize_t k = read(0, buf, sizeof buf);
+            if (k <= 0) {                                // finish owed replies, then exit
+                eof = 1;
+                if (last != '\n' && send_all(s, "\n", 1) == 0) pending++;
+            } else {
+                for (ssize_t i = 0; i < k; i++) pending += buf[i] == '\n';
+                last = buf[k - 1];
+                if (send_all(s, buf, (int)k) != 0) break;
+            }
+        }
+        if (FD_ISSET(s, &rd)) {
+            int k = (int)recv(s, buf, sizeof buf, 0);
+            if (k <= 0) break;
+            int a = 0;                                   // newline after each "<turn|>",
+            for (int i = 0; i < k; i++) {                // wherever it lands in the chunk
+                m = buf[i] == MARK[m] ? m + 1 : buf[i] == MARK[0];
+                if (m == (int)sizeof MARK - 1) {
+                    fwrite(buf + a, 1, (size_t)(i + 1 - a), stdout);
+                    putchar('\n');
+                    a = i + 1; m = 0; pending--;
+                }
+            }
+            fwrite(buf + a, 1, (size_t)(k - a), stdout);
+            fflush(stdout);
+        }
+    }
+#else
     char line[8192];
     while (fgets(line, sizeof line, stdin)) {
         size_t len = strlen(line);
@@ -600,6 +646,7 @@ static void client(const char *path) {
         putchar('\n');
         fflush(stdout);
     }
+#endif
     sock_close(s);
 }
 
