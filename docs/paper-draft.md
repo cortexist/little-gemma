@@ -553,25 +553,33 @@ question is segmented at breath pauses and answered INTO the user's
 ongoing speech (first audio 25–28 s before end of speech), and even
 with perfect segmentation the post-speech chain scales with utterance
 length (their ASR leg alone measures 3.9 s for 31.8 s of audio on this
-CPU) — where prefill-under-speech holds ours at 0.65 s regardless
-(§4.2's 929-token case is the measured proof).
+CPU) — where streaming both legs into the open turn holds ours at 0.65 s
+regardless (§4.2's mechanism; its 929-token case is the long-input
+extreme).
 
 Figure 4 makes the divergence explicit. We swept six spoken questions of
 increasing length (3.8–32 s, synthesized and measured on the same board)
-and clocked each leg. Our prefill-under-speech term is flat: the streamed
-`ttft` stays at 0.09–0.12 s across the whole range, because the prompt is
-already resident by the time the user stops talking. The HuggingFace
+and clocked each leg. Our prefill term is flat — and, at these lengths,
+nearly free in *either* placement: streamed `ttft` stays at 0.09–0.12 s
+across the range, and even a deferred one-shot prefill of the 90-word
+question costs 0.20 s. Natural speech arrives at ~3 tokens/s against a
+prefill rate of ~800 (E2B); anything a user can *say* in a turn is cheap
+to prefill. What the open turn hides at conversational lengths is
+therefore the ASR pass, not the prefill — prefill hiding earns its keep
+at dictation lengths and on the slower 12B tier (§4.2). The HuggingFace
 floor is not a line we could measure end-to-end — its VAD replies into our
 synthetic speech past ~15 s — so we compose its *best case*: the measured
 faster-whisper base-int8 ASR pass (1.20 s at 3.8 s of audio, rising to
 3.52 s at 32 s) plus a 0.45 s downstream constant (prefill, first-sentence
 decode, first MMS-TTS call) anchored to their measured 0.9 s tuned point.
 Even granting perfect segmentation, the floor rises from ~1.6 s at a 5 s
-prompt to ~3.9 s at 30 s. The gap the reader sees is entirely the ASR
-placement: run serially after end of speech it scales with the utterance;
-committed *during* speech it costs one final pass, a constant. Everything
-else — the LLM prefill, the first-clause decode, the vocoder — is
-roughly equal and roughly constant on both sides.
+prompt to ~3.9 s at 30 s. The gap the reader sees is the ASR placement:
+run serially after end of speech it scales with the utterance; committed
+*during* speech it costs one final pass, a constant. Everything else —
+the LLM prefill, the first speakable unit's decode, the vocoder — is
+constant in prompt length on both sides; the *size* of those constants
+(clause-first flushing, the streaming vocoder) is §4.3–4.4's fight,
+already settled in Figure 2.
 
 ![Figure 4 — time to first audio vs. spoken prompt length (E2B QAT, one
 Orin NX)](fig-ttfb-vs-length.svg)
