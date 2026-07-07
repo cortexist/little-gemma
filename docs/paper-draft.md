@@ -210,7 +210,7 @@ Three processes, one GPU owner:
   the CPU — the GPU belongs to the LLM. One ONNX call per line: first byte ≈
   whole-clause synthesis, ~0.27–0.49 s per clause on the Orin's cores
   (~18–26× realtime), 0.31 GB peak anonymous memory. Piper was chosen over
-  Kokoro on speed (0.008 RTF vs ~0.47-0.51 RTF) [18]. CPU placement is 
+  Kokoro on speed (0.008 RTF vs ~0.47-0.51 RTF) [17]. CPU placement is 
   measured, not assumed: on the A5000, CUDA piper *loses* to a desktop CPU 
   at clause length (0.112 vs 0.089 s — the ONNX graph round-trips the bus 28 
   times for ops pinned to CPU, and launch/copy overhead swamps ~20 MB of 
@@ -382,7 +382,7 @@ mmap'd and unpinned where the quantization is repacked anyway. Every
 optimization is gated byte-identical against a f32 reference and, for the
 speculative path, by acceptance-rate tripwires (which caught three real
 bugs). Full engineering logs, including the falsified dead ends, are in the
-repository journals [17]. The result on the Orin: ~0.8× of
+repository journals [18]. The result on the Orin: ~0.8× of
 llama.cpp's prefill throughput and 1.17–1.26× its decode, from a codebase a
 single reviewer can actually read (~6,000 lines).
 
@@ -719,11 +719,16 @@ a good trade for most embodied products.
 [1] S. Sharma. "Voice AI Latency: What's Fast, What's Slow, and How to Fix
     It." Hamming AI, Jan. 12, 2026.
     https://hamming.ai/resources/voice-ai-latency-whats-fast-whats-slow-how-to-fix-it
+    Archived: https://web.archive.org/web/20260511153827/https://hamming.ai/resources/voice-ai-latency-whats-fast-whats-slow-how-to-fix-it
 
 [2] Hamming AI. "Voice Agent Evaluation Metrics: Definitions, Formulas &
     Benchmarks." Jan. 18, 2026.
     https://hamming.ai/resources/voice-agent-evaluation-metrics-guide
-    (methodology: 4M+ production voice-agent calls, 10K+ agents, 2025-2026)
+    Archived: https://web.archive.org/web/20260707200723/https://hamming.ai/resources/voice-agent-evaluation-metrics-guide
+    (Primary source for the production-latency percentiles used here: Hamming's
+    own analysis of 4M+ production voice-agent calls across 10K+ agents,
+    2025-2026 — the figures originate with this dataset and are not
+    re-attributable to an upstream study.)
 
 [3] A. Défossez, L. Mazaré, M. Orsini, A. Royer, P. Pérez, H. Jégou,
     E. Grave, N. Zeghidour. "Moshi: a speech-text foundation model for
@@ -779,11 +784,11 @@ a good trade for most embodied products.
 [16] Arrow Electronics. Quote on July 6, 2026: Jetson Orin NX 16GB module, 
      1+ $699. 1000+ $599 https://www.arrow.com
 
-[17] Cortexist. "little-gemma" (GitHub repository).
-     https://github.com/cortexist/little-gemma
-
-[18] Codesota. TTS models, split by track, ranked by preference.
+[17] Codesota. TTS models, split by track, ranked by preference.
     https://www.codesota.com/guides/tts-models
+
+[18] Cortexist. "little-gemma" (GitHub repository).
+     https://github.com/cortexist/little-gemma
 
 ---
 

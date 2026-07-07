@@ -41,7 +41,7 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
  │ reference spec│  │ mtp-kernel.cuh (verify + device draft), and the GPU  │
  │               │  │ vision/audio encoder (media-kernel.cu)               │
  └───────────────┘  ├───────────────────────────┬──────────────────────────┤
-                    │     model-cuda-f32.cu     │    model-cuda-i8.cu     │
+                    │     model-cuda-f32.cu     │    model-cuda-i8.cu      │
                     │   readable f32 matmul     │  int8 dp4a + wide loads  │
                     └───────────────────────────┴──────────────────────────┘
 
