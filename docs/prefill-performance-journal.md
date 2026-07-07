@@ -1544,7 +1544,10 @@ where ours is 0.65 s flat (the 929-token instruction is the measured
 case). Prefill-under-speech and streaming ASR commits are exactly the
 difference, as predicted.
 
-## 2026-07-05 — Figure 4: TTFB vs prompt length, and it's all ASR placement
+## 2026-07-05 — Figure 5: TTFB vs prompt length, and it's all ASR placement
+
+*(Figure numbers here follow the paper's current numbering: the board photo
+became Figure 1 on 2026-07-07, shifting this sweep from 4 to 5.)*
 
 Swept the §5.9 comparison across length (docs/fig-ttfb-vs-length.svg,
 paper §5.9). Six coherent questions of increasing length on one Orin NX,
@@ -1584,9 +1587,36 @@ equal and roughly constant.
   repetition at temp0, so prefix-slicing them is degenerate. Needed fresh
   coherent questions synthesized on the spot.
 - Harnesses: bench/ttfb_vs_length.py (ours + deferred),
-  bench/asr_leg_vs_length.py (base/tiny ASR), docs/gen-fig-ttfb-vs-length.py.
+  bench/asr_leg_vs_length.py (base/tiny ASR), bench/gen-fig-ttfb-vs-length.py
+  (moved from docs/ on 2026-07-07).
 - Version pin: all HF speech-to-speech measurements in this journal
   (2026-07-03/04 entries and this one's composed floor) were taken against
   **speech-to-speech v0.2.10** (PyPI, released 2026-06-11). Their codebase
   moves quickly — reinstalls must pin `speech-to-speech==0.2.10` to
   reproduce these numbers.
+
+## 2026-07-07 — the decode pair closed: near-parity, and the 0.75× scare retires
+
+The one measurement Appendix B still owed: our E2B QAT plain decode,
+paired same-session with llama-bench under pinned clocks (the 2026-07-03
+entry had flagged the unpaired 28.5 as unprintable). Clock-state sanity
+first: llama pp929 reproduced at 1,020.95 vs the recorded 1,021 —
+conditions identical to the reference session.
+
+The pair: llama tg32 **37.91 ± 0.12** (fa1); ours **36.4 tok/s**, dead
+flat across 7 serve turns (21-tok prompt, 78-tok reply, one connection
+per turn, first discarded — decode showed no warmup at all). Ratio
+**0.96×, near-parity**. The old 28.5 — and the ~0.75× "llama.cpp LEADS"
+reading it implied — was a stale-conditions artifact; a same-session
+26% swing is exactly why the 07-03 entry refused to print the ratio
+from a one-sided number. §5.2 now carries the row with its protocol
+stated (78-tok replies vs tg32, not the 256-token protocol of the
+E4B/12B rows).
+
+Bench-harness hygiene from the same session: `bench-serve.ps1` had
+absolute `C:\Users\Zero` paths headed for the public repo — now
+`$PSScriptRoot`-relative with an `LG_BENCH_MODEL` override. And two ssh
+traps re-confirmed the hard way: `cd x && server & client` puts the cd
+inside the backgrounded subshell (clients ran from $HOME), and
+`pkill -f "run-cuda-i8 -m"` matches the remote shell's own command line
+and kills the session — use `pkill -x`.

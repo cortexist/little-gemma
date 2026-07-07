@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 235" font-family="Helvetica, Arial, sans-serif">
-  <!-- Figure 3: three tiers vs production voice-AI latency bands.
+  <!-- Figure 4: three tiers vs production voice-AI latency bands.
        x(t) = 60 + t*165 px (axis 0..4 s). Bands per hamming.ai telemetry. -->
   <rect width="760" height="235" fill="#ffffff"/>
 

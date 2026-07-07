@@ -1,20 +1,9 @@
-# Paper draft — v0.1 (2026-07-03)
+## Paper draft — v0.1 (2026-07-03)
 
-> **Title candidates** (pick one; 3 is the recommendation):
-> 1. Natural and Cohesive Conversation with Gemma 4 on Jetson Orin
-> 2. Fluent Conversation with SOTA Open-Source Models on Edge Devices
-> 3. **Fluent and Cohesive: Sub-Second Voice Interaction with General-Purpose
->    Open-Weight Models on a 20-Watt Edge Device**
-> 4. (short form of 3) Fluent and Cohesive: A Sub-Second Voice Pipeline for
->    Gemma 4 on Jetson Orin
->
-> Rationale for 3: "Fluent and Cohesive" names the paper's two defined,
-> measurable properties (the abstract defines them in its first sentence);
-> "general-purpose open-weight" is the positioning against Moshi in the title
-> itself; "20-Watt" is the number a skimming reviewer remembers.
->
-> TODO(author): authors/affiliation; venue (fits MLSys / EdgeSys /
-> Interspeech-systems-track shapes; arXiv first regardless).
+# Fluent and Cohesive: Sub-Second Voice Interaction with General-Purpose Open-Weight Models on a 20-Watt Edge Device
+
+Shaw Tan, Claire Tan
+> venue (fits MLSys / EdgeSys / Interspeech-systems-track shapes; arXiv first regardless).
 
 ---
 
@@ -194,6 +183,15 @@ dev kit [16]. The AGX buys performance with a power/cost step that
 changes the product class; the Nano 8GB cannot hold the 12B tier (§5.6
 qualifies what it *can* hold).
 
+![Figure 1 — the system under test: Jetson Orin NX 16GB on its carrier
+board, 355 mL can for scale](orin-nx.png)
+
+*Figure 1: The system under test. Every edge number in §5 was measured on
+this board — a Jetson Orin NX 16GB on its carrier board (fan attached),
+355 mL can for scale. The compute module itself is 69.6 × 45 mm, smaller
+than a credit card; this is the entire machine that answers 0.65 s after
+end of speech.*
+
 Three processes, one GPU owner:
 
 - **Ears — voicecat + whisper.cpp** (CUDA base.en): energy VAD, streaming
@@ -258,10 +256,13 @@ this achievable and it held in every reported cell, on both test machines).
 
 ### 4.2 Prefill under speech
 
-Chunked prefill is a scheduler concept for *completed* prompts in every
-serving stack we know (vLLM, TensorRT-LLM, llama.cpp server [TODO verify
-llama.cpp turn-level behavior]). The open turn is different: while the user
-speaks, committed words are already immutable — LocalAgreement-2 commits
+Chunked prefill — a named scheduler feature in vLLM and TensorRT-LLM —
+splits a *completed* prompt so it can interleave with decode; llama.cpp's
+server has no such feature but likewise processes a prompt that has already
+arrived in full (ubatch splitting, prefix-cache reuse). In every serving
+stack we know, prefill begins only once the whole prompt is in hand. The
+open turn is different: while the user speaks, committed words are already
+immutable — LocalAgreement-2 commits
 exactly the prefix both hypotheses agree on — so their KV entries can be
 computed *now*, under the speech itself.
 
@@ -274,10 +275,10 @@ replies, deferred vs streamed, all three models. (One span of holdback is
 kept unprefilled to absorb ASR revisions of the most recent words; MSG_PEEK
 lets the server prefill right up to the pending frame without consuming it.)
 
-![Figure 1 — prefill under speech: deferred vs streamed delivery of a
+![Figure 2 — prefill under speech: deferred vs streamed delivery of a
 929-token spoken instruction (12B, Orin NX)](fig-prefill-under-speech.svg)
 
-*Figure 1: In deferred delivery (a) the 5.37 s prefill starts only when the
+*Figure 2: In deferred delivery (a) the 5.37 s prefill starts only when the
 turn closes; streamed (b), committed words prefill during the speech itself
 and the turn close leaves only the holdback span — TTFT 5.37 → 0.55 s with
 byte-identical replies.*
@@ -412,6 +413,13 @@ Plain decode, tok/s (256 tokens, warm; llama-bench reference):
 |---|---|---:|---:|---:|
 | Orin | E4B | 16.80 | 13.36 | **1.26×** |
 | Orin | 12B | 8.27 | 7.04 | **1.17×** |
+| Orin | E2B QAT | 36.4 | 37.9 | 0.96× |
+
+(The E2B QAT row is its own same-session pinned-clocks pair — serve-mode
+turns with 78-token replies against llama-bench tg32, both sides stable to
+under 1% across repeats — rather than the 256-token protocol above.
+Near-parity is the honest reading: q4_0 is llama.cpp's oldest and most
+heavily tuned decode quant, while ours rides the q4_K-shaped repack path.)
 
 MTP multiplies on top (§4.5). Where the design point shows is multimodal
 turns: little-gemma reaches first-sentence on an image+question turn in
@@ -438,19 +446,20 @@ not assumed; deferred runs reproduce to the millisecond.)
 E2B QAT, voice-sys prompt, streamed dictation of the 30-second spoken
 instruction, everything on-device:
 
-![Figure 2 — anatomy of first audio: baseline vs voice-sys prompt (E2B QAT,
+![Figure 3 — anatomy of first audio: baseline vs voice-sys prompt (E2B QAT,
 Orin NX)](fig-first-audio-anatomy.svg)
 
-*Figure 2: The same question, three configurations. The voice-sys prompt
+*Figure 3: The same question, three configurations. The voice-sys prompt
 cuts the first speakable unit from 21 to 8 words (1.21 → 0.82 s); the
 streaming vocoder (§4.4) then decouples first PCM from clause length
 entirely (0.82 → 0.65 s). Synthesis continues under playback.*
 
 With whisper.cpp's final-commit pass in the loop (base.en CUDA, ~0.55 s
 per invocation, invocation-cost-dominated), voicecat closes the turn ~1.0 s
-after end of speech in live-mic operation; a persistent whisper server is
-the identified upgrade path [TODO: measure with whisper-server and update —
-likely pulls live-mic TTFB near the dictation number].
+after end of speech in live-mic operation; a persistent whisper server,
+amortizing that load-dominated invocation cost across passes, is the
+identified upgrade path. We expect it to pull live-mic TTFB toward the
+streamed-dictation number but have not measured it (§8).
 
 ### 5.5 Three tiers of conversational experience
 
@@ -462,10 +471,10 @@ One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 | E4B | high | ~1.35 s | just under the industry median (1.4–1.7 s) |
 | E2B QAT | good | **0.65 s** | inside the "theoretical ideal", rarely achieved in production |
 
-![Figure 3 — the three tiers against production voice-AI latency
+![Figure 4 — the three tiers against production voice-AI latency
 bands](fig-tiers-vs-industry.svg)
 
-*Figure 3: One board, one pipeline, three operating points. The E2B tier
+*Figure 4: One board, one pipeline, three operating points. The E2B tier
 lands inside the natural-conversation window that production telemetry
 reports as rarely achieved; the E4B matches the industry median; the 12B
 trades latency for the strongest answers.*
@@ -483,8 +492,7 @@ after mmap'ing the weight blob and skipping the pin for fully-repacked
 models: 5.5 → 3.2 GB), whisper ~0.7 GB, piper 0.31 GB peak → **≈4.2 GB for
 the full voice stack**, leaving ~2.2 GB slack on a 7.4 GB-usable headless
 Nano, with room for the vision encoder (~0.7 GB). Caveat, stated plainly:
-measured on the NX 16GB against an 8 GB budget, not yet on the Nano SKU
-[TODO if we can borrow one].
+measured on the NX 16GB against an 8 GB budget, not yet on the Nano SKU.
 
 ### 5.7 Power
 
@@ -559,7 +567,7 @@ CPU) — where streaming both legs into the open turn holds ours at 0.65 s
 regardless (§4.2's mechanism; its 929-token case is the long-input
 extreme).
 
-Figure 4 makes the divergence explicit. We swept six spoken questions of
+Figure 5 makes the divergence explicit. We swept six spoken questions of
 increasing length (3.8–32 s, synthesized and measured on the same board)
 and clocked each leg. Our prefill term is flat — and, at these lengths,
 nearly free in *either* placement: streamed `ttft` stays at 0.09–0.12 s
@@ -581,23 +589,50 @@ run serially after end of speech it scales with the utterance; committed
 the LLM prefill, the first speakable unit's decode, the vocoder — is
 constant in prompt length on both sides; the *size* of those constants
 (clause-first flushing, the streaming vocoder) is §4.3–4.4's fight,
-already settled in Figure 2.
+already settled in Figure 3.
 
-![Figure 4 — time to first audio vs. spoken prompt length (E2B QAT, one
+![Figure 5 — time to first audio vs. spoken prompt length (E2B QAT, one
 Orin NX)](fig-ttfb-vs-length.svg)
 
-*Figure 4: The same board and E2B weights, swept over prompt length. Our
+*Figure 5: The same board and E2B weights, swept over prompt length. Our
 TTFB is flat (0.65 s streamed-text; ≈1.0 s live-mic once the streaming-ASR
 final commit is included, still inside the conversational band). The
 HuggingFace perfect-VAD floor rises with the serial ASR pass. Points are
 measured; the HF line is its best case — real long input replies into
 ongoing speech, which is worse than the floor shown.*
 
+### 5.10 Session aging: does it hold as the context fills?
+
+A fair question the single-turn numbers do not answer: does responsiveness
+decay over a long conversation as the 8K window fills? We measured it
+directly — one persistent E2B QAT session on the Orin (plain serve, no MTP,
+pinned clocks, SoC otherwise idle), driven turn after turn with fixed
+~178-token turns until the server reported the context full, which happened
+after 42 turns (~7,475 tokens).
+
+![Figure 6 — session aging: TTFT and first audio vs conversation depth (E2B
+QAT, one Orin NX)](fig-session-aging.svg)
+
+*Figure 6: TTFT and first audio (measured TTFS + the streaming vocoder's
+0.10 s first-PCM constant, §4.4) as one conversation fills the window. Both
+rise gently and slightly sub-linearly — TTFT 0.25 → 0.45 s, first audio
+0.49 → 0.75 s — and both stay inside the conversational band for the entire
+session. Plain decode slows 39.6 → 28.6 tok/s (attention over the growing
+KV), still far above the ~3 tok/s real-time-listening floor (§6).*
+
+The growth is bounded because most layers use sliding-window attention —
+their cost is window-bounded and constant — so only the global layers pay
+for the accumulating KV. Absolute values reflect this fixed short-turn
+stimulus, chosen to fill the context at a constant rate; the load-bearing
+result is the slope: a full session adds only ~0.2 s to TTFT and ~0.26 s to
+first audio, and the pipeline still answers in under 0.75 s at context-full.
+The design point holds across the whole session, not just the first turn.
+
 ## 6. Discussion
 
 What the cascade buys for its ~0.5 s of structural disadvantage: the brain
-is a *commodity part*. The same pipeline ran three model generations
-[TODO: soften or substantiate] without retraining anything; it processes a
+is a *commodity part*. The same pipeline ran three Gemma 4 variants
+(E2B, E4B, 12B) without retraining anything; it processes a
 camera feed with the same open-turn mechanics that stream dictation
 (§4.2); it speaks Gemma's full tool-calling protocol because the server
 passes control tokens through; and its answer quality is that of a 12B
@@ -620,8 +655,8 @@ axis — and why a 6,000-line runner can hold the design point at all.
 
 - The dictation TTFB excludes the ASR final-commit pass (§5.4 gives the
   live-mic number, ~1.0 s to turn close); Moshi's number includes its
-  hearing. The persistent-whisper upgrade path narrows this and is measured
-  future work.
+  hearing. The persistent-whisper upgrade path narrows this and is future
+  work (§8).
 - The Moshi comparison is anchor-mismatched in Moshi's favor and ours at
   once: its probe clock starts at the *start* of input streaming (fed
   silence, the full-duplex model initiates speech itself), ours at the *end*
@@ -633,10 +668,6 @@ axis — and why a 6,000-line runner can hold the design point at all.
 - Style pressure makes the 2B confidently wrong where it was vaguely right
   (§4.3); the clause-splitting prompt trades a quality edge for fluency at
   the smallest tier. Finetuning may recover both.
-- Gemma 4's native audio path is not usable as the pipeline's ears (E2B/E4B
-  confabulation; 12B vision-disables-hearing exclusion) — findings we
-  report [TODO: decide whether the A/V exclusion becomes its own §
-  or stays a finding table] but that make the whisper lane load-bearing.
 - All benchmarks use greedy decoding (the byte-identity discipline
   requires it). Sampling exists and composes with MTP distribution-exactly
   — the verify samples the target's distribution and accepts a draft only
@@ -645,6 +676,16 @@ axis — and why a 6,000-line runner can hold the design point at all.
   sampled-mode latency/quality is not separately characterized here.
 - Single-user, single-stream serving; no batching story.
 - 8 GB verdict extrapolated from the NX 16GB (§5.6).
+- Gemma 4's native audio path is not usable as the pipeline's ears, which is
+  what makes the whisper lane load-bearing rather than a fallback. The
+  capability boundary we measured (greedy decoding; Orin + A5000):
+
+| configuration | native-audio result | status |
+|---|---|---|
+| E2B / E4B, speech | Confabulates — output tracks the *prompt*, not the audio; coarse comprehension ("a man speaking") survives, verbatim ASR fails. | Model limit, not our bug: the fork's `llama-mtmd-cli` and `llama-server`, and mainline llama.cpp, all confabulate on the same clip, each differently. |
+| 12B, speech alone | Accurate ASR (JFK transcribed verbatim over the socket). | Usable — spoken words only. |
+| 12B, non-speech alone | Confabulates or denies; describes whatever instrument the prompt names. | Speech-only scope; music/ambient need an external tag. |
+| 12B, any vision in the session | Hearing disabled — all seven arrangements fail (audio before/after/interleaved, black frames, even an earlier turn); vision survives audio, so the exclusion is asymmetric and session-scoped. | Whisper is mandatory whenever a session may also see frames. |
 
 ## 8. Future work
 
@@ -652,7 +693,9 @@ Finetune for human pause placement (shorter than grammatical clauses);
 persistent whisper service (flips the streaming-vs-endpass verdict
 unconditionally); integrate the streaming vocoder (§4.4) into the
 live-mic loop and re-measure the composed 0.65 s as one system;
-re-run the A5000 cross-silicon table with streaming TTS on both sides;
+the rigorous Moshi head-to-head (stream a recorded question, anchor the
+clock at its final word — §7); re-run the A5000 cross-silicon table with
+streaming TTS on both sides;
 Nano 8GB SKU validation; barge-in latency characterization; camera+voice
 concurrent sessions (the A/V exclusion policy exists, the latency study
 does not).
@@ -762,18 +805,32 @@ quantization levels by gate.
 
 - [x] llama.cpp E2B QAT references measured (2026-07-03, pinned clocks,
       same-day pair): pp929 1,021 tok/s (fa1) vs our 815 = 0.80×; tg32
-      37.8 tok/s vs our recorded 28.5 plain = ~0.75× — llama.cpp LEADS
-      on q4_0 decode (their most-tuned quant); re-pair our decode number
-      under pinned clocks before printing the decode ratio.
-- [ ] E2B Orin plain-decode re-measure paired with the tg32 37.8 reference
-      (recorded 28.5; dictation reply ran 31.6 tok/s with MTP at 39.5%)
+      37.8 tok/s vs our then-recorded 28.5 plain suggested ~0.75× — but that
+      28.5 was unpaired; the pinned re-pair (next item) landed at 0.96×.
+- [x] E2B Orin plain-decode re-measure — MEASURED (2026-07-07, pinned
+      clocks, same-session pair): llama-bench pp929 reproduced at 1,020.95
+      (recorded 1,021 — clock-state sanity passed), tg32 37.91 ± 0.12; our
+      serve-mode plain decode 36.4 tok/s flat across 7 turns (21-tok prompt,
+      78-tok reply, one connection per turn) = **0.96×, near-parity**. The
+      earlier unpaired 28.5 (and the ~0.75× it implied) was a stale-conditions
+      artifact and is retired; §5.2 now prints the row with its protocol
+      stated.
 - [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
       at the question's final word (script change needed in measure_ttfb.py)
-- [ ] Our own session-aging curve: TTFT/TTFB vs turn number as the 8K
-      context fills (SWA rings bound memory, but global-layer KV and
-      attention cost grow) — a natural reviewer question on its own merits.
-- [ ] whisper-server (persistent) live-mic TTFB
-- [ ] burst-mode row values if the matrix table keeps all three deliveries
+      — DEFERRED: acknowledged as a stated limitation (§7) and future work
+      (§8); an out-of-scope comparison, not a pre-submission gap.
+- [x] Session-aging curve — MEASURED (2026-07-07, Orin E2B QAT, plain serve,
+      pinned clocks, SoC idle; bench/session_age.py, one persistent session of
+      42 fixed ~178-tok turns to "context full" at ~7,475 tok). Result in §5.10
+      / Figure 6: TTFT 0.25→0.45 s, first audio 0.49→0.75 s, decode 39.6→28.6
+      tok/s over a full session — gentle, sub-linear, stays in the band (SWA
+      layers window-bounded; only global layers pay the growing KV).
+- [ ] whisper-server (persistent) live-mic TTFB — DEFERRED to future work
+      (§8); §5.4 now states this leg explicitly as un-measured, so it is an
+      acknowledged future measurement rather than a missing number.
+- [x] Burst-mode row values — RESOLVED (decided against): §5.3 keeps only
+      deferred + paced; burst is frame-padding-dominated (≈ deferred) and is
+      folded into the §5.3 note, so no separate rows are needed.
 - [x] Related-work / intro citations filled (2026-07-06, References section
       added, refs [1]-[17]): hamming.ai (2 companion articles, exact P50/P90/
       P95/P99 pulled from their published table), Moshi (arXiv:2410.00037,

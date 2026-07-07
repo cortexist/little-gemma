@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" font-family="Helvetica, Arial, sans-serif">
-  <!-- Figure 2: anatomy of first audio. E2B QAT, Orin NX, streamed dictation.
+  <!-- Figure 3: anatomy of first audio. E2B QAT, Orin NX, streamed dictation.
        x(t) = 60 + t*500 px (axis 0..1.3 s). Three configurations:
        baseline prompt, voice-sys prompt, voice-sys + streaming vocoder. -->
   <rect width="760" height="350" fill="#ffffff"/>

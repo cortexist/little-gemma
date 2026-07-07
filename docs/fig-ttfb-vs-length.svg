@@ -34,8 +34,8 @@
   <circle cx="529.3" cy="97.4" r="4" fill="#c47a3d"/>
   <circle cx="688.1" cy="87.4" r="4" fill="#c47a3d"/>
   <text x="688.1" y="103.4" font-size="10" fill="#a5632c" text-anchor="middle">4.0 s</text>
-  <text x="406.7" y="126.9" font-size="11" fill="#a5632c" font-weight="bold">HuggingFace speech-to-speech</text>
-  <text x="406.7" y="139.9" font-size="10" fill="#a5632c">perfect-VAD floor — the serial ASR pass sets the slope</text>
+  <text x="368.3" y="212.0" font-size="11" fill="#a5632c" font-weight="bold">HuggingFace speech-to-speech</text>
+  <text x="368.3" y="225.0" font-size="10" fill="#a5632c">perfect-VAD floor — the serial ASR pass sets the slope</text>
   <line x1="70.0" y1="268.9" x2="705.0" y2="268.9" stroke="#3e6fbf" stroke-width="1.5" stroke-dasharray="5 3"/>
   <text x="705.0" y="262.9" font-size="10" fill="#3e6fbf" text-anchor="end">live mic, + streaming-ASR commit  ≈ 1.0 s</text>
   <line x1="70.0" y1="290.3" x2="705.0" y2="290.3" stroke="#3e6fbf" stroke-width="2.5"/>

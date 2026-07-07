@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Generate fig-ttfb-vs-length.svg in the paper's house style."""
+import os
+_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs",
+                    "fig-ttfb-vs-length.svg")
 
 # Measured on Orin NX (clocks pinned, serve/app isolated per leg):
 # durations = actual piper-synthesized spoken length of 6 coherent questions.
@@ -67,8 +70,10 @@ for t, v in zip(dur, hf):
     s.append('  <circle cx="%.1f" cy="%.1f" r="4" fill="#c47a3d"/>' % (xpx(t), ypx(v)))
 # HF endpoint value + label
 s.append('  <text x="%.1f" y="%.1f" font-size="10" fill="#a5632c" text-anchor="middle">%.1f s</text>' % (xpx(dur[-1]), ypx(hf[-1]) + 16, hf[-1]))
-s.append('  <text x="%.1f" y="%.1f" font-size="11" fill="#a5632c" font-weight="bold">HuggingFace speech-to-speech</text>' % (xpx(17.5), ypx(a + D + b * 17.5) - 36))
-s.append('  <text x="%.1f" y="%.1f" font-size="10" fill="#a5632c">perfect-VAD floor — the serial ASR pass sets the slope</text>' % (xpx(17.5), ypx(a + D + b * 17.5) - 23))
+# label sits in the open band just below the trend line (steep slope + a long
+# caption line would otherwise be struck through if placed above it)
+s.append('  <text x="%.1f" y="%.1f" font-size="11" fill="#a5632c" font-weight="bold">HuggingFace speech-to-speech</text>' % (xpx(15.5), 212))
+s.append('  <text x="%.1f" y="%.1f" font-size="10" fill="#a5632c">perfect-VAD floor — the serial ASR pass sets the slope</text>' % (xpx(15.5), 225))
 
 # ours live-mic (dashed) and dictation (solid), both flat
 s.append('  <line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#3e6fbf" stroke-width="1.5" stroke-dasharray="5 3"/>' % (xpx(0), ypx(OURS_LIVE), xpx(TMAX), ypx(OURS_LIVE)))
@@ -84,5 +89,5 @@ s.append('  <text x="%.1f" y="26" font-size="13" font-weight="bold" fill="#1f232
 s.append('  <text x="%.1f" y="%.1f" font-size="10" fill="#555b61" text-anchor="middle">Same board, same E2B weights. HF floor = measured base-int8 ASR + 0.45 s downstream — its BEST case; real long input replies into ongoing speech.</text>' % (W / 2, H - 8))
 
 s.append('</svg>')
-open(r"C:\Users\Zero\Cortexist\little-gemma\docs\fig-ttfb-vs-length.svg", "w", encoding="utf-8").write("\n".join(s))
+open(_OUT, "w", encoding="utf-8").write("\n".join(s))
 print("wrote fig-ttfb-vs-length.svg")

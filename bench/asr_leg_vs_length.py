@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# asr_leg_vs_length.py — the HuggingFace-cascade ASR leg for §5.9 / Figure 4.
+# asr_leg_vs_length.py — the HuggingFace-cascade ASR leg for §5.9 / Figure 5.
 # Synthesizes the six questions from ttfb_vs_length.py with piper, measures each
 # clip's REAL spoken duration, and times the faster-whisper base-int8 AND
 # tiny.en transcription (temperature=0, no fallback — the fallback machinery

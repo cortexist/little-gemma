@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" font-family="Helvetica, Arial, sans-serif">
-  <!-- Figure 1: prefill under speech. 12B, Orin NX, 929-token spoken instruction.
+  <!-- Figure 2: prefill under speech. 12B, Orin NX, 929-token spoken instruction.
        Anchor: x=240 is "last word / turn close" (t=0); 53 px per second after it.
        The 30 s speech window left of the anchor is compressed (break marks). -->
   <rect width="760" height="360" fill="#ffffff"/>

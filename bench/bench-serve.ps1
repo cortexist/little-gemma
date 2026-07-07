@@ -2,15 +2,18 @@
 # llama.cpp.diagrams/tensorsharp-llama.cpp-benchmark.md: socket serve path,
 # N identical turns, first turn discarded (repack/clock warmup), best-of-rest.
 # Usage: .\bench-serve.ps1 [-WideChunk 0] [-Turns 6] [-Words 900] [-Bin path]
+# $Bin/$CAT default to this repo's Release build (resolved from the script's own
+# location). $Model has no in-repo default (the gguf lives in a sibling checkout);
+# pass -Model or set LG_BENCH_MODEL.
 param(
     [int]$WideChunk = 0,
     [int]$Turns = 6,
     [int]$Words = 900,
-    [string]$Bin = "C:\Users\Zero\Cortexist\little-gemma\build\Release\run-cuda-i8.exe",
-    [string]$Model = "C:\Users\Zero\Cortexist\llama.cpp\.scratch\gemma-4-12b\gemma-4-12B-it-Q4_K_M.gguf"
+    [string]$Bin = "$(Split-Path -Parent $PSScriptRoot)\build\Release\run-cuda-i8.exe",
+    [string]$Model = $(if ($env:LG_BENCH_MODEL) { $env:LG_BENCH_MODEL } else { "gemma-4-12B-it-Q4_K_M.gguf" })
 )
 $ErrorActionPreference = "Continue"
-$CAT = "C:\Users\Zero\Cortexist\little-gemma\build\Release\socket_cat.exe"
+$CAT = "$(Split-Path -Parent $PSScriptRoot)\build\Release\socket_cat.exe"
 $SOCK = "$env:TEMP\lg-bench.sock"
 $ERRF = "$env:TEMP\lg-bench.err"
 $OUTF = "$env:TEMP\lg-bench.out"
