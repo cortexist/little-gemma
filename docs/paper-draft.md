@@ -212,16 +212,15 @@ Three processes, one GPU owner:
   the CPU — the GPU belongs to the LLM. One ONNX call per line: first byte ≈
   whole-clause synthesis, ~0.27–0.49 s per clause on the Orin's cores
   (~18–26× realtime), 0.31 GB peak anonymous memory. Piper was chosen over
-  Kokoro on speed [TODO: one-line Kokoro comparison number if we keep this
-  claim]. CPU placement is measured, not assumed: on the A5000, CUDA piper
-  *loses* to a desktop CPU at clause length (0.112 vs 0.089 s — the ONNX
-  graph round-trips the bus 28 times for ops pinned to CPU, and launch/copy
-  overhead swamps ~20 MB of conv math) and only reaches 1.6× on long
-  sentences; clause splitting (§4.3) moves TTS precisely into the regime
-  where CPU wins, and on the Orin the iGPU would contend with decode for
-  the same LPDDR5 anyway. §4.4 removes the whole-clause wait itself: the
-  same voice files, split at the latent boundary, stream first PCM in
-  0.10 s.
+  Kokoro on speed (0.008 RTF vs ~0.47-0.51 RTF) [18]. CPU placement is 
+  measured, not assumed: on the A5000, CUDA piper *loses* to a desktop CPU 
+  at clause length (0.112 vs 0.089 s — the ONNX graph round-trips the bus 28 
+  times for ops pinned to CPU, and launch/copy overhead swamps ~20 MB of 
+  conv math) and only reaches 1.6× on long sentences; clause splitting (§4.3) 
+  moves TTS precisely into the regime where CPU wins, and on the Orin the 
+  iGPU would contend with decode for the same LPDDR5 anyway. §4.4 removes 
+  the whole-clause wait itself: the same voice files, split at the latent 
+  boundary, stream first PCM in 0.10 s.
 
 **Why external ASR when Gemma 4 is natively multimodal?** Because we
 measured the native path and it fails three ways (§7 for details): the
@@ -492,11 +491,7 @@ measured on the NX 16GB against an 8 GB budget, not yet on the Nano SKU
 GPU-saturated decode peaks ~23 W (default profile; 40 W MAXN raises clocks
 but the workload is bandwidth-bound), idle-to-peak on a supply a robot
 already carries. MTP reduces J/token 2.85 → 2.29 (§4.5). Moshi's reference
-deployment is an L4: 24 GB, ~72 W TDP datacenter card [5,6]
-[TODO: the "despite they got 100..." comparison could not be verified against
-the Moshi paper — its only "H100" mention is for TRAINING compute ("all
-models are trained on H100 GPUs"), not an inference-latency comparison;
-either complete this from a source outside the paper, or drop the aside].
+deployment is an L4: 24 GB, ~72 W TDP datacenter card [5,6].
 
 ### 5.8 Cross-silicon: the cascade vs Moshi on Moshi's hardware class
 
@@ -697,6 +692,7 @@ a good trade for most embodied products.
     S. C. Levinson. "Universals and cultural variation in turn-taking in
     conversation." Proceedings of the National Academy of Sciences,
     106(26), 10587-10592, 2009. DOI: 10.1073/pnas.0903616106
+    https://pubmed.ncbi.nlm.nih.gov/19553212
 
 [5] Kyutai Labs. "Moshi" (GitHub repository).
     https://github.com/kyutai-labs/moshi — source of the L4/24GB
@@ -737,13 +733,14 @@ a good trade for most embodied products.
      Simple LLM Inference Acceleration Framework with Multiple Decoding
      Heads." arXiv:2401.10774, 2024. https://arxiv.org/abs/2401.10774
 
-[16] NVIDIA. Jetson Orin NX 16GB module, 1KU pricing ($599).
-     https://developer.nvidia.com/embedded/buy-jetson — dev-kit price
-     ($899) per Seeed Studio reComputer J4012,
-     https://www.seeedstudio.com/reComputer-J4012-p-5586.html
+[16] Arrow Electronics. Quote on July 6, 2026: Jetson Orin NX 16GB module, 
+     1+ $699. 1000+ $599 https://www.arrow.com
 
 [17] Cortexist. "little-gemma" (GitHub repository).
      https://github.com/cortexist/little-gemma
+
+[18] Codesota. TTS models, split by track, ranked by preference.
+    https://www.codesota.com/guides/tts-models
 
 ---
 
@@ -770,29 +767,12 @@ quantization levels by gate.
       under pinned clocks before printing the decode ratio.
 - [ ] E2B Orin plain-decode re-measure paired with the tg32 37.8 reference
       (recorded 28.5; dictation reply ran 31.6 tok/s with MTP at 39.5%)
-- [ ] Kokoro comparison number, or drop the "faster than Kokoro" claim
-- [ ] Moshi note completion ("despite they got 100..."): searched the full
-      arXiv:2410.00037 text (2026-07-06) — no wattage/GPU-class comparison
-      exists near its latency claims; the only "H100" mention is for
-      TRAINING compute, unrelated to inference latency. Complete from a
-      source outside the paper, or drop the aside (see §5.7's inline TODO).
 - [ ] Moshi rigorous head-to-head: --input question.wav, clock re-anchored
       at the question's final word (script change needed in measure_ttfb.py)
-- [ ] Moshi session-aging study: GitHub reports (unverified) say latency
-      grows past 1 s as the session runs — plausible mechanism: lock-step
-      80 ms frame budget + per-step cost growing with KV history = a
-      real-time cliff that accumulates rather than jitters (the demo's
-      session cap is circumstantial evidence). Measure step time vs session
-      length. If confirmed: stationary-vs-accumulating latency becomes a §6
-      argument — the cascade re-anchors per turn and has no deadline to miss.
-- [ ] Our own session-aging curve, same rigor: TTFT/TTFB vs turn number as
-      the 8K context fills (SWA rings bound memory, but global-layer KV and
-      attention cost grow) — preempt the symmetric reviewer question.
+- [ ] Our own session-aging curve: TTFT/TTFB vs turn number as the 8K
+      context fills (SWA rings bound memory, but global-layer KV and
+      attention cost grow) — a natural reviewer question on its own merits.
 - [ ] whisper-server (persistent) live-mic TTFB
-- [x] price of Orin NX 16GB module for §3 (2026-07-06): NVIDIA 1KU module
-      price $599; Seeed Studio reComputer J4012 dev kit $899 — "$700-class"
-      didn't match either; §3 now says "$600-class module / $900-class dev
-      kit" [ref 16].
 - [ ] burst-mode row values if the matrix table keeps all three deliveries
 - [x] Related-work / intro citations filled (2026-07-06, References section
       added, refs [1]-[17]): hamming.ai (2 companion articles, exact P50/P90/
