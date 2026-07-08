@@ -285,6 +285,10 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     if (kvcache_init(&kv, &m, SERVE_SEQ) != 0) { if (md) media_free(md); model_free(&m); tokenizer_free(tk); return; }
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
+    // Thinking models open replies with a named channel; a probe verdict must
+    // not leak the name (same suppression the -p path's emit_token does).
+    int ch_open = tokenizer_token_id(tk, "<|channel>");
+    int ch_close = tokenizer_token_id(tk, "<channel|>");
 
     // The draft head (-mtp): block-2 speculative decode, same as generate().
     // A failed open falls back to plain greedy (NULL) — log either way so the
@@ -503,8 +507,11 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                             int (*pick)(const float *, int) = model_pick;
                             model_pick = NULL;
                             int b = model_forward_next(&m, &kv, promptv[np - 1], pp++);
+                            int in_ch = 0;               // inside a channel NAME (thinking models)
                             while (b != eot && b != eos) {
-                                if (!tokenizer_is_special(tk, b))
+                                if (b == ch_open) in_ch = 1;
+                                else if (b == ch_close) in_ch = 0;
+                                else if (!in_ch && !tokenizer_is_special(tk, b))
                                     vn = append_piece(verdict, vn, sizeof verdict, tokenizer_token_text(tk, b));
                                 if (++gen >= max_gen || pp + 1 >= SERVE_SEQ) break;
                                 b = model_forward_next(&m, &kv, b, pp++);
