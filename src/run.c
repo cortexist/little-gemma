@@ -146,6 +146,8 @@ static void print_piece(const char *s) {
                          // degenerate greedy loop would otherwise spin until the
                          // context fills (observed: 8,098 tokens, 270 s, of the
                          // same sentence about a typo); -temp mostly defuses these
+#define PROBE_GEN_CAP 32   // most tokens one listener probe may decode ('P' frame w)
+#define PROBE_TEXT_CAP 256 // probe verdict text cap on the wire
 
 
 static int send_all(sock_t s, const char *buf, int n) {
@@ -157,15 +159,22 @@ static int send_all(sock_t s, const char *buf, int n) {
     return 0;
 }
 
+// Append a token's text at dst[n] (▁ marker rendered as a space, always
+// NUL-terminated); returns the new length.
+static int append_piece(char *dst, int n, int cap, const char *t) {
+    if (!t) { dst[n] = 0; return n; }
+    for (const char *p = t; *p && n < cap - 1; p++) {
+        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81)
+            { dst[n++] = ' '; p += 2; } else dst[n++] = *p;
+    }
+    dst[n] = 0;
+    return n;
+}
+
 // One token's text onto the wire, with the ▁ marker rendered as a space.
 static int send_piece(sock_t s, const char *t) {
-    char buf[512]; int n = 0;
-    if (!t) return 0;
-    for (const char *p = t; *p && n < (int)sizeof buf - 1; p++) {
-        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81)
-            { buf[n++] = ' '; p += 2; } else buf[n++] = *p;
-    }
-    return send_all(s, buf, n);
+    char buf[512];
+    return send_all(s, buf, append_piece(buf, 0, sizeof buf, t));
 }
 
 // Anything the client says mid-generation. 0 = nothing; 1 = the connection
@@ -235,6 +244,27 @@ static int recv_n(sock_t s, void *buf, int n) {
         p += k; n -= k;
     }
     return 0;
+}
+
+// Prefill the open turn's accumulated text up to its last space and keep the
+// remainder in `chat` — dictation's incremental flush. SentencePiece pieces
+// never cross a space, so the split token stream is byte-identical to
+// tokenizing the whole turn at once. Returns the tokens prefilled (0 when the
+// text has no space to split at yet).
+static int flush_tail(struct tokenizer *tk, struct model *m, struct kvcache *kv,
+                      char *chat, int *tl, int *skip, int *pos, int *promptv) {
+    int split = *tl - 1;
+    while (split > 0 && chat[split] != ' ') split--;
+    if (split <= 0) return 0;
+    chat[split] = 0;
+    int n = tokenizer_encode(tk, chat, promptv, 4096);
+    int adv = n - *skip;
+    model_prefill_mixed(m, kv, NULL, promptv + *skip, adv, *pos);
+    *pos += adv; *skip = 1;
+    chat[split] = ' ';
+    memmove(chat, chat + split, (size_t)(*tl - split) + 1);
+    *tl -= split;
+    return adv;
 }
 
 static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
@@ -423,25 +453,71 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     // (voicecat's confirmed transcript), so prefill the text as
                     // it accumulates and the prefill HIDES under the speaking —
                     // a 929-token spoken instruction answers in the tail time,
-                    // not 5+ seconds after the user stops. Split at the last
-                    // SPACE and keep it with the remainder: SentencePiece
-                    // pieces never cross a space, so the split token stream is
-                    // byte-identical to tokenizing the whole turn at once.
+                    // not 5+ seconds after the user stops (the space-split rule
+                    // that keeps this byte-identical lives in flush_tail).
                     if (tl >= SERVE_TEXT_FLUSH && pos + tl + 64 < SERVE_SEQ) {
-                        int split = tl - 1;
-                        while (split > 0 && chat[split] != ' ') split--;
-                        if (split > 0) {
-                            chat[split] = 0;
-                            n = tokenizer_encode(tk, chat, promptv, 4096);
-                            double f0 = now_sec();
-                            model_prefill_mixed(&m, &kv, NULL, promptv + skip, n - skip, pos);
-                            pos += n - skip; total += n - skip; skip = 1;
-                            tp += now_sec() - f0;
-                            chat[split] = ' ';
-                            memmove(chat, chat + split, (size_t)(tl - split) + 1);
-                            tl -= split;
+                        double f0 = now_sec();
+                        total += flush_tail(tk, &m, &kv, chat, &tl, &skip, &pos, promptv);
+                        tp += now_sec() - f0;
+                    }
+                    continue;
+                }
+                if (hdr[0] == MEDIA_FRAME_PROBE && len <= 2048) {
+                    // A LISTENER PROBE — "if my turn ended right HERE, what
+                    // would you say?" — a dry-run turn close on the live
+                    // context, for a client arbitrating duplex behavior (nod,
+                    // backchannel, take the turn) while its user is still
+                    // speaking. The confirmed tail prefills for REAL first (it
+                    // is committed transcript; back-to-back probes then re-pay
+                    // only the transient part). The close + suffix + generated
+                    // tokens are rolled back by NOT advancing pos: rows they
+                    // wrote are rewritten by the turn's real tokens at the same
+                    // positions before any later query can attend them — the
+                    // invariant the engine warmup and an MTP reject already
+                    // rely on. h_prev self-heals the same way: the real turn's
+                    // head forward refreshes it before any draft reads it.
+                    // Probes pick greedily (the -temp RNG must not advance), so
+                    // a probed session's replies stay byte-identical to an
+                    // unprobed session's. The verdict goes back mid-turn as
+                    // "<|probe>text<probe|>\n"; the suffix wording, the
+                    // cadence, and what the words mean are the CLIENT's policy
+                    // — the engine only owns the mechanism and its bounds.
+                    payload[len] = 0;
+                    double p0 = now_sec();
+                    int max_gen = w > 0 ? (w > PROBE_GEN_CAP ? PROBE_GEN_CAP : w) : 4;
+                    char verdict[PROBE_TEXT_CAP];
+                    int vn = 0, nfl = 0, gen = 0;
+                    verdict[0] = 0;
+                    if (pos + tl + (int)len + max_gen + 96 < SERVE_SEQ) {
+                        double f0 = now_sec();
+                        nfl = flush_tail(tk, &m, &kv, chat, &tl, &skip, &pos, promptv);
+                        total += nfl; tp += now_sec() - f0;
+                        char pchat[8704];
+                        int pl = snprintf(pchat, sizeof pchat, "%s%s<turn|>\n<|turn>model\n", chat, payload);
+                        if (pl > 0 && pl < (int)sizeof pchat) {
+                            int np = tokenizer_encode(tk, pchat, promptv, 4096);
+                            int pp = pos;
+                            if (np - 1 - skip > 0)
+                                model_prefill_mixed(&m, &kv, NULL, promptv + skip, np - 1 - skip, pp);
+                            pp += np - 1 - skip;
+                            int (*pick)(const float *, int) = model_pick;
+                            model_pick = NULL;
+                            int b = model_forward_next(&m, &kv, promptv[np - 1], pp++);
+                            while (b != eot && b != eos) {
+                                if (!tokenizer_is_special(tk, b))
+                                    vn = append_piece(verdict, vn, sizeof verdict, tokenizer_token_text(tk, b));
+                                if (++gen >= max_gen || pp + 1 >= SERVE_SEQ) break;
+                                b = model_forward_next(&m, &kv, b, pp++);
+                            }
+                            model_pick = pick;           // pos untouched = the rollback
                         }
                     }
+                    free(payload);
+                    char env[PROBE_TEXT_CAP + 32];
+                    int en = snprintf(env, sizeof env, "<|probe>%s<probe|>\n", verdict);
+                    if (send_all(c, env, en) != 0) { dead = 1; break; }
+                    fprintf(stderr, "probe: '%s' — %.2fs (%d tail tokens flushed, %d decoded)\n",
+                            verdict, now_sec() - p0, nfl, gen);
                     continue;
                 }
                 if (!md) { fprintf(stderr, "media frame but no -mm projector\n"); free(payload); dead = 1; break; }

@@ -73,4 +73,16 @@ float *media_embed_audio(struct media *md, const int16_t *pcm, int n_samples, in
 // next turn mentions the interruption is the client's choice (a text note).
 #define MEDIA_BARGE        0x02
 
+// Listener probe (duplex prototype): a 'P' frame sent while the user turn is
+// still OPEN asks "if the turn ended right here, what would you say?" — the
+// engine dry-runs the turn close (payload = a steering suffix appended inside
+// the user turn first; w = max tokens to decode, 0 for the default), replies
+// mid-turn with "<|probe>text<probe|>\n", and rolls the context back, so a
+// probed conversation is byte-identical to an unprobed one. This is what lets
+// a voice client arbitrate duplex behavior — nod, backchannel, take the turn —
+// with the model's own judgment while its user is still speaking. Send it only
+// while listening (never with a reply pending); payload must be >= 1 byte
+// (send "\n" for a bare end-point peek).
+#define MEDIA_FRAME_PROBE  'P'
+
 #endif // MEDIA_H
