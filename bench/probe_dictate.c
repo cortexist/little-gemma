@@ -64,9 +64,10 @@ static double now_sec(void) {
 #define FRAME_MAGIC 0x01
 
 static const char *g_suffix =
-    "\n(brief listener check - I am still mid-request; reply with exactly one "
-    "lowercase word: nod if you follow me so far, mhmm to acknowledge me, "
-    "answer if my request is already complete, quiet otherwise)";
+    "\n(brief listener check - I am still mid-request, keep listening; emit "
+    "exactly one backchannel tag: [[nod]] if you follow me so far, [[mhmm]] to "
+    "acknowledge me, [[answer]] if my request is already complete, [[quiet]] "
+    "otherwise)";
 
 static int send_all(sock_t s, const void *buf, size_t n) {
     const char *p = buf;
