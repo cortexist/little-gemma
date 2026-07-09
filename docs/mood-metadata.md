@@ -5,6 +5,17 @@ for the model emitting tags reliably. The mechanism chosen is in-band
 tool-call control lines (below), which replaced the JSON-lines idea from the
 first draft of this note.*
 
+*UPDATE 2026-07-09 (duplex branch): the MODEL-facing grammar moved to the
+inline tag form `[[emotion:happy]]` — 5 tokens vs the tool-call line's 17,
+and semantically an annotation, not a call. `docs/voice-sys.txt` teaches the
+tag; `clausecat --route-emotion` (and voicedemo) translate it into the very
+control line documented below, so piper and everything downstream of the
+orchestrator are unchanged — this doc's piper/mux/demux design stands.
+Measured bonus: under the tag grammar the E4B emits emotion spans PROMPT-ONLY
+(sad→neutral→happy tracking a story arc, exact spans) — the tool-call form
+needed the 12B. The old form still parses (`--allow-control-token`), so mixed
+sessions migrate gracefully.*
+
 ## The requirement
 
 The LLM annotates its own speech with expression/mood. The voice changes

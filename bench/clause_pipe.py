@@ -20,15 +20,20 @@ PUNCT = ",;:.!?"
 AFTER = " \t\n\r\f\v*)\"']"
 TAG_MAX = 26
 SPAN_MAX = 4096
+TAGSPAN_MAX = 64
 
 allow = None
+route_emotion = False
 args = sys.argv[1:]
 while args:
     if args[0] == "--allow-control-token" and len(args) > 1:
         allow = args[1]
         args = args[2:]
+    elif args[0] == "--route-emotion":
+        route_emotion = True
+        args = args[1:]
     else:
-        sys.exit("usage: clause_pipe.py [--allow-control-token PATTERN]")
+        sys.exit("usage: clause_pipe.py [--allow-control-token PATTERN] [--route-emotion]")
 
 line = ""
 
@@ -79,18 +84,24 @@ def main():
     span = ""                    # a <|tool_call> span being captured
     tcall = False
     tclose, tcn = "<tool_call|>", 0
+    tsp = ""                     # a [[key:value]] inline tag being captured
+    brk = False                  # inside [[ ... ]]
+    pb = False                   # a pending lone '[' (may open a tag)
 
     while True:
         b = os.read(0, 4096)
         if not b:
             break
         for c in b.decode("utf-8", errors="replace"):
-            if c == "\n":        # end of turn: pending '<...' was literal text
-                if not thought and not tcall:
+            if c == "\n":        # end of turn: pending '<...'/'[' was literal
+                if not thought and not tcall:   # text; unterminated [[ drops
+                    if pb:
+                        emit("[")
                     for t in tag:
                         emit(t)
                 flush_line()
                 tag, thought, cn, tcall, span, tcn = "", False, 0, False, "", 0
+                pb, brk, tsp = False, False, ""
                 continue
             if thought:          # discard until the exact close marker
                 cn = cn + 1 if c == close[cn] else (1 if c == close[0] else 0)
@@ -126,11 +137,41 @@ def main():
                 for t in tag:    # too long or '<': literal
                     emit(t)
                 tag = ""
+            if brk:              # capture a [[...]] inline tag until "]]"
+                if c == "]" and tsp.endswith("]"):
+                    key = tsp[:-1]
+                    # [[emotion:X]] -> piper's voice-switch line (--route-emotion);
+                    # every other tag drops whole - inline tags are control, not speech
+                    if route_emotion and key.startswith("emotion:") and key[8:]:
+                        flush_line()   # the switch holds its place among the clauses
+                        sys.stdout.write('<|tool_call>call:set_voice{speaker_id:<|"|>%s<|"|>}<tool_call|>\n' % key[8:])
+                        sys.stdout.flush()
+                    brk, tsp = False, ""
+                    continue
+                if len(tsp) < TAGSPAN_MAX - 1:
+                    tsp += c
+                    continue
+                emit("[")        # overflow: it was literal text after all
+                emit("[")
+                for t in tsp:
+                    emit(t)
+                brk, tsp = False, ""
+            if pb:
+                pb = False
+                if c == "[":     # "[[" opens a tag span
+                    brk, tsp = True, ""
+                    continue
+                emit("[")        # a lone '[' was literal text
+            if c == "[":
+                pb = True
+                continue
             if c == "<":
                 tag = "<"
                 continue
             emit(c)
     if not thought and not tcall:
+        if pb:
+            emit("[")
         for t in tag:
             emit(t)
     flush_line()
