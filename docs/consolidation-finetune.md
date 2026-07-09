@@ -45,6 +45,24 @@ Every sample teaches the budget; each also carries one load-bearing skill:
   forward"; a quiet year is *honestly* quiet. At 1000:1 compression,
   inventing a past is the catastrophic failure mode, so degenerate inputs
   are a first-class sample type, not an afterthought.
+- **Associative (flashbulb) salience.** Significance attaches to
+  *episodes*, and details inherit their episode's weight: the car and the
+  suit from graduation day outlive a sprained wrist two months later, even
+  though on any ordinary day clothing is the first thing dropped. The
+  structural enemy is a UNIFORM budget — "merge the year into one
+  sentence" forces flat coverage (measured on E4B: "routine work,
+  graduation, a sprained wrist, a new job, quiet months" — every event one
+  clause, zero texture). The merge asks are therefore anomaly-shaped:
+  *spend nearly all the words on the single defining event, keep its small
+  details; everything else gets a clause or nothing*. Measured on E4B
+  prompt-only, this ask alone recovers the human pattern ("Graduating was
+  the big moment. You rode in Marta's red Civic. You wore the blue suit
+  your dad bought." — stairs fall gone entirely), so the finetune's job is
+  robustness and flagship-*judgment* in ambiguous periods, not the
+  mechanism itself. The paired-contrast samples (flagship texture kept
+  NEXT TO a notable-but-isolated event dropped, in the same target) are
+  the teaching signal, and the uneventful-year sample guards the other
+  edge: when no flagship exists, none may be manufactured.
 - **Tag hygiene.** Conversation context contains `[[emotion:...]]` and
   thought spans (realistic); targets never do. (The client strips them
   mechanically too — belt and suspenders.)
@@ -61,8 +79,14 @@ hardest, so it is oversampled ~10x its runtime share):
 | L1 day merge | 20% | resolved-loop dropping is the core skill |
 | L2 week merge | 12% | life events over routine |
 | L3 month merge | 8% | durable facts only |
-| L4 year merge | 10% | one sentence; includes uneventful years |
+| L4 year merge | 10% | anomaly-budget passage; includes uneventful years |
 | degenerate / negative | 10% | small-talk sessions, trivia-only days, contradictory inputs, near-empty merges — spread across levels |
+
+Within every merge level (L1–L4), roughly **a quarter of samples are
+flashbulb-contrast pairs**: a flagship episode whose incidental texture
+survives, next to a more notable-*sounding* isolated event that vanishes.
+The remaining merges are ordinary periods, so the model also learns when
+NOT to elevate anything.
 
 A recommended companion slice (outside this mix, ~5% extra): **recall**
 samples — a ledger seed in context, the user asks "when is Ana visiting?",
