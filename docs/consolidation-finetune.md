@@ -111,3 +111,52 @@ coming?", "what did I show you yesterday?") and score answers against the
 scenario ground truth. The E4B Friday-drop is the baseline to beat; the
 metric is *open-loop survival rate* and *date accuracy* after N
 consolidation levels, not summary fluency.
+
+## Related work — what to take from each
+
+Architectures. **Generative Agents** (Park et al. 2023, arXiv 2304.03442):
+memory stream retrieved by recency x importance x relevance, and
+*reflection* — periodic synthesis of raw memories into higher abstractions,
+triggered when accumulated model-scored importance (1–10 "poignancy")
+crosses a threshold. Take: the importance score is a cheap flagship-judgment
+primitive, and consolidation can be importance-triggered, not only
+time-triggered — a big day earns its merge early. **MemGPT/Letta** +
+*sleep-time compute* (2023–25): memory work moved off the user-facing
+critical path to idle agents — independent validation of the idle-cycle
+trigger; also memory-pressure as a second trigger. **MemoryBank** (2023):
+explicit Ebbinghaus curve with strength *refreshed on recall* — a ledger
+entry the user actually asks about should decay slower (cheap: touch its
+weight on use). **Mem0** (ECAI 2025): memory edits as structured
+ADD/UPDATE/DELETE/NOOP decisions — the corrections-collapse discipline,
+formalized; also the first ten-way comparison on LoCoMo. **Zep/Graphiti**:
+bi-temporal bookkeeping — event time vs. record time — which our ledger
+already has (digest anchors vs. line stamp); keep them distinct on purpose.
+**TiMem** (2026, arXiv 2601.02845) "temporal-hierarchical memory
+consolidation" and **MemoryOS**/**MemForest** (2025–26) are the closest
+recent systems — read before building the consolidation job.
+
+Datasets. **MSC** (Multi-Session Chat, Xu et al. 2021): multi-session
+dialogs with gold summaries carried between sessions — reformat directly
+into L0 samples. **DialogSum/SAMSum**: generic L0 volume. **LoCoMo**
+(2024): steal the *generation method* — build a temporal event graph
+first, render conversations from it, and eval ground truth comes free;
+its five QA categories (single-hop / multi-hop / temporal / open-domain /
+adversarial) shape the probe eval. **LongMemEval** (2024–25): timestamped
+sessions, five abilities — information extraction, multi-session
+reasoning, temporal reasoning, knowledge updates, abstention — a near 1:1
+match to this doc's skill list; adopt the taxonomy, and running the
+benchmark itself through the compress pipeline is a publishable eval.
+**BookSum**: paragraph->chapter->book targets, the hierarchical-ratio
+precedent.
+
+Cognitive science. Systems consolidation ("semanticization": episodic
+detail fades to semantic gist) is the ledger's aging, and fuzzy-trace
+theory (verbatim and gist as parallel traces, verbatim decaying faster)
+is the today-verbatim/old-gist split. One warning worth engineering
+around: flashbulb memories in humans are confidently WRONG in detail
+(Neisser's Challenger studies) because each recall re-writes them. The
+ledger avoids reconsolidation error structurally (append-only, recorded
+once) — but only if merges QUOTE surviving details verbatim ("Marta's old
+red Civic") instead of paraphrasing them; ten years of re-merges must not
+be ten years of drift. Sample targets therefore carry flagship texture as
+exact quotes across levels.
