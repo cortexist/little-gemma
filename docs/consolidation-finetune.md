@@ -41,6 +41,24 @@ Every sample teaches the budget; each also carries one load-bearing skill:
   raw spans are gone by design — see the A/V exclusion rationale).
 - **Corrections collapse.** Only the corrected fact survives ("Wednesday,
   not Thursday"), never the history of the mistake.
+- **State changes are NOT mistakes — they compress as dated transitions.**
+  "Lived in Seattle" was true; "moved to California in June" supersedes it
+  without falsifying it. A mistake deletes; a change keeps BOTH states with
+  direction and dates ("moved Jun 17 from Seattle to Santa Rosa"). This is
+  the *ghost memory* failure class isolated by LTP (LoCoMo Temporal Plus,
+  the A-TMA paper's LoCoMo supplement, arXiv 2607.01935): stale state
+  resurfacing after an update — mutable slots (job, home, relationships,
+  pets, preferences, numbers), old-state cues planted early, updates late,
+  probed from TWO views (current state and history). Graph-memory systems
+  scored 0.48 conflict accuracy there; measured HERE, dated ledger entries
+  defeat the basic case prompt-only on E4B (current "Santa Rosa", history
+  "Seattle, Green Lake", transition "June" — all correct), so the risk
+  concentrates in MERGES that drop a transition's direction. The eval
+  adopts LTP's two-view probing: every mutable slot in a scenario is asked
+  both ways after each consolidation level, and the event-graph generator
+  plants mutable slots with update events on both sides of compression
+  boundaries (their time-quantile placement, translated to ledger-entry
+  boundaries).
 - **No confabulation.** Small talk compresses to "nothing to carry
   forward"; a quiet year is *honestly* quiet. At 1000:1 compression,
   inventing a past is the catastrophic failure mode, so degenerate inputs
