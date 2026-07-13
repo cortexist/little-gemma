@@ -138,8 +138,8 @@ __device__ __forceinline__ void fa_mma(float &c0,float &c1,float &c2,float &c3,
 // kernel (every loop collapses to the old bounds). Shared memory is dynamic
 // (G=2 at hd 256 needs ~62 KB, past the 48 KB static limit).
 template<int HD, bool RING, typename KT, int G>
-__global__ static void __launch_bounds__(256, 2)
-flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
+__global__ static void __launch_bounds__(256, G >= 4 ? 1 : 2)   // G=4: 128 acc floats/thread
+flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,   // need the full register file
                     int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
                     const int *seg, int bidir_hi){
     const int FKB = 32, FHDW = HD/8, ROWS = 32*G;          // keys/block; PV hd-slice per warp
@@ -264,26 +264,39 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
 static size_t flash_shm(int hd, int G, bool kstage) {
     return (size_t)32*G*hd*2 + (size_t)32*G*32*6 + (size_t)32*G*12 + (kstage ? (size_t)32*(hd+8)*2 : 0);
 }
-// The G=2 launches live in a specialization so the hd-512 packed instantiation
-// (128 acc floats/thread — it would spill, and nothing ever launches it) never
-// exists in the binary.
+// The packed launches live in a specialization so the hd-512 packed
+// instantiation (it would spill, and nothing ever launches it) never exists
+// in the binary. G=2 ships all four KT/RING flavors; G=4 (one CTA/SM, the
+// full register file for its 128 acc floats) ships f16-only — the f32-ring
+// K-stage would push shared past sm_86's 99 KB per-CTA cap, and the f16
+// SWA rings made the f32 flavors legacy anyway.
 template<int HD> struct flash_packed {
     static bool go(float*, const float*, const void*, const void*, int, int, const int*, int, int, int, int,
-                   bool, bool, const int*, int) { return false; }
+                   bool, bool, const int*, int, int) { return false; }
 };
 template<> struct flash_packed<256> {
     static bool go(float *dxb, const float *dq, const void *Kc, const void *Vc,
                    int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
-                   bool f16, bool ring, const int *seg, int bidir_hi) {
-        dim3 g(n_head/2, (B + 31) / 32);
-        size_t shm = flash_shm(256, 2, !f16);
+                   bool f16, bool ring, const int *seg, int bidir_hi, int G) {
+        dim3 g(n_head/G, (B + 31) / 32);
+        size_t shm = flash_shm(256, G, !f16);
         static int carve = 0;
-        if (!carve) {                                       // ~62 KB > the 48 KB default
+        if (!carve) {                                       // ~62-90 KB > the 48 KB default
             cudaFuncSetAttribute(flash_attn_n_kernel<256,false,__half,2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,false));
             cudaFuncSetAttribute(flash_attn_n_kernel<256,true, __half,2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,false));
             cudaFuncSetAttribute(flash_attn_n_kernel<256,true, float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
             cudaFuncSetAttribute(flash_attn_n_kernel<256,false,float, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,2,true));
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,false,__half,4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,4,false));
+            cudaFuncSetAttribute(flash_attn_n_kernel<256,true, __half,4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_shm(256,4,false));
             carve = 1;
+        }
+        if (G == 4) {
+            if (!f16) return false;                         // f32+G4: shared past the sm_86 cap
+            static int seen4 = 0;                           // wiring proof: a zero delta must be
+            if (!seen4) { seen4 = 1; fprintf(stderr, "flash: G=4 pack engaged (n_head %d, gqa %d)\n", n_head, gqa); }
+            if (ring) flash_attn_n_kernel<256,true, __half,4><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+            else      flash_attn_n_kernel<256,false,__half,4><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+            return true;
         }
         if (f16 && ring) flash_attn_n_kernel<256,true, __half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
         else if (f16)  flash_attn_n_kernel<256,false,__half,2><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
@@ -294,9 +307,11 @@ template<> struct flash_packed<256> {
 };
 // hd is a compile-time template (256 SWA / 512 global); pick KT/RING like the
 // per-query dispatch: f16 -> global (no ring), f32+seq<max -> SWA ring, else
-// full f32. GQA packing (G=2, hd 256, gqa 2) defaults ON for integrated GPUs —
-// it halves the K/V instruction stream the Orin is throttled on, but costs the
-// A5000 a CTA of occupancy; LG_FLASH_GQA=0/1 overrides.
+// full f32. GQA packing (hd 256) defaults ON for integrated GPUs — it divides
+// the K/V instruction stream the Orin is throttled on by G, but costs the
+// A5000 occupancy. G is the largest of {4,2} dividing gqa (G=2 on gemma's
+// gqa-2 12B; gqa-4 E4B and gqa-8 E2B take G=4, f16 layers only — see
+// flash_packed). LG_FLASH_GQA: 0 off, 1 auto, 2/4 cap G.
 template<int HD>
 static void launch_flash(float *dxb, const float *dq, const void *Kc, const void *Vc,
                          int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
@@ -307,9 +322,14 @@ static void launch_flash(float *dxb, const float *dq, const void *Kc, const void
         if (e) pack_pol = atoi(e);
         else { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); pack_pol = p.integrated ? 1 : 0; }
     }
-    if (pack_pol && HD == 256 && gqa == 2 && (n_head & 1) == 0 &&
-        flash_packed<HD>::go(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, seq, B, n_head, f16, ring, seg, bidir_hi))
-        return;
+    if (pack_pol && HD == 256) {
+        int cap = pack_pol == 1 ? 4 : pack_pol;            // 1 = auto: largest allowed
+        int G = 0;
+        if (f16 && cap >= 4 && gqa % 4 == 0 && n_head % 4 == 0) G = 4;
+        else if (cap >= 2 && gqa % 2 == 0 && n_head % 2 == 0)   G = 2;
+        if (G && flash_packed<HD>::go(dxb, dq, Kc, Vc, kv_dim, gqa, d_pos, window, seq, B, n_head, f16, ring, seg, bidir_hi, G))
+            return;
+    }
     dim3 g(n_head, (B + 31) / 32);                         // y = 32-query tiles (B>32 prefill chunks)
     size_t shm = flash_shm(HD, 1, HD == 256 && !f16);
     if (f16 && ring) flash_attn_n_kernel<HD,true,__half,1><<<g,256,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
