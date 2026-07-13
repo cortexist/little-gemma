@@ -548,7 +548,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 best = out[adv - 1];
             }
             double dt = now_sec() - t1;
-            fprintf(stderr, "turn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s), ttft %.2fs\n",
+            fprintf(stderr, "\nturn: %d in %.2fs (%.1f tok/s), %d out %.2fs (%.1f tok/s), ttft %.2fs\n",
                     total, tp, total / (tp > 0 ? tp : 1e-9),
                     g, dt, g / (dt > 0 ? dt : 1e-9),
                     t1 - t0);
