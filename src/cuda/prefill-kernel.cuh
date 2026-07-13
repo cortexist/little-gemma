@@ -323,7 +323,11 @@ static void launch_flash(float *dxb, const float *dq, const void *Kc, const void
         else { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); pack_pol = p.integrated ? 1 : 0; }
     }
     if (pack_pol && HD == 256) {
-        int cap = pack_pol == 1 ? 4 : pack_pol;            // 1 = auto: largest allowed
+        int cap = pack_pol == 1 ? 2 : pack_pol;            // auto = G2: G4 measured SLOWER than
+                                                           // G2 on Orin E4B even at 4K ctx (383.4
+                                                           // vs 385.6 tok/s) — the 4x K/V cut
+                                                           // loses to 1-CTA/SM occupancy; G4
+                                                           // stays reachable via LG_FLASH_GQA=4
         int G = 0;
         if (f16 && cap >= 4 && gqa % 4 == 0 && n_head % 4 == 0) G = 4;
         else if (cap >= 2 && gqa % 2 == 0 && n_head % 2 == 0)   G = 2;
