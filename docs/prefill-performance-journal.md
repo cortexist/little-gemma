@@ -1619,4 +1619,42 @@ absolute `C:\Users\Zero` paths headed for the public repo — now
 traps re-confirmed the hard way: `cd x && server & client` puts the cd
 inside the backgrounded subshell (clients ran from $HOME), and
 `pkill -f "run-cuda-i8 -m"` matches the remote shell's own command line
+
+## 2026-07-16 — float4 chunk rmsnorm: a small but real prefill win on E4B
+
+Branch `prefill-e4b-orin`. The 2026-07-02 sweep left the elementwise pool
+at ~0.18 s of the 1.44 s Orin gap with no isolated verdict. ncu on the
+chunk norms (E4B, A5000): `rmsnorm_w_n_kernel` 43% memory throughput /
+28% SM at 30% occupancy; `rmsnorm_add_w_n_kernel` 74% / 16%. Both are
+scalar one-float-per-lane loops over `n` — each warp reads `x` twice
+(rowsum + multiply), `w` once, writes once, with 80–120 scalar iterations
+per row (n=2560/3840).
+
+Change: float4 vectorize both loops in `rmsnorm_w_n_kernel` and
+`rmsnorm_add_w_n_kernel` (and `d_warp_rowsum2` with them). The multiply
+loop keeps the exact per-element arithmetic order → byte-identical; the
+rowsum regroups each lane's addends (same shuffle tree after) — the
+project's numerics-gated class, verified byte-identical on a high-entropy
+random-words prompt for E4B/12B/E2B (the redundant-paragraph trap from
+the ring-spare bug is why the gate uses random words).
+
+Measured (warm serve, 928-token turns, first discarded):
+
+| device | model | before | after | delta |
+|---|---|---:|---:|---:|
+| A5000 | E4B | 3715.5 | 3755.0 | **+1.1%** |
+| Orin  | E4B | 415.5  | 419.3  | **+1.0%** |
+| A5000 | 12B | 1806.8 | 1805.5 | ~0 (noise) |
+| Orin  | 12B | 172.8  | 173.5  | +0.4% |
+| A5000 | E2B QAT | 7127.4 | 7151.5 | +0.3% |
+| Orin  | E2B QAT | 825.5  | 830.8  | +0.6% |
+
+Kernel-level (A5000): `rmsnorm_w_n_kernel` 129→113 µs (−12%),
+`rmsnorm_add_w_n_kernel` 67→57 µs (−15%); memory throughput 43→49% and
+74→89% respectively. The E4B win is the largest because n_embd=2560 puts
+the norms at ~10% of prefill time; 12B's bigger matmuls dilute it to
+noise, and E2B's tiny rows leave little to recover. llama.cpp's
+`rms_norm_f32` already loads f32x4 — this closes that slice of the
+elementwise gap. The rest of the pool (geglu, rope, the small
+`rmsnorm_kernel`) is unchanged.
 and kills the session — use `pkill -x`.
