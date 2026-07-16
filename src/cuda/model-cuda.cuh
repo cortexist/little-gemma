@@ -184,7 +184,14 @@ __global__ static void rmsnorm_add_n_kernel(float *acc, const float *x, const fl
 // frozen in its captured graph.
 __device__ static float d_warp_rowsum2(const float *xr, int n, int lane) {
     float ss = 0.0f;
-    for (int i = lane; i < n; i += 32) ss += xr[i] * xr[i];
+    if ((n & 127) == 0) {                          // float4 fast path: 4x fewer load transactions
+        for (int i = lane * 4; i < n; i += 32 * 4) {
+            float4 x4 = *(const float4 *)(xr + i);
+            ss += x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w;
+        }
+    } else {
+        for (int i = lane; i < n; i += 32) ss += xr[i] * xr[i];
+    }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     return ss;
@@ -196,8 +203,30 @@ __global__ static void rmsnorm_w_n_kernel(float *out, const float *x, const floa
     const float *xr = x + (size_t)row * n;
     float *outr = out + (size_t)row * n;
     float scale = rsqrtf(d_warp_rowsum2(xr, n, lane) / (float)n + eps);
-    if (w) for (int i = lane; i < n; i += 32) outr[i] = xr[i] * scale * w[i];
-    else   for (int i = lane; i < n; i += 32) outr[i] = xr[i] * scale;
+    if ((n & 127) == 0) {                          // float4 fast path (byte-identical multiply order)
+        if (w) for (int i = lane * 4; i < n; i += 32 * 4) {
+            float4 x4 = *(const float4 *)(xr + i);
+            float4 w4 = *(const float4 *)(w + i);
+            float4 o4;
+            o4.x = x4.x * scale * w4.x;
+            o4.y = x4.y * scale * w4.y;
+            o4.z = x4.z * scale * w4.z;
+            o4.w = x4.w * scale * w4.w;
+            *(float4 *)(outr + i) = o4;
+        }
+        else   for (int i = lane * 4; i < n; i += 32 * 4) {
+            float4 x4 = *(const float4 *)(xr + i);
+            float4 o4;
+            o4.x = x4.x * scale;
+            o4.y = x4.y * scale;
+            o4.z = x4.z * scale;
+            o4.w = x4.w * scale;
+            *(float4 *)(outr + i) = o4;
+        }
+    } else {
+        if (w) for (int i = lane; i < n; i += 32) outr[i] = xr[i] * scale * w[i];
+        else   for (int i = lane; i < n; i += 32) outr[i] = xr[i] * scale;
+    }
     if (aq.xq) {
         __syncwarp();
         for (int g = 0; g < n / 32; g++) d_quant_group_warp(outr + g * 32, row * (n / 32) + g, aq, lane);
@@ -210,10 +239,28 @@ __global__ static void rmsnorm_add_w_n_kernel(float *acc, const float *x, const 
     const float *xr = x + (size_t)row * n;
     float *accr = acc + (size_t)row * n;
     float scale = rsqrtf(d_warp_rowsum2(xr, n, lane) / (float)n + eps);
-    for (int i = lane; i < n; i += 32) {
-        // __fadd_rn as in d_rmsnorm_add: keep the separately-rounded mul-then-add
-        float v = __fadd_rn(accr[i], xr[i] * scale * w[i]);
-        accr[i] = os ? v * os[0] : v;
+    if ((n & 127) == 0) {                          // float4 fast path (byte-identical mul/add order)
+        for (int i = lane * 4; i < n; i += 32 * 4) {
+            float4 x4 = *(const float4 *)(xr + i);
+            float4 w4 = *(const float4 *)(w + i);
+            float4 a4 = *(const float4 *)(accr + i);
+            float4 o4;
+            o4.x = __fadd_rn(a4.x, x4.x * scale * w4.x);
+            o4.y = __fadd_rn(a4.y, x4.y * scale * w4.y);
+            o4.z = __fadd_rn(a4.z, x4.z * scale * w4.z);
+            o4.w = __fadd_rn(a4.w, x4.w * scale * w4.w);
+            if (os) {
+                float s = os[0];
+                o4.x *= s; o4.y *= s; o4.z *= s; o4.w *= s;
+            }
+            *(float4 *)(accr + i) = o4;
+        }
+    } else {
+        for (int i = lane; i < n; i += 32) {
+            // __fadd_rn as in d_rmsnorm_add: keep the separately-rounded mul-then-add
+            float v = __fadd_rn(accr[i], xr[i] * scale * w[i]);
+            accr[i] = os ? v * os[0] : v;
+        }
     }
     if (aq.xq) {
         __syncwarp();
