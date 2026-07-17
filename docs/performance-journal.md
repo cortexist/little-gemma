@@ -1183,3 +1183,94 @@ occupancy-trap section ran into, and not the chunk width. Wide chunks were a rea
 +17% that cost nothing but buffer memory; closing the rest is still the q4_K ALU,
 not a flag. The lesson rhymes with the occupancy trap: the win wasn't in the
 kernel everyone stares at — it was in how often we made it re-read its weights.
+
+## The split that never split (2026-07-17)
+
+The decode attention had shipped a split-K kernel since the long-context
+roadmap: split the KV walk across `n_split` blocks per head, each computing a
+partial (max, sum, V-acc), then a combine pass merges them. It was measured at
+~3.3x decode-attn on the Orin at 4k context and left alone.
+
+The constant on top of it read:
+
+```c
+#define MAXSPLIT 8
+#define SPLIT_KEYS 1024
+int n_split = min(MAXSPLIT, max(1, (T + SPLIT_KEYS - 1) / SPLIT_KEYS));
+```
+
+and the comment above it called `n_split` **device-adaptive**. It is not: there
+is no device term in that formula. It is `ceil(T/1024)`. Which means that for
+every context under 1024 tokens, `n_split == 1` — **the split-K kernel did not
+split.** It degenerated to one block per head, and each block's KV walk grew
+linearly with depth. The kernel was doing exactly what it was written to
+prevent, for the whole context range where our decode benchmarks live.
+
+llama.cpp's fattn does the inverse, and reading it is what exposed ours: it
+pins per-block work to a fixed KV tile (`nbatch_fa` = 128 keys) and lets the
+*grid* grow with depth (`min(occupancy*SMs, ntiles_KV*ntiles_dst)`), so a CTA's
+serial walk is ~constant in context and deeper prompts buy more CTAs, not
+longer ones. That is why their `tg128` loses ~1% from depth 0 to 512 while ours
+lost double digits. `SPLIT_KEYS` is the same knob, set two orders of magnitude
+too high.
+
+**The fix is that one constant: 1024 -> 64.** Nothing else moved — the grid was
+always `n_head x MAXSPLIT` (fixed for the captured graph, with `split >=
+n_split` blocks early-exiting), so lowering the cap simply puts already-launched
+blocks to work; `n_split` is computed in-kernel from the device-resident
+position, so it stays graph-safe. Sweep on A5000 E2B: 1024 -> 147.8, 128 ->
+203.2, **64 -> 213.9**, 32 -> 214.5 tok/s. The knee is 64, and `MAXSPLIT=16`
+adds nothing (211.5) — 8 splits x 8 heads = 64 blocks = 1 CTA/SM = 2
+warps/scheduler, the same balanced-latency floor the matmul kernels sit at.
+
+The depth droop, which is the whole mechanism, shallow-avg vs 930-deep decode
+(A5000 E2B): **-14.3% -> -0.6%.** Flat, matching llama's signature.
+
+Decode, warm serve, same harness one day apart:
+
+| device | model | before | after | delta | vs llama.cpp |
+|---|---|---:|---:|---:|---|
+| A5000 | E2B QAT | 147.8 | **213.9** | **+44.7%** | 0.70x -> **1.02x** |
+| A5000 | E4B | 93.7 | **117.6** | **+25.5%** | 0.81x -> **1.01x** |
+| A5000 | 12B | 49.7 | **58.0** | **+16.7%** | 0.80x -> 0.93x |
+| Orin | E2B QAT | 30.0 | **34.5** | **+15.0%** | 0.80x -> 0.92x |
+| Orin | E4B | 16.4 | **17.9** | **+9.1%** | 1.17x -> **1.27x** |
+| Orin | 12B | 8.0 | **8.3** | **+3.8%** | 1.08x -> **1.12x** |
+
+The gain tracks attention's share of decode — largest on the smallest model,
+smallest on the largest — and is bigger on the 64-SM A5000 than the 8-SM Orin.
+Both fall out of the same arithmetic: at T=512 the old code ran 8 working
+blocks (`n_head`) walking 512 keys each. On the Orin that is 8 blocks on 8 SMs,
+which fills the board **by accident** — `MAXSPLIT 8` is the Orin's SM count and
+`n_head` is 8. On the A5000 it is 8 blocks on 64 SMs with a 4x longer serial
+walk than llama's. So the same constant that made the Orin look like a win was
+what made the desktop look like a loss, and it hid the bug on the one device we
+tuned it on.
+
+Gates (numerics-gated, relaxed class — reassociating the split changes the last
+bit, so this rides the f16-KV precedent battery, not byte-identity):
+determinism (every turn byte-identical within a build, both devices);
+coherence; **prefill unchanged as the control** (7,260 -> 7,307 A5000 E2B — it
+uses the flash kernel, so it must not move, and does not); and the **MTP
+acceptance tripwire at 43.9-45.9% vs 44.6% baseline** — no collapse, so the
+verify==decode-by-construction invariant survives (both derive `n_split` from
+the same `f(T)`, so they cannot drift apart). Long context cannot regress by
+construction: `min(8, ceil(T/64)) >= min(8, ceil(T/1024))` for all T, and both
+saturate at 8 for T >= 8192.
+
+**The lessons, in order of how much they cost:**
+
+- **A comment is not evidence.** "device-adaptive" sat above a formula with no
+  device term for months, and reading the comment instead of the arithmetic is
+  why nobody re-derived it.
+- **Tuning on one device at one context depth bakes that point into a
+  constant.** 1024 was fitted on the Orin at 4k, where it is defensible; every
+  other (device, depth) pair inherited it silently.
+- **An optimization can be dead and still measure as a win.** The split-K kernel
+  was credited with ~3.3x at 4k — true, and it stayed true — while doing
+  nothing at all below 1k. A win at the measured point says nothing about the
+  points you didn't measure.
+- **Read the competition's source, not just their numbers.** The gap had been
+  correctly localized to "E2B decode depth scaling" a day earlier from
+  benchmarks alone. Only their code said *why*, and the why was a constant we
+  already had.

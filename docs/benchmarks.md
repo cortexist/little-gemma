@@ -5,7 +5,9 @@ all three models, measured in one sitting. **These tables supersede every
 number published before 2026-07-16** (a reconciliation of the older,
 mutually inconsistent figures is at the bottom).
 
-- **Date / builds:** 2026-07-16. little-gemma `7980037` (`run-cuda-i8`);
+- **Date / builds:** prefill 2026-07-16, decode 2026-07-17 (after the KV-split
+  fix — prefill is untouched by it and was re-measured as the control:
+  A5000 E2B 7,260 → 7,307, i.e. unchanged). little-gemma `7980037`+ (`run-cuda-i8`);
   llama.cpp = the [Cortexist fork](https://github.com/cortexist/llama.cpp)
   (`83efbcc79` on the Orin, `10306b8fd` on the A5000), CUDA build.
 - **Hardware:** Jetson Orin NX 16GB (Ampere sm_87, integrated, zero-copy
@@ -41,29 +43,47 @@ best-of-two attention configs. The ratios below are therefore conservative.
 
 ## Decode (tokens/s, batch 1)
 
-| device | model | little-gemma (serve) | llama.cpp (tg128@d512) | ratio |
-|--------|-------|---------------------:|-----------------------:|------:|
-| **Orin NX** | E4B | **16.4** | 14.1 | **1.17×** |
-| **Orin NX** | 12B | **8.0** | 7.4 | **1.08×** |
-| **Orin NX** | E2B QAT | 30.0 | 37.4 | 0.80× |
-| A5000 | E4B | 93.7 | 116.1 | 0.81× |
-| A5000 | 12B | 49.7 | 62.5 | 0.80× |
-| A5000 | E2B QAT | 146.9 | 209.3 | 0.70× |
+Post the **2026-07-17 KV-split fix** (`SPLIT_KEYS 1024 → 64`; see
+[upstream-llama-study.md §4](upstream-llama-study.md) and the journal):
 
-On the **edge device this project targets, decode is ahead of llama.cpp** on
-the models that matter to it (E4B, 12B) — everything *around* the matmul
-(launch overhead, syncs, norms, the PLE path, the captured CUDA graph) is
-what a few thousand readable lines can do leanly, and decode on the Orin is
-bandwidth-bound enough that lean wins. On desktop, llama.cpp's arch-tuned
-kernels lead. The E2B QAT row is an honest open item, and it is a *depth*
-story, not a matvec story: at shallow context the stacks are near parity
-(2026-07-07 pinned pair: our serve 36.4 vs llama tg32 37.9 = 0.96×), but
-our decode slows ~18% by ~1k context while llama's fattn loses ~1% — the
-depth scaling of the split-K decode attention on E2B (small weights, so
-attention is a large share) is the one decode gap left.
-[MTP speculative decoding](mtp.md) multiplies on top of these numbers
-(byte-identical output): ~1.85–2.2× on structured output, 1.1–1.35× on
-prose, content-dependent.
+| device | model | little-gemma (serve) | llama.cpp (tg128@d512) | ratio | was |
+|--------|-------|---------------------:|-----------------------:|------:|----:|
+| **Orin NX** | E4B | **17.9** | 14.1 | **1.27×** | 1.17× |
+| **Orin NX** | 12B | **8.3** | 7.4 | **1.12×** | 1.08× |
+| **Orin NX** | E2B QAT | 34.5 | 37.4 | 0.92× | 0.80× |
+| **A5000** | E4B | **117.6** | 116.1 | **1.01×** | 0.81× |
+| A5000 | 12B | 58.0 | 62.5 | 0.93× | 0.80× |
+| **A5000** | E2B QAT | **213.9** | 209.3 | **1.02×** | 0.70× |
+
+**On the edge device this project targets, decode leads llama.cpp on both
+models that matter to it (E4B 1.27×, 12B 1.12×) — and desktop decode is now
+at parity too** (E2B 1.02×, E4B 1.01×). Everything *around* the matmul —
+launch overhead, syncs, norms, the PLE path, the captured CUDA graph — is
+what a few thousand readable lines can do leanly.
+
+The `was` column is the same harness one day earlier, and the delta is one
+constant. The decode attention splits the KV walk across `n_split` blocks per
+head; `SPLIT_KEYS` caps the keys **one block walks**, so it must be small
+enough that per-block work stays flat as context grows and the *block count*
+absorbs the depth. At 1024 it never did: below 1024 tokens `n_split == 1`, the
+split degenerated to one block per head, and each block's walk grew linearly
+with depth. Measured droop, shallow → 930-deep (A5000 E2B): **−14.3% before,
+−0.6% after** (llama.cpp's own fattn loses ~1%, for exactly this reason — it
+caps per-block work at `nbatch_fa`=128 keys and grows the grid instead).
+
+The gain tracks attention's share of decode, which is why it is largest on the
+smallest model (E2B +44.7% A5000) and smallest on the largest (12B +3.8%
+Orin), and larger on the 64-SM A5000 (which the old constant left badly
+under-filled) than the 8-SM Orin (where `n_head == 8 == SM count` filled the
+board by accident, which is why the Orin lead existed at all and why the droop
+went unnoticed).
+
+The one remaining decode gap is **A5000 12B at 0.93×** — the largest model on
+the widest device, where decode is most weight-bandwidth-bound and llama's
+arch-tuned matvec still leads. [MTP](mtp.md) multiplies on top of these
+numbers (byte-identical output): ~1.85–2.2× structured, 1.1–1.35× prose,
+content-dependent (E4B prose measures **1.28×** on the A5000 post-fix, 150.1
+vs 117.6).
 
 ## Prefill (prompt tokens/s, 929-token turns)
 

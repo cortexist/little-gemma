@@ -298,12 +298,16 @@ Other upstream MTP design notes worth having on record:
 
 ## Open leads this study produced
 
-1. **Depth-scaled KV split for decode attention** (§4) — the concrete lever:
-   cap per-block KV work instead of capping the block count. Predicted to move
-   desktop/A5000 decode materially and to flatten the short-context depth
-   droop on any device wider than 8 SMs; the Orin may see little (its
-   constants are accidentally right there). Numerics-gated; acceptance% is the
-   tripwire.
+1. ~~Depth-scaled KV split for decode attention~~ (§4) — **SHIPPED, and it was
+   the biggest decode win in the project's history.** `SPLIT_KEYS 1024 → 64`,
+   one constant: A5000 E2B **+44.7%** / E4B **+25.5%** / 12B **+16.7%**, Orin
+   **+15.0% / +9.1% / +3.8%**; depth droop **−14.3% → −0.6%**; desktop decode
+   went from 0.70–0.81× to **parity (1.01–1.02× on E2B/E4B)** and the Orin
+   lead widened to **1.27× (E4B)**. All gates green (determinism, coherence,
+   prefill control unchanged, MTP acceptance 43.9–45.9% vs 44.6% baseline).
+   Full writeup in [performance-journal.md](performance-journal.md#the-split-that-never-split-2026-07-17).
+   The prediction that the Orin would see little was **wrong** — it gained too;
+   more resident blocks hide latency even on 8 SMs.
 2. **Efficiency-gated stream-K** (§3) — our own recommendation, now with a
    reference implementation to copy; ~5 lines on branch `own-q4k-streamk`.
 3. ~~Chained-draft position~~ — **tested and falsified** (§6). Closed.

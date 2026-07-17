@@ -25,14 +25,14 @@ context depth). Full tables, methodology, and history:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
 **Decode** (tokens/s, batch 1) — ahead on the Jetson, the device this
-project targets:
+project targets, and at parity on desktop:
 
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B Q4_K_M | **16.4** | 14.1 | **1.17×** |
-| Jetson Orin NX | 12B Q4_K_M | **8.0** | 7.4 | **1.08×** |
-| Jetson Orin NX | E2B QAT q4_0 | 30.0 | 37.4 | 0.80× |
-| RTX A5000 | E4B / 12B / E2B | 93.7 / 49.7 / 146.9 | 116.1 / 62.5 / 209.3 | ~0.8× |
+| Jetson Orin NX | E4B Q4_K_M | **17.9** | 14.1 | **1.27×** |
+| Jetson Orin NX | 12B Q4_K_M | **8.3** | 7.4 | **1.12×** |
+| Jetson Orin NX | E2B QAT q4_0 | 34.5 | 37.4 | 0.92× |
+| RTX A5000 | E4B / 12B / E2B | **117.6** / 58.0 / **213.9** | 116.1 / 62.5 / 209.3 | **1.01×** / 0.93× / **1.02×** |
 
 **Prefill** (929-token prompts) — **0.8×** llama.cpp, consistently:
 
@@ -41,9 +41,9 @@ project targets:
 | Jetson Orin NX | E4B / 12B / E2B | 426 / 174 / 834 | 524 / 217 / 1,020 | 0.80–0.82× |
 | RTX A5000 | E4B / 12B / E2B | 3,703 / 1,782 / 7,222 | 4,846 / 2,207 / 8,785 | 0.76–0.82× |
 
-The pattern is the project's thesis: on the bandwidth-bound edge device,
-decode speed is mostly everything *around* the matmul — launch overhead,
-syncs, norms, the PLE path — which a few thousand readable lines can do
+The pattern is the project's thesis: decode speed is mostly everything
+*around* the matmul — launch overhead, syncs, norms, the PLE path, how the
+KV walk is split across the GPU — which a few thousand readable lines can do
 leanly. Prefill runs through llama.cpp's home turf (arch-tuned tensor-core
 GEMMs); the 2026-07 campaign closed it from ~0.2× to 0.8× and measured the
 rest to its structural floor. [MTP](docs/mtp.md) multiplies decode on top

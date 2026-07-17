@@ -492,14 +492,31 @@ __global__ static void attn_swa_h_n_kernel(float *xb, const float *q, const __ha
 // each serially reducing the whole KV (the profile put it ~14x over the KV-
 // bandwidth floor). Split the KV reduction across n_split blocks per head: each
 // computes a partial (max, sum, V-acc) over its sub-range, then a combine pass
-// merges them. n_head x n_split blocks feed the SMs. n_split is device-adaptive
-// (clamp(T/SPLIT_KEYS,1,MAXSPLIT)) so one graph-captured launch covers all
-// contexts; splits beyond n_split early-exit. Same online-softmax math as
-// d_attn, deterministic (fixed split order), relaxed class (reassociated). The
-// per-query d_attn stays for the B=2 MTP verify and LG_NO_SPLITK fallback.
-// Measured (.scratch/flash_decode_test.cu) ~3.3x decode-attn on the Orin @4k.
+// merges them. n_head x n_split blocks feed the SMs. n_split = clamp(T/SPLIT_KEYS,
+// 1, MAXSPLIT), computed IN-KERNEL from the device-resident position, so one
+// graph-captured launch (grid is always n_head x MAXSPLIT) covers every context;
+// splits beyond n_split early-exit. Same online-softmax math as d_attn,
+// deterministic (fixed split order), relaxed class (reassociated). The per-query
+// d_attn stays for the B=2 MTP verify and LG_NO_SPLITK fallback.
+//
+// SPLIT_KEYS is a cap on the KEYS ONE BLOCK WALKS, and that is the whole point:
+// it must be small enough that per-block work stays flat as the context grows,
+// and the block count absorbs the depth instead. It was 1024 until 2026-07-17,
+// which meant n_split==1 for every context under 1024 — the split degenerated to
+// one block per head and each block's walk grew LINEARLY with depth. Decode
+// drooped -14.3% from shallow to 930-deep on the A5000 (llama.cpp: ~1%, because
+// their fattn caps per-block work at nbatch_fa=128 keys and grows the grid).
+// At 64: droop -0.6%, and decode +44.7% E2B / +25.5% E4B / +16.7% 12B (A5000),
+// +15% / +9.1% (Orin). Sweep: 1024 -> 147.8, 128 -> 203.2, 64 -> 213.9,
+// 32 -> 214.5 tok/s (A5000 E2B); the knee is 64 and MAXSPLIT=16 adds nothing
+// (64 blocks = 1 CTA/SM = 2 warps/sched is the same balanced-latency floor the
+// matmul kernels sit at). The 1024 was tuned on the Orin @4k alone
+// (.scratch/flash_decode_test.cu, ~3.3x decode-attn there) where n_head==8
+// happens to equal the SM count, so shallow contexts filled the board anyway and
+// the droop was invisible. DON'T tune a launch geometry on one device at one
+// context depth.
 #define MAXSPLIT 8
-#define SPLIT_KEYS 1024
+#define SPLIT_KEYS 64
 // blockIdx.z selects the query within a B-row chunk. Decode launches z=1, so qi=0,
 // pos=*d_pos, and the (query,head) base collapses to hh*MAXSPLIT — byte-identical
 // to the single-query form. The B<=2 MTP verify launches z=B: query qi sits at
