@@ -1659,10 +1659,21 @@ Kernel-level (A5000): `rmsnorm_w_n_kernel` 129→113 µs (−12%),
 `rmsnorm_add_w_n_kernel` 67→57 µs (−15%); memory throughput 43→49% and
 74→89% respectively. The E4B win is the largest because n_embd=2560 puts
 the norms at ~10% of prefill time; 12B's bigger matmuls dilute it to
-noise, and E2B's tiny rows leave little to recover. llama.cpp's
-`rms_norm_f32` already loads f32x4 — this closes that slice of the
-elementwise gap. The rest of the pool (geglu, rope, the small
-`rmsnorm_kernel`) is unchanged.
+noise, and E2B's tiny rows leave little to recover. The rest of the pool
+(geglu, rope, the small `rmsnorm_kernel`) is unchanged.
+
+> **CORRECTION (2026-07-17):** this entry originally claimed "llama.cpp's
+> `rms_norm_f32` already loads f32x4 — this closes that slice of the
+> elementwise gap." **That is false.** `ggml/src/ggml-cuda/norm.cu` contains
+> no `float4` at all, in either the fork's 2026-04 base or current upstream
+> b10054; their loop is scalar (`for (int col = tid; col < ncols; col +=
+> block_size) { const float xi = x[col]; tmp += xi*xi; }`). So this change did
+> not close a gap — it opened one in our favour. The claim was asserted from
+> memory rather than read, which is exactly the failure the KV-split bug (see
+> performance-journal.md, 2026-07-17) also turned on: **a claim about someone
+> else's code is not evidence until you have opened the file.** The decode
+> norms remain scalar and single-block in BOTH stacks — an unexploited lever,
+> not a deficit.
 
 ## 2026-07-16 — the settle campaign: one methodology, every number re-measured
 
