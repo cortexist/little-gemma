@@ -87,6 +87,29 @@ in interactive serving the gap rarely shows (turns are short, `-sys` removes
 the skills re-prefill, the GPU encoder removed the image one), but on very
 long documents llama.cpp still wins the wait.
 
+## Upstream cross-check (llama.cpp b10054, 2026-07-17)
+
+The tables above use the Cortexist fork as the llama.cpp reference (its
+upstream base is ~April–May 2026). Cross-checked against **current
+upstream** — release binaries on the A5000, a source build (sm_87) on the
+Orin, identical flags and GGUFs:
+
+- **Orin: the fork IS current-llama performance.** Decode matches upstream
+  within ±0.6% on all three models (E4B 14.15 vs 14.06 at d512, 12B 7.45
+  vs 7.41, E2B 37.18 vs 37.40); prefill the fork is ~2% *ahead* (E4B 524
+  vs 511, 12B 217 vs 212). Every Orin ratio above therefore stands against
+  the strongest available llama.cpp.
+- **A5000: current upstream is +2.3–4.4% over the fork on every cell**
+  (E4B pp929 5,059 / tg128@d512 118.8; 12B 2,302 / 64.4; E2B 9,077 /
+  216.4). Against current upstream the A5000 ratios tighten to
+  prefill 0.73× / 0.77× / 0.80× and decode 0.79× / 0.77× / 0.68×
+  (E4B / 12B / E2B).
+- The asymmetry has a structural suspect: since the fork's base, upstream
+  restructured MMQ into per-architecture tile-config files
+  (`mmq-config-ampere.cuh`, `-blackwell`, …) — discrete-Ampere got tuned,
+  Tegra sm_87 apparently didn't. A source-level study of what changed is
+  tracked separately.
+
 ## TTFT / TTFS (2026-07-02 campaign)
 
 Client-side, both stacks, same definition: last request byte sent → first
