@@ -116,9 +116,40 @@ the adaptation is dynamic, off the live SM count, not baked per arch.
 lever in a form its author had already abandoned, because we ported the
 protocol from a snapshot instead of asking what it looked like now. Our own
 data (ffn helps, attn hurts) *was* the gate's motivation, discovered
-independently and then left on the floor. Whether an efficiency-gated
-stream-K wins for our kernel remains untested — the branch
-`own-q4k-streamk` is the substrate, and the gate is ~5 lines.
+independently and then left on the floor.
+
+**Closed 2026-07-17: the gate is not worth porting, because we already solve
+the problem it solves — more cheaply.** llama's row-tile is frozen at `I=128`
+for *every* Ampere entry in the config table (§2), so when the tile grid does
+not cover the SMs they cannot make tiles smaller — the only lever left is to
+split K and pay a fixup pass. That is what stream-K *is*: a workaround for a
+fixed tile size. Our tile is not fixed — `launch_q4k_mma` shrinks
+warps-per-CTA (`model-cuda-i8.cu:1061`), and the loop is already self-gating on
+exactly llama's condition:
+
+```c
+while (wpc > 1 && (long)((m + 32*wpc - 1) / (32*wpc)) * ncol < 2 * sms) wpc >>= 1;
+```
+
+Shrinking the tile fills the SMs with no fixup, no cross-CTA partials, and no
+scratch buffer. So stream-K measuring −2.2% (Orin) / −5–9% (A5000) was not bad
+luck: it is a *second* mechanism for an already-solved problem, carrying
+overhead the first one doesn't.
+
+The shrink is deliberately **off on discrete**, and that decision re-measured
+correct today (A5000 E4B prefill, `LG_Q4K_WPC=-1` forces it): **3,846 → 3,661
+tok/s, −4.8%.** The reason is in the code comment and it is sound — shared
+memory >50 KB pins residency at one CTA/SM either way, so a smaller CTA is the
+same number of waves with half the warps and half the latency hiding.
+
+That leaves exactly one stream-K-shaped gap: **small matmuls on discrete**,
+where we decline to shrink and the tile count doesn't cover 64 SMs (a 12B
+global-layer k-projection is ~30 tiles = 47% fill, and llama's gate *would*
+route it to stream-K). It is not worth chasing: with V reusing K's projection,
+those k/v matmuls are ~1–2% of matmul work against ffn's ~12288-wide tensors,
+so even halving them is a fraction of a percent of prefill. **Stream-K stays
+closed on both devices, now for a structural reason rather than an empirical
+one.**
 
 ## 4. The transferable win: grow the KV split with depth, not the walk
 
@@ -308,8 +339,11 @@ Other upstream MTP design notes worth having on record:
    Full writeup in [performance-journal.md](performance-journal.md#the-split-that-never-split-2026-07-17).
    The prediction that the Orin would see little was **wrong** — it gained too;
    more resident blocks hide latency even on 8 SMs.
-2. **Efficiency-gated stream-K** (§3) — our own recommendation, now with a
-   reference implementation to copy; ~5 lines on branch `own-q4k-streamk`.
+2. ~~Efficiency-gated stream-K~~ (§3) — **closed, not worth porting.** We
+   already fill the SMs by shrinking the tile (`wpc`), which llama cannot do
+   (their `I` is frozen at 128 per-arch), so stream-K is their workaround for
+   a constraint we don't have. The one residual case (small matmuls on
+   discrete, where we decline to shrink) is ~1–2% of matmul work.
 3. ~~Chained-draft position~~ — **tested and falsified** (§6). Closed.
 4. **Variable draft length / confidence early-exit** (§6) — upstream stops
    drafting when the head's top-k confidence is low instead of always paying
