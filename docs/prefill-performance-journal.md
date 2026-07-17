@@ -429,6 +429,11 @@ Final two rounds under the open numerics gate:
 | 12B | **173.2** | **0.80×** (216.8) | **8.7** (llama 7.55) | **1811** |
 | E4B | **417.5** | **0.82×** (510.3) | **30.0** | **3718** |
 
+> **ERRATUM (2026-07-16):** the decode column is wrong. The E4B "30.0" is an
+> E2B QAT value (E4B serve decode is ~16.4 pinned), and the 12B 8.7 does not
+> reproduce (8.0 sustained). The prefill columns are correct and reproduce
+> within 1%. See the 2026-07-16 settle entry below and docs/benchmarks.md.
+
 Option (b) delivered +4.5% / +9.0% prefill on top of Phase 1b plus ~+8%
 decode (the f16-ring sleeper). Campaign total from the 2026-07-01 start:
 A5000 3.4× / 3.6×; Orin 12B 102 → 173 and E4B 192 → 417 against the same
@@ -1619,6 +1624,7 @@ absolute `C:\Users\Zero` paths headed for the public repo — now
 traps re-confirmed the hard way: `cd x && server & client` puts the cd
 inside the backgrounded subshell (clients ran from $HOME), and
 `pkill -f "run-cuda-i8 -m"` matches the remote shell's own command line
+and kills the session — use `pkill -x`.
 
 ## 2026-07-16 — float4 chunk rmsnorm: a small but real prefill win on E4B
 
@@ -1657,4 +1663,39 @@ noise, and E2B's tiny rows leave little to recover. llama.cpp's
 `rms_norm_f32` already loads f32x4 — this closes that slice of the
 elementwise gap. The rest of the pool (geglu, rope, the small
 `rmsnorm_kernel`) is unchanged.
-and kills the session — use `pkill -x`.
+
+## 2026-07-16 — the settle campaign: one methodology, every number re-measured
+
+The documentation had accumulated mutually inconsistent numbers (README
+decode tables, the Phase-2 scoreboard, the fork's README), so both stacks ×
+both devices × all three models were re-benched in one sitting under one
+written methodology — serve harness for us, `llama-bench` best-of-fa at
+matched depth (`tg128 -d 512`) for llama, pinned `jetson_clocks` on the
+Orin. Results and methodology now live in **docs/benchmarks.md**, which
+supersedes all earlier tables; raw logs in `.scratch/settle-2026-07-16/`;
+harnesses committed as `bench/settle-bench.sh` / `bench/settle-bench.ps1`.
+
+What the settling found, beyond fresh numbers:
+
+- **The Phase-2 "Final scoreboard" decode column was wrong** (erratum added
+  in place): its E4B decode 27.8→30.0 values are E2B QAT values — today's
+  E2B measures 27.8 at the 929-deep tail and 30.0 sustained, exactly — and
+  its 12B 8.7 doesn't reproduce (8.0 sustained, 7.5 tail). A model-label
+  mixup in the campaign's decode cells. Prefill columns reproduce within 1%.
+- **The retired README decode table ("A5000 ≈1.0× llama") was a harness
+  artifact**: one-shot `-p` decode reads ~20% higher than serve mode on
+  Windows (per-token detokenize + socket write; negligible on Linux). The
+  serve numbers were stable all along — 12B A5000 49.9 in the 2026-07-02 MTP
+  entry, 49.7 today.
+- **The old "E2B 25% faster than llama.cpp" claim was Q3_K-era; the QAT
+  E2B picture is a DEPTH story**: near parity at shallow context (0.96×,
+  the 2026-07-07 pinned pair, 36.4 vs tg32 37.9) but 0.80× sustained to 1k
+  — our decode slows ~18% with depth where llama's fattn loses ~1%. The
+  split-K decode attention's depth scaling on E2B (attention is a large
+  share when weights are small) is the one remaining decode gap, both
+  devices (0.70–0.80× sustained).
+- The claims that survive, cleanly: **Orin decode ahead on E4B (1.17×) and
+  12B (1.08×); prefill 0.76–0.82× everywhere** (six pairs, two devices).
+- Depth costs llama little on these models (SWA caps most layers' KV):
+  `tg128` d0→d512 is −1% (E4B Orin) to −4% (12B A5000). Depth was not the
+  explanation for any of the discrepancies; harness and labels were.
