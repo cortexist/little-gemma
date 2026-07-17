@@ -89,26 +89,44 @@ long documents llama.cpp still wins the wait.
 
 ## Upstream cross-check (llama.cpp b10054, 2026-07-17)
 
-The tables above use the Cortexist fork as the llama.cpp reference (its
-upstream base is ~April–May 2026). Cross-checked against **current
-upstream** — release binaries on the A5000, a source build (sm_87) on the
-Orin, identical flags and GGUFs:
+The tables above use the Cortexist fork as the llama.cpp reference. Its
+upstream merge-base is **2026-04-15** (`b3d758750`), so the obvious worry is
+that we benchmark against a stale llama. Cross-checked against **current
+upstream** — a source build (sm_87) on the Orin, release binaries on the
+A5000, identical flags and GGUFs:
 
-- **Orin: the fork IS current-llama performance.** Decode matches upstream
-  within ±0.6% on all three models (E4B 14.15 vs 14.06 at d512, 12B 7.45
-  vs 7.41, E2B 37.18 vs 37.40); prefill the fork is ~2% *ahead* (E4B 524
-  vs 511, 12B 217 vs 212). Every Orin ratio above therefore stands against
-  the strongest available llama.cpp.
-- **A5000: current upstream is +2.3–4.4% over the fork on every cell**
-  (E4B pp929 5,059 / tg128@d512 118.8; 12B 2,302 / 64.4; E2B 9,077 /
-  216.4). Against current upstream the A5000 ratios tighten to
-  prefill 0.73× / 0.77× / 0.80× and decode 0.79× / 0.77× / 0.68×
-  (E4B / 12B / E2B).
-- The asymmetry has a structural suspect: since the fork's base, upstream
-  restructured MMQ into per-architecture tile-config files
-  (`mmq-config-ampere.cuh`, `-blackwell`, …) — discrete-Ampere got tuned,
-  Tegra sm_87 apparently didn't. A source-level study of what changed is
-  tracked separately.
+**Verdict: the fork is a current-strength reference. Every ratio above
+stands.**
+
+- **Orin (both built from source, same toolchain): parity.** Decode matches
+  within ±0.6% on all three models (E4B 14.15 vs 14.06 at d512, 12B 7.45 vs
+  7.41, E2B 37.18 vs 37.40); the fork's prefill is ~2% *ahead* (E4B 524 vs
+  511, 12B 217 vs 212).
+- **A5000: upstream's 3 months of code changes are performance-neutral
+  within noise.** A first pass appeared to show upstream +2.3–4.4%, but that
+  compared a locally-built fork against CI release binaries. Isolating the
+  variables on E4B — same CUDA 12.4 CI toolchain, April code (b8833) vs July
+  code (b10054) — gives tg128@d512 **117.5 vs 114.1** and pp929@d512 **4,887
+  vs 4,786**, i.e. new code marginally *slower*; the CUDA 13.x pair gives
+  +2.3%. The sign flips with the toolchain, so the effect is build
+  configuration and CUDA version, not llama.cpp's code.
+
+This is corroborated by upstream's own record. The one large MMQ change in
+the window — PR #24127, "CUDA: refactor MMQ kernel configuration"
+(2026-07-13) — introduced the per-architecture config tables but is a
+**tunability** refactor whose author states *"I am seeing no changes to
+performance beyond statistical fluctuations"*; the Ampere table encodes the
+same values April hardcoded. The window's one real decode win, PDL
+(#22522), is gated to CC ≥ 90 (Hopper+) and cannot touch an sm_86/sm_87
+Ampere part. Nothing in the window targeted Tegra: upstream's MMQ/FA work
+was measured on RTX 3090/4090, P40, RTX PRO 6000, DGX Spark and AMD parts,
+and Jetson appears only as breakage — issue #24457 ("FA+MTP crash … on SM87
+(Jetson Orin)"), caused by FA specializations being pruned for compile time,
+which *"inadvertently broke Gemma 4 E4B MTP"* (fixed in #25148, 2026-06-30).
+
+A source-level study of what upstream changed, and which mechanisms transfer
+to little-gemma, is in
+[upstream-llama-study.md](upstream-llama-study.md).
 
 ## TTFT / TTFS (2026-07-02 campaign)
 
