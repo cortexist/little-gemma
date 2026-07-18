@@ -97,6 +97,8 @@ decoding with byte-identical output ([docs/mtp.md](docs/mtp.md));
   pass walkthrough, backend layering, validation.
 - [docs/benchmarks.md](docs/benchmarks.md) — canonical numbers, methodology,
   TTFT/TTFS, reconciliation of older figures.
+- [docs/seminar.md](docs/seminar.md) — Q&A: why decode is faster and prefill
+  is slower than llama.cpp, and the single most remarkable lever in each.
 - [docs/serving.md](docs/serving.md) — the socket protocol, CLI reference,
   Windows clients.
 - [docs/multimodal.md](docs/multimodal.md) — encoder-free 12B vision/audio,
