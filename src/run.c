@@ -238,7 +238,7 @@ static int recv_n(sock_t s, void *buf, int n) {
 }
 
 static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
-                  const char *syspath, const char *mtp_path) {
+                  const char *syspath, const char *mtp_path, int think) {
     struct tokenizer *tk = tokenizer_init(ctx);
     if (!tk) { fprintf(stderr, "tokenizer init failed\n"); return; }
     struct model m;
@@ -255,6 +255,20 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     if (kvcache_init(&kv, &m, SERVE_SEQ) != 0) { if (md) media_free(md); model_free(&m); tokenizer_free(tk); return; }
     int eot = tokenizer_token_id(tk, "<turn|>");
     int eos = tokenizer_eos(tk);
+    // -think N: reliably bound the reasoning channel WITHOUT relying on the model
+    // to obey a prompt (measured: enabling vs disabling <|think|> in the system
+    // turn made NO difference to this 12B — prompt-level control is inert). We do it
+    // structurally instead. The channel is <|channel>thought[reasoning]<channel|>
+    // [answer], so N=0 SEEDS an empty <|channel>thought\n<channel|> onto the model
+    // turn — the model can't open a thought channel it's been handed already
+    // closed, so its first generated token is the answer (no reasoning, best TTFS);
+    // N>0 lets it reason but force-injects <channel|> once the span reaches N tokens
+    // (a little thinking, then the answer); N<0 (default) leaves it unbounded.
+    // The seed is GATED on saw_think (a channel actually observed this session):
+    // models that don't use the channel (E4B answers plainly) never get seeded, so
+    // -think is a clean no-op on them instead of confusing them with a stray marker.
+    int ch_open  = tokenizer_token_id(tk, "<|channel>");
+    int ch_close = tokenizer_token_id(tk, "<channel|>");
 
     // The draft head (-mtp): block-2 speculative decode, same as generate().
     // A failed open falls back to plain greedy (NULL) — log either way so the
@@ -360,6 +374,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         kvcache_restore_prefix(&kv, n_sys);              // system prefix (at 0 when there is none);
                                                          // restore repairs ring rows a long previous
                                                          // session may have wrapped over
+        int saw_think = 0;                               // has this model ever opened a thought channel? (gates the seed)
         char line[8192], chat[8704];
         int promptv[4096];
         for (;;) {
@@ -490,7 +505,8 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 break;
             }
             double t0 = now_sec();
-            snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n", line);
+            snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n%s", line,
+                     think == 0 && saw_think ? "<|channel>thought\n<channel|>" : "");
             n = tokenizer_encode(tk, chat, promptv, 4096);
             if (pend) {                                  // pack the held span with the tail:
                 int *ids = realloc(pend, ((size_t)pend_n + n) * sizeof *ids);
@@ -510,19 +526,29 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             int g = 0, fail = 0, barged = 0;              // g = tokens streamed this turn
             double t_draft = 0, t_verify = 0;
             int n_draft = 0, n_accept = 0;
+            int in_think = 0, think_n = 0;                // -think N>0: reasoning-span state
             for (;;) {                                   // stream raw token text, turn end included
                 int sig = client_signal(c);
                 if (sig == 2) { send_piece(c, "<turn|>"); barged = 1; break; }
                 if (sig || send_piece(c, tokenizer_token_text(tk, best)) != 0) { fail = 1; break; }
                 g++;
+                if (best == ch_open) saw_think = 1;       // this model uses the channel: seed is safe from next turn
+                if (think > 0) {                          // budget cap: track the reasoning span (thinking is turn-initial)
+                    if (best == ch_open) in_think = 1;
+                    if (in_think) think_n++;
+                    if (best == ch_close) in_think = 0;
+                }
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
                 if (g >= SERVE_GEN) {                    // runaway turn: end it ourselves
                     send_piece(c, " [SERVE_GEN cap]<turn|>");
                     fprintf(stderr, "turn capped at %d tokens without an end-of-turn\n", SERVE_GEN);
                     break;
                 }
-                if (!t || pos + LG_MTP_N - 1 >= SERVE_SEQ) {   // plain decode: no head, or no room for a full spec block
+                // Plain decode while reasoning under a budget: it lets us inject the
+                // <channel|> cleanly (MTP drafts a whole block, awkward to truncate).
+                if (!t || in_think || pos + LG_MTP_N - 1 >= SERVE_SEQ) {
                     best = model_forward_next(&m, &kv, best, pos++);
+                    if (in_think && think_n >= think && best != ch_close) best = ch_close;   // budget spent: end the thought
                     continue;
                 }
                 // block-LG_MTP_N speculation: draft LG_MTP_N-1 tokens (chained), verify
@@ -763,6 +789,7 @@ int main(int argc, char **argv) {
     float temp = 0.0f, topp = -1.0f;
     int topk = -1;
     uint64_t seed = 0;
+    int think = -1;                                       // -think N: thinking-channel token budget (-1 = unlimited)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];
@@ -771,6 +798,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-mm") && i + 1 < argc) mmproj = argv[++i];
         else if (!strcmp(argv[i], "-mtp") && i + 1 < argc) mtp   = argv[++i];
         else if (!strcmp(argv[i], "-sys") && i + 1 < argc) syspath = argv[++i];
+        else if (!strcmp(argv[i], "-think") && i + 1 < argc) think = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-temp") && i + 1 < argc) temp = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "-topk") && i + 1 < argc) topk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-topp") && i + 1 < argc) topp = (float)atof(argv[++i]);
@@ -779,7 +807,8 @@ int main(int argc, char **argv) {
     if (cpath) { client(cpath); return 0; }              // client mode needs no model
     if (!model) {
         printf("Usage: %s -m <model.gguf> [-mm <mmproj.gguf>] [-mtp <assistant.gguf>] [-sys <skills.txt>]\n"
-               "          [-temp T [-topk K] [-topp P] [-seed N]] [-p \"prompt\" | -s <socket>]\n"
+               "          [-think N] [-temp T [-topk K] [-topp P] [-seed N]] [-p \"prompt\" | -s <socket>]\n"
+               "          (-think: reasoning-channel token budget; 0 = none, N = up to N, omitted = unlimited)\n"
                "       %s -c <socket>\n", argv[0], argv[0]);
         return 1;
     }
@@ -805,7 +834,7 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (config_load(&cfg, ctx) == 0) { printf("\n"); config_print(&cfg); }
 
-    if (spath)       serve(ctx, spath, mmproj, syspath, mtp);
+    if (spath)       serve(ctx, spath, mmproj, syspath, mtp, think);
     else if (prompt) { printf("\n"); generate(ctx, prompt, mtp); }
 
     free_gguf(ctx);
