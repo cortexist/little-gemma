@@ -87,9 +87,11 @@ Options: `-mm mmproj.gguf` adds image/audio input over the socket
 ([docs/multimodal.md](docs/multimodal.md), via
 [`mmcat`](../little-gemma-tools)); `-mtp assistant.gguf` adds speculative
 decoding with byte-identical output ([docs/mtp.md](docs/mtp.md));
-`-sys file` prefills a system turn once at server start; `-temp`/`-topk`/
-`-topp`/`-seed` sample instead of greedy. On Windows the same code serves
-`%TEMP%\lg.sock` and the build ships its own socket clients.
+`-sys file` prefills a system turn once at server start; `-think N` bounds the
+reasoning channel (`0` = off, structural — prompt control of thinking is
+inert on Gemma 4; see [docs/serving.md](docs/serving.md#controlling-the-reasoning-channel-think));
+`-temp`/`-topk`/`-topp`/`-seed` sample instead of greedy. On Windows the same
+code serves `%TEMP%\lg.sock` and the build ships its own socket clients.
 
 ## Documentation
 

@@ -32,6 +32,49 @@ run -c <socket>
   skills-in-context pattern without the TTFT tax. The saved cache rows are
   restored at session start, so each conversation begins byte-identically
   fresh no matter what a previous session did to the rings.
+- `-think N` → bound the reasoning channel. `0` = none, `N` = up to N tokens,
+  omitted = unlimited (default). See [Controlling the reasoning
+  channel](#controlling-the-reasoning-channel).
+
+## Controlling the reasoning channel (`-think`)
+
+Gemma 4's thinking models emit a reasoning channel:
+`<|channel>thought[reasoning]<channel|>[answer]`. The **12B always emits it**
+(wrapping even "The capital of France is Paris"); the **E4B never does** (plain
+answer). The client hides the channel from display, but it still occupies the
+KV cache and — when the model fills the reasoning span — costs TTFS before the
+first speakable word.
+
+**Prompt-level control of thinking does not work.** Measured on the 12B
+`Q4_K_M`: enabling `<|think|>` in the system turn, disabling it, and instructing
+"reply directly, no thinking channel" **all produce byte-identical output** —
+the model ignores the request. (This matches the general llama.cpp experience
+that turning thinking off by prompt is unreliable.) So `-think` controls it
+**structurally** instead, independent of whether the model obeys:
+
+- **`-think 0`** — seed an empty `<|channel>thought\n<channel|>` onto the model
+  turn. The model cannot open a channel it has already been handed closed, so
+  its first generated token is the answer: no reasoning, best TTFS, no channel
+  in the stream at all. This is the reliable off-switch.
+- **`-think N`** (N > 0) — let the model reason, but force-inject `<channel|>`
+  once the reasoning span reaches N tokens: *a little* thinking, then the
+  answer. The dial for the TTFS-vs-reasoning-depth tradeoff.
+- **omitted** — unbounded; the model's native behavior, byte-unchanged.
+
+The seed is **gated on having seen the model use the channel this session**, so
+on a model that answers plainly (E4B) `-think` is a clean no-op — it is never
+handed a closed channel it wasn't going to open (which would make it emit a
+stray marker). On the 12B the first turn is the model's native (client-hidden
+empty) thought; every turn after is seeded clean.
+
+> **Note for a future reasoning-capable checkpoint** (e.g. the T2000 era). The
+> shipped 12B `Q4_K_M` emits an *empty* reasoning span — it puts its
+> step-by-step in the *answer*, after `<channel|>` — so `-think N>0`'s force-cap
+> has nothing to cap here and is a no-op; only `-think 0` changes anything. The
+> cap mechanism is implemented and sound, but **re-verify it against a
+> checkpoint that actually fills the reasoning span** before relying on the
+> budget. Don't rediscover this: prompt control is inert, the span is empty on
+> this build, and `-think` is the structural handle.
 
 ## The protocol
 
