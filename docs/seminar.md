@@ -86,6 +86,23 @@ softmax rescaling woven through it.
    little-gemma. So the 0.8x is a priced, deliberate trade, not a failure to
    figure something out.
 
+**And we have the measurement, not just the argument.** Earlier in the project
+(before the July prefill overhaul) we did the maximal version of "do exactly the
+same": a **faithful, line-by-line port of llama.cpp's q4_K MMQ kernel** — their
+`ldmatrix`/`mma` primitives, their `load_tiles_q4_K` interleave, their
+`vec_dot`, validated against an f64 reference to 3.6e-6. On the Orin, E4B
+prefill with that port ran **~255 tok/s; our own kernel at the time, ~271; and
+llama.cpp itself, 498.** Having llama's *exact matmul* left the gap at ~2×
+(0.51×) — and the port was even a touch *slower* than our own kernel, because
+scoped to the matmul it drops the parts that actually carry llama's speed
+(mmq_x autotune, stream-K balancing, cp.async overlap). The lesson was decisive:
+the matmul was never the gap — it's ~half of prefill, and **attention plus the
+pipeline are the other half** (the nsys split above puts attention alone at
+~40%). That result is *why* we stopped porting their kernel and instead rebuilt
+attention (the flash kernel) and the whole prefill pipeline — which is what took
+prefill from that ~0.5× to today's **0.8×**. So "why can't we do exactly what
+llama.cpp does?" answers itself: we did, line for line, and it wasn't the kernel.
+
 One extra Orin-specific twist worth mentioning: at 8 SMs there are no spare warps
 to hide that shared-read latency (the "1-CTA-per-SM trap"), so the same codegen
 edge that costs llama nothing on a 64-SM desktop costs us more on the edge device
