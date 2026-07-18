@@ -1710,3 +1710,44 @@ What the settling found, beyond fresh numbers:
 - Depth costs llama little on these models (SWA caps most layers' KV):
   `tg128` d0→d512 is −1% (E4B Orin) to −4% (12B A5000). Depth was not the
   explanation for any of the discrepancies; harness and labels were.
+
+## FA4's online-softmax rescale-skip: FALSIFIED on Ampere (2026-07-18)
+
+Prompted by the Blackwell/Thor news cycle (Unsloth NVFP4, Tri Dao's FA4 at Hot
+Chips 2025). Of everything in those announcements, exactly one idea isn't
+hardware-locked: FA4's forward-pass change #1, *"new online softmax algo to skip
+90% of output rescaling."* The rest is silicon we don't have — NVFP4 needs
+Blackwell FP4 tensor cores (Unsloth themselves route older GPUs to GGUF), and
+FA4's other changes (software-emulated exp, 2-CTA backward) are Blackwell-balance
+or training. So this one algorithmic lever got a measured test.
+
+The idea, made exact: the flash O-rescale `acc *= corr` has `corr == exp(0) ==
+1.0` **exactly** whenever a row's running max held that block; after the first few
+K-blocks most maxes are stable, so the rescale is a lossless no-op that can be
+skipped. Implemented in `flash_attn_n_kernel` (gated `LG_SOFTMAX_SKIP`): a
+warp-level `__any_sync` over the block's `sc` (one warp's 32 lanes already read
+all 32G rows, so no extra barrier and no divergence) gates the rescale loop. It
+also lifts the rescale off the dependency chain feeding the PV MMA — the one way
+it might have paid at 8 SMs.
+
+| device | prefill OFF | prefill ON | output |
+|---|---:|---:|---|
+| A5000 E4B | 3,829 | 3,573 (**−6.7%**) | byte-identical |
+| Orin E4B  | 427.1 | 427.0 (**neutral**) | byte-identical |
+
+**Byte-identical both devices** (the skip is exact), and **it does not help**:
+a regression on the A5000 (the `__any_sync` + compare costs more than the FMAs it
+saves — those FMAs were already hidden behind other work on a 64-SM part) and
+dead-flat on the Orin (even the 8-SM dependency-chain argument didn't pan out; the
+rescale was never on our critical path). Reverted.
+
+The why is the whole point, and it's the Ampere-vs-Blackwell story in one lever:
+FA4 skips rescaling because **on Blackwell the softmax path is the bottleneck** —
+their slide shows exp (MUFU.EX2, 1024 cycles) is 2× the matmul (UMMA, 512 cycles),
+so the tensor cores are starved on the transcendental. On **our Ampere flash the
+bottleneck is the opposite end** — shared-memory fragment-read latency and
+instruction count (measured to a floor here across cp.async/ldmatrix/staging). The
+rescale FMAs sit in the shadow of those stalls, so removing them frees nothing.
+The lever is aimed at a constraint we don't have. **Re-test on Blackwell/Thor**,
+where the balance flips and it's expected to pay — the ~15-line patch reattaches
+at the `acc *= cA/cB` loop in `flash_attn_n_kernel`.
