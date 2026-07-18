@@ -83,15 +83,20 @@ echo "What is the capital of France?" | nc -N -U /tmp/lg.sock
 run -c /tmp/lg.sock                                # or the bundled client
 ```
 
-Options: `-mm mmproj.gguf` adds image/audio input over the socket
-([docs/multimodal.md](docs/multimodal.md), via
-[`mmcat`](../little-gemma-tools)); `-mtp assistant.gguf` adds speculative
-decoding with byte-identical output ([docs/mtp.md](docs/mtp.md));
-`-sys file` prefills a system turn once at server start; `-think N` bounds the
-reasoning channel (`0` = off, structural — prompt control of thinking is
-inert on Gemma 4; see [docs/serving.md](docs/serving.md#controlling-the-reasoning-channel-think));
-`-temp`/`-topk`/`-topp`/`-seed` sample instead of greedy. On Windows the same
-code serves `%TEMP%\lg.sock` and the build ships its own socket clients.
+Options:
+
+- `-mm mmproj.gguf` — image/audio input over the socket, via
+  [`mmcat`](../little-gemma-tools) ([docs/multimodal.md](docs/multimodal.md)).
+- `-mtp assistant.gguf` — speculative decoding, byte-identical output
+  ([docs/mtp.md](docs/mtp.md)).
+- `-sys file` — prefill a system turn once at server start.
+- `-think N` — cap the reasoning channel: `0` off (structural — prompt control
+  of thinking is inert on Gemma 4), `N` up to N tokens, omitted unlimited
+  ([docs/serving.md](docs/serving.md#controlling-the-reasoning-channel-think)).
+- `-temp`/`-topk`/`-topp`/`-seed` — sample instead of greedy.
+
+On Windows the same code serves `%TEMP%\lg.sock` and the build ships its own
+socket clients.
 
 ## Documentation
 
