@@ -39,6 +39,11 @@ ours hits 88%. So "the matmul is a wash" is true for the q4_K models (E4B, 12B)
 where we then win on overhead — but on q4_0 their matvec is simply more
 bandwidth-efficient, and that is the one decode gap we haven't closed.
 
+![Decode attention dataflow: the old code capped the block count and grew the
+per-block KV walk with depth (−14% droop); the fix (and llama.cpp) cap the walk
+and grow the block count, filling the device — flat with
+depth.](fig-decode-attention.svg)
+
 ## Q2 — What makes little-gemma 20% slower at prefill? If there are many gaps, what's the biggest one, and why can't we do exactly what llama.cpp does to reach parity?
 
 Prefill flips everything: it is a large-batch tensor-core GEMM problem —
@@ -86,3 +91,9 @@ to hide that shared-read latency (the "1-CTA-per-SM trap"), so the same codegen
 edge that costs llama nothing on a 64-SM desktop costs us more on the edge device
 — which is exactly why the residual is a scheduling property, not an algorithmic
 one.
+
+![Prefill flash attention dataflow: identical flash loop on both stacks (load K,
+QKᵀ, online softmax, load V, accumulate PV); the ~8× gap is entirely inside the
+per-block load+MMA step, where llama uses cp.async pipelining, ldmatrix.x4, and
+GQA packing while we do manual shared reads — codegen, not a transplantable
+slice.](fig-prefill-flash.svg)
