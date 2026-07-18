@@ -33,6 +33,31 @@ with the depth droop going from -14% to -0.6%. It is the cleanest illustration
 of the whole principle: decode speed is about *keeping the GPU busy between
 weight reads*, not the reads themselves.
 
+**But then — if we now split keys exactly like llama, why are we *faster*
+rather than equal?** This is the crux, and the answer is that the split-K fix
+is *not* the source of the 1.27x — it only *unmasked* it. Two facts pin this
+down. First, **we were already 1.17x before the fix, with strictly worse
+attention** (the drooping split): if attention were where our lead came from,
+we couldn't have led while our attention was the broken part. The fix didn't
+*create* a lead; it removed a self-inflicted drag that was *hiding* one. Second,
+if decode were purely the weight read, both stacks would simply tie — same bytes,
+same bus. The 1.27x exists *because decode isn't purely bandwidth-bound*: a real
+fraction of each token is per-token *overhead* — kernel launches, sync
+round-trips, the norms, rope, the PLE path, picking the argmax — and that
+fraction is large on a small model spread over just 8 SMs. So splitting keys the
+same way made our *attention* a wash with llama's; the lead itself is the
+**everything-around-the-matmul** being leaner in a purpose-built 6,100-line
+runner (the whole forward as one captured graph, GPU argmax instead of a
+262k-logit download + host scan + sync, fused norm+residual, a device-resident
+position that keeps the graph static). The split-K fix just stopped our own
+attention from eating that lead back.
+
+The clinching evidence is the model-size trend: **E4B 1.27x, 12B 1.12x, E2B a
+loss.** Overhead is a roughly fixed cost per token, so the *smaller* the model
+the *bigger* our lead — exactly what you'd see if the lead were overhead and not
+the matmul. On the 12B the weight read dominates and dilutes it; on E2B q4_0 it
+inverts (below).
+
 **The honest caveat:** this is model-dependent, and we *lose* on E2B (0.92x).
 E2B is q4_0; on that path llama's matvec genuinely hits 95% of bandwidth where
 ours hits 88%. So "the matmul is a wash" is true for the q4_K models (E4B, 12B)
