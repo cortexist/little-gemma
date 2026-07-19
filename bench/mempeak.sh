@@ -45,8 +45,8 @@ SRV=$!
 for i in $(seq 120); do [ -S /tmp/lg.sock ] && break; sleep 0.5; done
 sampler /tmp/min1 & SMP=$!
 hello_turn
-python3 ~/ttft_dictate.py /tmp/lg.sock ~/line929s.txt 0 0 > /dev/null
-python3 ~/ttft_dictate.py /tmp/lg.sock ~/line929s.txt 6 5 > /dev/null
+python3 "$(dirname "$0")/ttft_dictate.py" /tmp/lg.sock "$(dirname "$0")/line929s.txt" 0 0 > /dev/null
+python3 "$(dirname "$0")/ttft_dictate.py" /tmp/lg.sock "$(dirname "$0")/line929s.txt" 6 5 > /dev/null
 kill $SMP 2>/dev/null; wait $SMP 2>/dev/null
 MIN1=$(cat /tmp/min1)
 LGHWM=$(awk '/VmHWM/{print $2}' /proc/$SRV/status)
@@ -69,7 +69,7 @@ sampler /tmp/min2 & SMP=$!
     done
   done ) &
 WLOOP=$!
-python3 ~/ttft_dictate.py /tmp/lg.sock ~/line929s.txt 6 5
+python3 "$(dirname "$0")/ttft_dictate.py" /tmp/lg.sock "$(dirname "$0")/line929s.txt" 6 5
 touch /tmp/dict_done
 wait $WLOOP 2>/dev/null
 kill $SMP 2>/dev/null; wait $SMP 2>/dev/null
