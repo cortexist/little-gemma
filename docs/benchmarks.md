@@ -7,7 +7,10 @@ mutually inconsistent figures is at the bottom).
 
 - **Date / builds:** prefill 2026-07-16, decode 2026-07-17 (after the KV-split
   fix — prefill is untouched by it and was re-measured as the control:
-  A5000 E2B 7,260 → 7,307, i.e. unchanged). little-gemma `7980037`+ (`run-cuda-i8`);
+  A5000 E2B 7,260 → 7,307, i.e. unchanged). **E4B QAT rows and the MTP
+  section: 2026-07-19** (the 2-row MTP verify kernel; llama.cpp fork
+  `cd5ad883e` on the Orin, `74ade5274`/b9672 on the A5000 for those pairs).
+  little-gemma `7980037`+ (`run-cuda-i8`);
   llama.cpp = the [Cortexist fork](https://github.com/cortexist/llama.cpp)
   (`83efbcc79` on the Orin, `10306b8fd` on the A5000), CUDA build.
 - **Hardware:** Jetson Orin NX 16GB (Ampere sm_87, integrated, zero-copy
@@ -15,8 +18,11 @@ mutually inconsistent figures is at the bottom).
   numbers are lower) and RTX A5000 24GB (Ampere sm_86, Windows/WDDM, stock
   clocks — the serve harness runs warm back-to-back turns; the clock probe
   shows sustained 1695 MHz boost during decode).
-- **Models:** Gemma 4 E4B Q4_K_M, 12B Q4_K_M, E2B QAT q4_0
-  (`gemma-4-E2B-it-qat-UD-Q4_K_XL`).
+- **Models:** Gemma 4 **E4B QAT q4_0** (`gemma-4-E4B-it-qat-UD-Q4_K_XL`,
+  unsloth — **the default E4B since 2026-07-19**, with its matched MTP head
+  `mtp-gemma-4-E4B-it.gguf`), 12B Q4_K_M, E2B QAT q4_0
+  (`gemma-4-E2B-it-qat-UD-Q4_K_XL`). The superseded E4B Q4_K_M rows are
+  kept for reference.
 
 ## Methodology
 
@@ -48,12 +54,20 @@ Post the **2026-07-17 KV-split fix** (`SPLIT_KEYS 1024 → 64`; see
 
 | device | model | little-gemma (serve) | llama.cpp (tg128@d512) | ratio | was |
 |--------|-------|---------------------:|-----------------------:|------:|----:|
-| **Orin NX** | E4B | **17.9** | 14.1 | **1.27×** | 1.17× |
+| **Orin NX** | **E4B QAT** | **20.7** | 18.7 | **1.11×** | — |
 | **Orin NX** | 12B | **8.3** | 7.4 | **1.12×** | 1.08× |
 | **Orin NX** | E2B QAT | 34.5 | 37.4 | 0.92× | 0.80× |
-| **A5000** | E4B | **117.6** | 116.1 | **1.01×** | 0.81× |
+| Orin NX | E4B Q4_K_M *(superseded)* | **17.9** | 14.1 | **1.27×** | 1.17× |
+| **A5000** | **E4B QAT** | 134 | 136.6 | 0.98× | — |
 | A5000 | 12B | 58.0 | 62.5 | 0.93× | 0.80× |
 | **A5000** | E2B QAT | **213.9** | 209.3 | **1.02×** | 0.70× |
+| A5000 | E4B Q4_K_M *(superseded)* | **117.6** | 116.1 | **1.01×** | 0.81× |
+
+The QAT switch (2026-07-19) speeds up **both** stacks — Orin 17.9 → 20.7
+for us, 14.1 → 18.7 for llama — and narrows the Orin ratio (1.27× →
+1.11×) for the same reason E2B QAT sits at 0.92×: llama's q4_0 matvec is
+stronger than its q4_K one, so q4_0 models play toward their strength.
+Faster absolute tokens win over a prettier ratio; QAT is the default.
 
 **On the edge device this project targets, decode leads llama.cpp on both
 models that matter to it (E4B 1.27×, 12B 1.12×) — and desktop decode is now
@@ -81,20 +95,20 @@ went unnoticed).
 The one remaining decode gap is **A5000 12B at 0.93×** — the largest model on
 the widest device, where decode is most weight-bandwidth-bound and llama's
 arch-tuned matvec still leads. [MTP](mtp.md) multiplies on top of these
-numbers (byte-identical output): ~1.85–2.2× structured, 1.1–1.35× prose,
-content-dependent (E4B prose measures **1.28×** on the A5000 post-fix, 150.1
-vs 117.6).
+numbers, byte-identical output — see the dedicated section below.
 
 ## Prefill (prompt tokens/s, 929-token turns)
 
 | device | model | little-gemma | llama.cpp (pp929) | ratio |
 |--------|-------|-------------:|------------------:|------:|
-| Orin NX | E4B | 426 | 524 | 0.81× |
+| Orin NX | **E4B QAT** | 474 | 553 | **0.86×** |
 | Orin NX | 12B | 174 | 217 | 0.80× |
 | Orin NX | E2B QAT | 834 | 1,020 | 0.82× |
-| A5000 | E4B | 3,703 | 4,846 | 0.76× |
+| Orin NX | E4B Q4_K_M *(superseded)* | 426 | 524 | 0.81× |
+| A5000 | **E4B QAT** | 4,335 | 5,254 | 0.83× |
 | A5000 | 12B | 1,782 | 2,207 | 0.81× |
 | A5000 | E2B QAT | 7,222 | 8,785 | 0.82× |
+| A5000 | E4B Q4_K_M *(superseded)* | 3,703 | 4,846 | 0.76× |
 
 **Prefill is 0.8× llama.cpp — 0.76–0.82 across six pairs on two devices,
 one consistent number.** The 2026-07 prefill campaign took it from ~0.2× to
@@ -106,6 +120,59 @@ declined. The full campaign — every kept lever and every falsified one — is
 in interactive serving the gap rarely shows (turns are short, `-sys` removes
 the skills re-prefill, the GPU encoder removed the image one), but on very
 long documents llama.cpp still wins the wait.
+
+## MTP speculative decoding (2026-07-19, the 2-row verify kernel)
+
+MTP verifies a block of drafted tokens as one small batch (B = `LG_MTP_N` =
+2–5). That batch is **its own kernel regime** — too narrow for the
+tensor-core prefill path (and barred from it: verify must argmax
+bit-identically to decode), and priced per-column on the decode matvec. The
+2026-07-19 **2-row verify kernel** (one warp owns two output rows; each
+column's activation registers load once and dot against both rows' weights)
+cut the Orin's verify cost to **1.01× / 1.13× / 1.24×** a decode step at
+B=2/3/4 — llama.cpp's same-shape forwards measure 1.04× / 1.21× / 1.49×
+(`llama-bench pp2..4` vs `tg`) — and took MTP from trailing `llama-server`'s
+speculative decoding to **leading it on every content type measured**.
+Output stays byte-identical to plain decoding (gated on both devices, text
+and image turns; acceptance rates unchanged to the digit).
+
+**Orin NX, E4B QAT, serve mode, same-day pairs** (plain decode 20.7; llama
+plain 19.0). llama-server runs `--spec-type draft-mtp`; acceptance column is
+little-gemma's block-3 chained rate:
+
+| content | accept | little-gemma +MTP | llama-server +MTP |
+|---------|-------:|------------------:|------------------:|
+| free prose | 37% | **29.9 tok/s (1.40×)** | 24.5 (1.29×) |
+| code | 76% | **40.7 (1.91×)** | 31.8 (n-max 1) / 34.1 (n-max 3) |
+| counting | 99% | **48.6 (2.33×)** | — |
+| image description (image-only turn) | 48% | **31.5 (1.52×)** | 28.8 (1.54×, plain 18.6) |
+
+Block depth (`-DLG_MTP_N`, default 3) is a content dial (Orin tok/s):
+
+| content \ block | 2 | 3 | 4 | 5 |
+|-----------------|--:|--:|--:|--:|
+| prose | 29.3 | **29.9** | 27.6 | 24.0 |
+| code | 35.4 | 40.7 | **45.9** | — |
+| counting | 38.1 | 48.6 | **57.8** | 57.3 |
+
+Prose peaks at block 2–3, code at 4, counting at 4–5; the shipped 3 is a
+good compromise everywhere (adaptive depth is the open lever). A widely
+shared *"31 tok/s E4B on a Jetson"* llama-server figure reproduces here
+exactly (31.8 — code content, `--spec-draft-n-max 1`); the shipped default
+beats it by 28%, block-4 by 44%. MTP also survives vision context intact —
+the image row is measured on a turn containing **only** an image, and the
+claim that speculation stops paying there did not reproduce on either stack.
+
+**A5000, E4B QAT:** plain 134 → prose **168.8 (1.26×)**, counting **282
+(2.10×)**. **12B QAT:** prose 101.5, counting 143.7 with MTP. (The 2-row
+kernel is gated to the integrated-GPU path: on the A5000 it helped E4B but
+regressed 12B, so the discrete path keeps the prior verify kernel —
+per-device verdicts, as ever.)
+
+The kernel investigation — the ncu attribution and the two levers measured
+and falsified on the way (occupancy forcing, shared-memory staging) — is in
+the [performance journal](performance-journal.md); the MTP mechanism is
+[mtp.md](mtp.md).
 
 ## Upstream cross-check (llama.cpp b10054, 2026-07-17)
 
@@ -235,6 +302,11 @@ Numbers that circulated before this page, and why they differ:
 - The old scoreboard's **12B Orin decode 8.7** doesn't reproduce either
   (today: 8.0 sustained / 7.5 at 929-deep tail, pinned); treat 8.0 as
   canonical.
+- **Pre-2026-07-19 MTP figures** ("E4B prose ~1.1×", "~2× structured",
+  "MTP is noise on conversational prose"): measured before the 2-row verify
+  kernel, whose B=2–4 verify now costs near one decode step. The MTP
+  section above supersedes them; the mechanism was a kernel cost, not a
+  property of speculation.
 
 ## Reproducing
 

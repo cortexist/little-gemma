@@ -8,7 +8,7 @@ its inputs are the target's own embedding of the freshly chosen token plus
 the target's last hidden state. `mtp.c` implements it; `-mtp` turns it on:
 
 ```
-run-cuda-i8 -m gemma-4-E4B-it-Q4_K_M.gguf -mtp gemma-e4b-assistant-mtp.gguf -p "..."
+run-cuda-i8 -m gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf -mtp mtp-gemma-4-E4B-it.gguf -p "..."
 ```
 
 Each round drafts and then verifies the block as one small batch — the
@@ -17,20 +17,23 @@ token. Verification is greedy, which buys the strongest property speculative
 decoding can have: **the output is byte-identical to plain greedy decoding,
 always** (the split-K verify makes it byte-identical *by construction*) — the
 only things that move are tokens/s and the acceptance rate the stats line
-reports. What MTP is worth is **sharply content-dependent**: at block-3, a
-fully-accepted round emits three tokens for ~one decode pass, so structured
-output (counting, lists, tables) roughly **doubles**; free prose lives or
-dies on the draft head's acceptance rate — the 12B's 1024-wide head lands
-~49% of prose drafts, E4B's 256-wide head only ~30%. Measured in the
-**socket server**, steady-state (2026-07):
+reports. What MTP is worth is **content-dependent** — the draft head lands
+~37% of free-prose drafts (E4B, matched QAT head), ~76% of code, ~99% of
+counting — and, since the 2026-07-19 **2-row verify kernel** dropped the
+Orin's verify cost to ~1.0–1.2× a decode step, worth having everywhere.
+Measured in the **socket server**, steady-state, E4B QAT (2026-07-19; the
+12B rows predate the new kernel):
 
-| model | counting (100% acc) | prose |
-|-------|--------------------:|------:|
-| E4B (A5000 / Orin) | **2.08×** / **1.83×** | 1.10× / 1.12× |
-| 12B (A5000 / Orin) | **2.16×** / **1.85×** | 1.35× / 1.19× |
+| model | counting | code | image-only turn | prose |
+|-------|---------:|-----:|----------------:|------:|
+| E4B QAT (Orin / A5000) | **2.33×** / 2.10× | **1.91×** / — | **1.52×** / — | **1.40×** / 1.26× |
+| 12B (A5000 / Orin, pre-2-row) | 2.16× / 1.85× | — | — | 1.35× / 1.19× |
 
-(A5000 12B: 61.6 → 133 tok/s counting, 49.9 → 66.9 prose; Orin 12B:
-8.4 → 15.5 counting, 7.8 → 9.3 prose.)
+(Orin E4B QAT: 20.7 plain → 29.9 prose, 40.7 code, 48.6 counting, 31.5
+describing an image — every one ahead of `llama-server`'s `draft-mtp` on
+the same model, same day; block-depth sweep and llama pairs in
+[benchmarks.md](benchmarks.md).) Block depth is `-DLG_MTP_N` (default 3):
+prose peaks at 2–3, code at 4, counting at 4–5.
 
 **A measurement trap worth recording:** the draft head pays a one-time ~3.6 s
 CUDA-graph warmup on its *first* call, and a one-shot `run -p` charges all of

@@ -29,25 +29,27 @@ project targets, and at parity on desktop:
 
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B Q4_K_M | **17.9** | 14.1 | **1.27×** |
+| Jetson Orin NX | E4B QAT q4_0 | **20.7** | 18.7 | **1.11×** |
 | Jetson Orin NX | 12B Q4_K_M | **8.3** | 7.4 | **1.12×** |
 | Jetson Orin NX | E2B QAT q4_0 | 34.5 | 37.4 | 0.92× |
-| RTX A5000 | E4B / 12B / E2B | **117.6** / 58.0 / **213.9** | 116.1 / 62.5 / 209.3 | **1.01×** / 0.93× / **1.02×** |
+| RTX A5000 | E4B / 12B / E2B | 134 / 58.0 / **213.9** | 136.6 / 62.5 / 209.3 | 0.98× / 0.93× / **1.02×** |
 
 **Prefill** (929-token prompts) — **0.8×** llama.cpp, consistently:
 
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B / 12B / E2B | 426 / 174 / 834 | 524 / 217 / 1,020 | 0.80–0.82× |
-| RTX A5000 | E4B / 12B / E2B | 3,703 / 1,782 / 7,222 | 4,846 / 2,207 / 8,785 | 0.76–0.82× |
+| Jetson Orin NX | E4B / 12B / E2B | 474 / 174 / 834 | 553 / 217 / 1,020 | 0.80–0.86× |
+| RTX A5000 | E4B / 12B / E2B | 4,335 / 1,782 / 7,222 | 5,254 / 2,207 / 8,785 | 0.81–0.83× |
 
 The pattern is the project's thesis: decode speed is mostly everything
 *around* the matmul — launch overhead, syncs, norms, the PLE path, how the
 KV walk is split across the GPU — which a few thousand readable lines can do
 leanly. Prefill runs through llama.cpp's home turf (arch-tuned tensor-core
 GEMMs); the 2026-07 campaign closed it from ~0.2× to 0.8× and measured the
-rest to its structural floor. [MTP](docs/mtp.md) multiplies decode on top
-(~2× structured / ~1.1–1.35× prose), output byte-identical. On media turns,
+rest to its structural floor. [MTP](docs/mtp.md) multiplies decode on top —
+Orin E4B: **1.4× prose, 1.5× image description, 1.9× code, 2.3–2.8×
+structured**, byte-identical output, ahead of `llama-server`'s own
+speculative decoding on every content type measured. On media turns,
 time-to-first-token **inverts in our favor** (1.5–2.4×) — GPU encoder plus
 arrival-overlapped prefill; see [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -71,8 +73,12 @@ All three implement the same `model.h`; only the compute kernels differ.
 ## Run
 
 ```
-run-cuda-i8 -m gemma-4-E4B-it-Q4_K_M.gguf -p "The capital of France is"
+run-cuda-i8 -m gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf -p "The capital of France is"
 ```
+
+The default E4B is unsloth's **QAT q4_0** build (with its matched MTP head,
+`mtp-gemma-4-E4B-it.gguf`) — QAT-trained for q4_0, and faster than Q4_K_M
+on both stacks.
 
 Serve conversations over a Unix-domain socket (multi-turn KV cache, raw
 token stream out — details in [docs/serving.md](docs/serving.md)):

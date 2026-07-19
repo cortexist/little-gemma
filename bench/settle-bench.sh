@@ -12,7 +12,7 @@ SCR=$LL/.scratch
 OUT=/tmp/settle
 mkdir -p $OUT
 
-E4B=$SCR/gemma-4-e4b/gemma-4-E4B-it-Q4_K_M.gguf
+E4B=~/gguf/gemma-4-e4b-qat/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   # QAT = the default E4B since 2026-07-19
 B12=$SCR/gemma-4-12b/gemma-4-12b-it-Q4_K_M.gguf
 E2B=$SCR/gemma-4-e2b/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf
 
@@ -41,7 +41,7 @@ bench_ll() {  # $1=tag $2=model [extra args...]
   local tag=$1 model=$2; shift 2
   sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
   echo "=== llama-bench $tag ==="
-  $LL/build/bin/llama-bench -m "$model" -p 929 -n 32,128 -fa 0,1 -r 3 "$@" 2>$OUT/ll-$tag.err
+  $LL/build/bin/llama-bench -m "$model" -p 929 -n 32,128 -fa 0,1 -d 0,512 -r 3 "$@" 2>$OUT/ll-$tag.err
 }
 
 case "${1:-}" in
