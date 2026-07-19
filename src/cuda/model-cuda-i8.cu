@@ -360,6 +360,121 @@ __device__ static void sub_q4_0m_n(const block_q4_0m *p, int sj, const int8_t *x
     }
 }
 
+// The 2-row twins of the sub_*_n dots above, for the MTP verify: TWO rows'
+// weight bytes unpack once each, and every column's activation registers are
+// loaded ONCE and dotted against both rows. Per row and column the arithmetic
+// — and so the float accumulation order — is exactly sub_*_n's; only the
+// xq/xds loads are shared, and the integer dots they feed are order-free.
+// Only the types our models run hot (q4_K, q6_K, repacked q4_0) get a twin;
+// the rest stay on the one-row kernel.
+template <int NB>
+__device__ static void sub2_q4_K(const block_q4_K *pa, const block_q4_K *pb, int sj,
+                                 const int8_t *xq0, int k, const float2 *xds0, int kg,
+                                 float *sa, float *sb) {
+    uint8_t sca, ma; d_gsm32(sj, (const uint32_t *)pa->scales, &sca, &ma);
+    uint8_t scb, mb; d_gsm32(sj, (const uint32_t *)pb->scales, &scb, &mb);
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *qa = (const uint4 *)(pa->qs + g * 32);
+    const uint4 *qb = (const uint4 *)(pb->qs + g * 32);
+    uint4 qa0 = qa[0], qa1 = qa[1], qb0 = qb[0], qb1 = qb[1];
+    int wa0 = nib4(qa0.x, half), wa1 = nib4(qa0.y, half), wa2 = nib4(qa0.z, half), wa3 = nib4(qa0.w, half);
+    int wa4 = nib4(qa1.x, half), wa5 = nib4(qa1.y, half), wa6 = nib4(qa1.z, half), wa7 = nib4(qa1.w, half);
+    int wb0 = nib4(qb0.x, half), wb1 = nib4(qb0.y, half), wb2 = nib4(qb0.z, half), wb3 = nib4(qb0.w, half);
+    int wb4 = nib4(qb1.x, half), wb5 = nib4(qb1.y, half), wb6 = nib4(qb1.z, half), wb7 = nib4(qb1.w, half);
+    float da, mna; d_dm(&pa->d, &da, &mna);
+    float db, mnb; d_dm(&pb->d, &db, &mnb);
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int4 *a = (const int4 *)(xq0 + (size_t)j * k + sj * 32);
+        int4 x0 = a[0], x1 = a[1];
+        int dota = 0, dotb = 0;
+        dota = __dp4a(wa0, x0.x, dota); dota = __dp4a(wa1, x0.y, dota);
+        dota = __dp4a(wa2, x0.z, dota); dota = __dp4a(wa3, x0.w, dota);
+        dota = __dp4a(wa4, x1.x, dota); dota = __dp4a(wa5, x1.y, dota);
+        dota = __dp4a(wa6, x1.z, dota); dota = __dp4a(wa7, x1.w, dota);
+        dotb = __dp4a(wb0, x0.x, dotb); dotb = __dp4a(wb1, x0.y, dotb);
+        dotb = __dp4a(wb2, x0.z, dotb); dotb = __dp4a(wb3, x0.w, dotb);
+        dotb = __dp4a(wb4, x1.x, dotb); dotb = __dp4a(wb5, x1.y, dotb);
+        dotb = __dp4a(wb6, x1.z, dotb); dotb = __dp4a(wb7, x1.w, dotb);
+        float2 xd = xds0[(size_t)j * kg + sj];
+        sa[j] += xd.x * (da * sca * dota - mna * ma * xd.y);
+        sb[j] += xd.x * (db * scb * dotb - mnb * mb * xd.y);
+    }
+}
+template <int NB>
+__device__ static void sub2_q6_Kr(const block_q6_Kr *pa, const block_q6_Kr *pb, int sj,
+                                  const int8_t *xq0, int k, const float2 *xds0, int kg,
+                                  float *sa, float *sb) {
+    int ni = sj >> 3, rem = sj & 7, grp = rem >> 1, hl = rem & 1;
+    int sh = grp * 2, off = (grp & 1) ? 32 : 0, hin = (grp >= 2);
+    const uint8_t *qla = pa->ql + ni * 64 + off + hl * 16;
+    const uint8_t *qha = pa->qh + ni * 32 + hl * 16;
+    const uint8_t *qlb = pb->ql + ni * 64 + off + hl * 16;
+    const uint8_t *qhb = pb->qh + ni * 32 + hl * 16;
+    int g_act = ni * 4 + grp;
+    int wa[4], wb[4];
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t l32 = ld32(qla + i);
+        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
+        uint32_t hi = ((ld32(qha + i) >> sh) & 0x03030303u) << 4;
+        wa[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+    }
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t l32 = ld32(qlb + i);
+        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
+        uint32_t hi = ((ld32(qhb + i) >> sh) & 0x03030303u) << 4;
+        wb[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+    }
+    float dda = d_fp16(pa->d), ddb = d_fp16(pb->d);
+    float sca = pa->scales[ni * 8 + 2 * grp + hl];
+    float scb = pb->scales[ni * 8 + 2 * grp + hl];
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int8_t *xqg = xq0 + (size_t)j * k + g_act * 32 + hl * 16;
+        int dota = 0, dotb = 0;
+        for (int i = 0; i < 16; i += 4) {
+            int xv = *(const int *)(xqg + i);
+            dota = __dp4a(wa[i >> 2], xv, dota);
+            dotb = __dp4a(wb[i >> 2], xv, dotb);
+        }
+        float xdx = xds0[(size_t)j * kg + g_act].x;
+        sa[j] += xdx * dda * sca * dota;
+        sb[j] += xdx * ddb * scb * dotb;
+    }
+}
+template <int NB>
+__device__ static void sub2_q4_0m(const block_q4_0m *pa, const block_q4_0m *pb, int sj,
+                                  const int8_t *xq0, int k, const float2 *xds0, int kg,
+                                  float *sa, float *sb) {
+    int g = sj >> 1, half = sj & 1;
+    const uint4 *qa = (const uint4 *)(pa->qs + g * 32);
+    const uint4 *qb = (const uint4 *)(pb->qs + g * 32);
+    uint4 qa0 = qa[0], qa1 = qa[1], qb0 = qb[0], qb1 = qb[1];
+    int wa0 = nib4s(qa0.x, half), wa1 = nib4s(qa0.y, half), wa2 = nib4s(qa0.z, half), wa3 = nib4s(qa0.w, half);
+    int wa4 = nib4s(qa1.x, half), wa5 = nib4s(qa1.y, half), wa6 = nib4s(qa1.z, half), wa7 = nib4s(qa1.w, half);
+    int wb0 = nib4s(qb0.x, half), wb1 = nib4s(qb0.y, half), wb2 = nib4s(qb0.z, half), wb3 = nib4s(qb0.w, half);
+    int wb4 = nib4s(qb1.x, half), wb5 = nib4s(qb1.y, half), wb6 = nib4s(qb1.z, half), wb7 = nib4s(qb1.w, half);
+    float da = d_fp16(pa->d[sj]);
+    float db = d_fp16(pb->d[sj]);
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        const int4 *a = (const int4 *)(xq0 + (size_t)j * k + sj * 32);
+        int4 x0 = a[0], x1 = a[1];
+        int dota = 0, dotb = 0;
+        dota = __dp4a(wa0, x0.x, dota); dota = __dp4a(wa1, x0.y, dota);
+        dota = __dp4a(wa2, x0.z, dota); dota = __dp4a(wa3, x0.w, dota);
+        dota = __dp4a(wa4, x1.x, dota); dota = __dp4a(wa5, x1.y, dota);
+        dota = __dp4a(wa6, x1.z, dota); dota = __dp4a(wa7, x1.w, dota);
+        dotb = __dp4a(wb0, x0.x, dotb); dotb = __dp4a(wb1, x0.y, dotb);
+        dotb = __dp4a(wb2, x0.z, dotb); dotb = __dp4a(wb3, x0.w, dotb);
+        dotb = __dp4a(wb4, x1.x, dotb); dotb = __dp4a(wb5, x1.y, dotb);
+        dotb = __dp4a(wb6, x1.z, dotb); dotb = __dp4a(wb7, x1.w, dotb);
+        float xdx = xds0[(size_t)j * kg + sj].x;
+        sa[j] += xdx * da * dota;
+        sb[j] += xdx * db * dotb;
+    }
+}
+
 // out[i] = W[i,:] . x : one warp per output row. For K-quant/q8_0 weights the
 // lanes split the row's sub-blocks (integer dots); for bf16/f32/f16 they fall
 // back to the f32 path (lane 0). A shuffle reduces the per-lane partials.
@@ -776,6 +891,77 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         float v = s[j];
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
         if (lane == 0) out[(size_t)j * m + warp] = v;
+    }
+}
+
+// The MTP-verify form of the n-kernel (B = LG_MTP_N; q4_K / q6_K / q4_0
+// only, the host routes the rest to the n-kernel). Verify is barred from the
+// tensor-core chunk path — it must argmax bit-identically to decode — so it
+// pays the dp4a row walk, where at B columns the per-column xq/xds loads are
+// the bill (ncu: ~73% L1TEX, SM and DRAM idle, B=3 costs 1.5x a decode
+// step). Two levers measured and FALSIFIED here first: decode's 6-block
+// __launch_bounds__ (40-reg schedule, 90% occupancy, +17% time — the fat
+// 64-register ILP schedule beats warps) and a shared-memory activation stage
+// (+10% — LDG->LDS is one-for-one on the Orin's MIO, the same lesson the
+// prefill flash campaign paid for). What is left is issuing FEWER loads: one
+// warp owns TWO rows, so every column's activation registers are loaded once
+// and dotted against both rows' weights — a third less MIO work per row at
+// B=3. The same trade lost at B=1 (one column to share, see the note above
+// matmul_i8r_kernel) and llama's mmvq table agrees from the other side: it
+// runs 2 rows per block only at ncols >= 2. Per row the si order, sub
+// arithmetic, and shuffle tree are exactly the n-kernel's (the 2-row subs
+// share only the loads), so verify==decode argmax holds by construction.
+// 128-thread blocks keep the register granularity friendly: 8 rows per block,
+// same grid as the n-kernel. An odd m aliases the tail warp's second row to
+// its first and discards the result. INTEGRATED-ONLY (mma_integrated gate):
+// on the Orin every verify(B)/decode ratio drops to llama's curve or under
+// (B=2 1.01x, B=3 1.13x; E4B prose MTP 1.09x -> 1.40x), but on the A5000 the
+// verdicts split by model — E4B verify -8%, 12B +7% (same-session pairs) — so
+// the discrete path keeps the n-kernel. (Parked: a shape-aware gate could
+// reclaim the A5000 E4B win.)
+template <int NB>
+__global__ static void matmul_i8r_s_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
+                                           const int8_t *xq, const float2 *xds, int k, int m) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int r0 = 2 * warp;
+    if (r0 >= m) return;
+    int two = r0 + 1 < m;
+    size_t rstr = (size_t)(k / blck) * ts;
+    const unsigned char *rowa = wbase + (size_t)r0 * rstr;
+    const unsigned char *rowb = two ? rowa + rstr : rowa;
+    int nb = k / blck, gpb = blck / 32;
+    float sa[NB], sb[NB];
+    #pragma unroll
+    for (int j = 0; j < NB; j++) { sa[j] = 0.0f; sb[j] = 0.0f; }
+
+    int nsub = type == GGML_TYPE_Q6_K ? 16 : 8;
+    int total = nb * nsub;
+    for (int si = lane; si < total; si += 32) {
+        int b = si / nsub, sj = si % nsub;
+        const unsigned char *blka = rowa + (size_t)b * ts;
+        const unsigned char *blkb = rowb + (size_t)b * ts;
+        const int8_t *xq0 = xq + (size_t)b * blck;       // column 0; stride k per column
+        const float2 *xds0 = xds + (size_t)b * gpb;      // column 0; stride k/32
+        switch (type) {
+            case GGML_TYPE_Q4_K: sub2_q4_K<NB>((const block_q4_K *)blka, (const block_q4_K *)blkb, sj, xq0, k, xds0, k / 32, sa, sb); break;
+            case GGML_TYPE_Q6_K: sub2_q6_Kr<NB>((const block_q6_Kr *)blka, (const block_q6_Kr *)blkb, sj, xq0, k, xds0, k / 32, sa, sb); break;
+            case GGML_TYPE_Q4_0: sub2_q4_0m<NB>((const block_q4_0m *)blka, (const block_q4_0m *)blkb, sj, xq0, k, xds0, k / 32, sa, sb); break;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < NB; j++) {
+        float v = sa[j];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        if (lane == 0) out[(size_t)j * m + r0] = v;
+    }
+    if (two) {
+        #pragma unroll
+        for (int j = 0; j < NB; j++) {
+            float v = sb[j];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+            if (lane == 0) out[(size_t)j * m + r0 + 1] = v;
+        }
     }
 }
 
@@ -1400,5 +1586,9 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
     int blck = rblck(t), ts;
     const unsigned char *w = rweight(t, &ts);
     int blocks = (m + 7) / 8;
-    matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    int hot = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q4_0;
+    if (hot && mma_integrated())
+        matmul_i8r_s_kernel<LG_MTP_N><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m);
+    else
+        matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
