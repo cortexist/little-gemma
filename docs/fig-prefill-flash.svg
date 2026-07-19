@@ -1,87 +1,208 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
-  <defs>
-    <marker id="pa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
-    </marker>
-    <marker id="pad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
-    </marker>
-  </defs>
-  <rect x="6" y="6" width="988" height="588" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
-
-  <text x="36" y="50" font-size="25" font-weight="700" fill="#0f172a">Prefill flash attention — where the 8× gap forms</text>
-  <text x="36" y="76" font-size="13.5" fill="#64748b">A chunk of query rows sweeps the K/V blocks (flash / online softmax). The dataflow is identical on both stacks — the gap is entirely inside the per-block inner step.</text>
-
-  <!-- ===== LEFT: the flash loop (shared dataflow) ===== -->
-  <rect x="36" y="100" width="300" height="392" rx="10" fill="#fbfdff" stroke="#cbd5e1" stroke-width="1.5"/>
-  <text x="52" y="126" font-size="12" font-weight="700" fill="#64748b">FLASH LOOP</text>
-  <text x="52" y="143" font-size="11" fill="#94a3b8">identical dataflow, both stacks</text>
-
-  <rect x="60" y="154" width="252" height="30" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
-  <text x="186" y="174" text-anchor="middle" font-size="12.5" fill="#15803d">IN: Q tile · B query rows + K/V blocks</text>
-  <line x1="186" y1="184" x2="186" y2="200" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-
-  <rect x="60" y="202" width="252" height="28" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
-  <text x="186" y="220" text-anchor="middle" font-size="12.5" fill="#334155">load K block</text>
-  <line x1="186" y1="230" x2="186" y2="242" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-
-  <rect x="60" y="244" width="252" height="28" rx="6" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.8"/>
-  <text x="186" y="262" text-anchor="middle" font-size="12.5" fill="#b45309">S = Q · K&#7488;   &#183;  tensor-core MMA</text>
-  <line x1="186" y1="272" x2="186" y2="284" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-
-  <rect x="60" y="286" width="252" height="28" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
-  <text x="186" y="304" text-anchor="middle" font-size="12.5" fill="#334155">online softmax → running m, l</text>
-  <line x1="186" y1="314" x2="186" y2="326" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-
-  <rect x="60" y="328" width="252" height="28" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
-  <text x="186" y="346" text-anchor="middle" font-size="12.5" fill="#334155">load V block</text>
-  <line x1="186" y1="356" x2="186" y2="368" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-
-  <rect x="60" y="370" width="252" height="28" rx="6" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.8"/>
-  <text x="186" y="388" text-anchor="middle" font-size="12.5" fill="#b45309">O += P · V   &#183;  tensor-core MMA</text>
-
-  <!-- loop back -->
-  <path d="M312,384 C338,384 338,216 315,216" fill="none" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-  <text x="322" y="300" font-size="10.5" fill="#94a3b8" transform="rotate(90 322 300)">next K/V block</text>
-
-  <line x1="186" y1="398" x2="186" y2="416" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#pa)"/>
-  <rect x="60" y="418" width="252" height="30" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
-  <text x="186" y="438" text-anchor="middle" font-size="12.5" fill="#1e40af">after last block: normalize O → attn out</text>
-
-  <text x="186" y="474" text-anchor="middle" font-size="11" fill="#94a3b8">the two MMA steps (amber) are the hot path ↓</text>
-
-  <!-- magnifier arrow to the right -->
-  <path d="M318,258 C352,258 352,150 384,150" fill="none" stroke="#7c3aed" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#pad)"/>
-  <text x="352" y="196" font-size="11" font-weight="600" fill="#7c3aed" transform="rotate(-32 352 196)">zoom in</text>
-
-  <!-- ===== RIGHT: the hot step, two ways ===== -->
-  <text x="384" y="120" font-size="12" font-weight="700" fill="#64748b">THE HOT STEP  (load fragments + MMA),  TWO WAYS</text>
-
-  <rect x="384" y="132" width="578" height="112" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
-  <text x="404" y="157" font-size="15" font-weight="700" fill="#1d4ed8">little-gemma</text>
-  <text x="404" y="181" font-size="12.5" fill="#334155">•  manual LDS reads of the A / B fragments from shared memory</text>
-  <text x="404" y="201" font-size="12.5" fill="#334155">•  global K / V loads, not pipelined  ·  one query-head per CTA</text>
-  <text x="404" y="228" font-size="12.5" font-weight="600" fill="#dc2626">→ stalls on shared-memory reads — at 8 SMs there are no spare warps to hide it</text>
-
-  <rect x="384" y="256" width="578" height="112" rx="9" fill="#fff7ed" stroke="#ea580c" stroke-width="1.8"/>
-  <text x="404" y="281" font-size="15" font-weight="700" fill="#c2410c">llama.cpp</text>
-  <text x="404" y="305" font-size="12.5" fill="#334155">•  cp.async: global → shared loads, software-pipelined (overlapped)</text>
-  <text x="404" y="325" font-size="12.5" fill="#334155">•  ldmatrix.x4: &#188; the fragment-load instructions  ·  GQA pack: 2 heads / CTA</text>
-  <text x="404" y="352" font-size="12.5" font-weight="600" fill="#16a34a">→ latency hidden, instruction-lean</text>
-
-  <!-- 8x badge -->
-  <circle cx="895" cy="312" r="34" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
-  <text x="895" y="308" text-anchor="middle" font-size="20" font-weight="800" fill="#dc2626">8×</text>
-  <text x="895" y="326" text-anchor="middle" font-size="9" fill="#b91c1c">per block</text>
-
-  <!-- ===== verdict bar ===== -->
-  <rect x="384" y="392" width="578" height="84" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
-  <text x="404" y="418" font-size="13" fill="#334155"><tspan font-weight="700">Same math, same dataflow — the gap is instruction economy in this one step.</tspan></text>
-  <text x="404" y="441" font-size="12.5" fill="#475569">Prefill attention: <tspan font-weight="700" fill="#0f172a">0.67 s</tspan> (ours) vs <tspan font-weight="700" fill="#0f172a">0.08 s</tspan> (llama) per 929-token 12B pass on the Orin</text>
-  <text x="404" y="461" font-size="12.5" fill="#475569">— ~<tspan font-weight="700" fill="#0f172a">40%</tspan> of the whole 0.8× prefill gap, and the single biggest slice.</text>
-
-  <!-- takeaway strip -->
-  <text x="36" y="522" font-size="13" fill="#334155"><tspan font-weight="700">Why we can't just copy it:</tspan> the 8× isn't a parameter — it's how their warps interleave shared-memory reads to hide within-wave latency (codegen).</text>
-  <text x="36" y="544" font-size="13" fill="#334155">Matching it means adopting ~1,500 lines of their kernel wholesale — at which point it stops being a teachable, dependency-free runner. So 0.8× is a deliberate trade.</text>
-  <text x="36" y="566" font-size="12.5" fill="#64748b">(We took the one graftable slice — GQA head-packing, +1.7%. The rest is structural: barrier cadence + softmax serialization.)</text>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1000" height="600" viewBox="0 0 1000 600" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;">
+    <path d="M994,20L994,580C994,587.727 987.727,594 980,594L20,594C12.273,594 6,587.727 6,580L6,20C6,12.273 12.273,6 20,6L980,6C987.727,6 994,12.273 994,20Z" style="fill:white;stroke:rgb(226,232,240);stroke-width:2px;"/>
+    <g transform="matrix(1,0,0,1,36,50)">
+        <g transform="matrix(25,0,0,25,40.307617,0)">
+        </g>
+        <g transform="matrix(25,0,0,25,48.632812,0)">
+        </g>
+        <g transform="matrix(25,0,0,25,76.416016,0)">
+        </g>
+        <g transform="matrix(25,0,0,25,84.741211,0)">
+        </g>
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:25px;fill:rgb(15,23,42);">Preﬁll ﬂash attention — where the 8× gap forms</text>
+    </g>
+    <g transform="matrix(0.979138,0,0,0.979138,35.999587,75.794957)">
+        <g transform="matrix(13.5,0,0,13.5,280.632568,0)">
+        </g>
+        <g transform="matrix(13.5,0,0,13.5,284.383301,0)">
+        </g>
+        <g transform="matrix(13.5,0,0,13.5,472.486816,0)">
+        </g>
+        <g transform="matrix(13.5,0,0,13.5,476.237549,0)">
+        </g>
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13.5px;fill:rgb(100,116,139);">A<tspan x="8.26px 12.01px " y="0px 0px "> c</tspan>hunk of query rows sweeps the K/V blocks (ﬂash / online softmax). <tspan x="419.199px 427.445px " y="0px 0px ">Th</tspan>e dataﬂow is identical on both stacks — the gap is entirely inside the per-block inner step.</text>
+    </g>
+    <path d="M336,110L336,482C336,487.519 331.519,492 326,492L46,492C40.481,492 36,487.519 36,482L36,110C36,104.481 40.481,100 46,100L326,100C331.519,100 336,104.481 336,110Z" style="fill:rgb(251,253,255);stroke:rgb(203,213,225);stroke-width:1.5px;"/>
+    <g transform="matrix(1,0,0,1,52,126)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12px;fill:rgb(100,116,139);">FLASH LOOP</text>
+    </g>
+    <g transform="matrix(1,0,0,1,52,143)">
+        <g transform="matrix(11,0,0,11,64.82373,0)">
+        </g>
+        <g transform="matrix(11,0,0,11,67.879883,0)">
+        </g>
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:11px;fill:rgb(148,163,184);">identical dataﬂow<tspan x="83.778px 86.834px " y="0px 0px ">, </tspan>both stacks</text>
+    </g>
+    <path d="M312,160L312,178C312,181.311 309.311,184 306,184L66,184C62.689,184 60,181.311 60,178L60,160C60,156.689 62.689,154 66,154L306,154C309.311,154 312,156.689 312,160Z" style="fill:rgb(240,253,244);stroke:rgb(22,163,74);stroke-width:1.6px;"/>
+    <g transform="matrix(1,0,0,1,186,174)">
+        <text x="-102.985px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(21,128,61);">IN: Q tile · B query rows + K/V blocks</text>
+    </g>
+    <g>
+        <path d="M186,184L186,200" style="fill:none;fill-rule:nonzero;"/>
+        <path d="M188.4,192.8L186,200L183.6,192.8L188.4,192.8Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+        <path d="M186,184L186,194.24" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.6px;"/>
+    </g>
+    <g transform="matrix(1,0,0,1,0,-2)">
+        <path d="M312,208L312,224C312,227.311 309.311,230 306,230L66,230C62.689,230 60,227.311 60,224L60,208C60,204.689 62.689,202 66,202L306,202C309.311,202 312,204.689 312,208Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    </g>
+    <g transform="matrix(1,0,0,1,186,220)">
+        <text x="-34.048px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">load K block</text>
+    </g>
+    <g transform="matrix(1,0,0,1.333333,0,-78.666667)">
+        <path d="M186,230L186,242" style="fill:none;fill-rule:nonzero;"/>
+        <g transform="matrix(1,-0,-0,0.75,-0,59)">
+            <path d="M188.828,235.515L186,244L183.172,235.515L188.828,235.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+            <path d="M186,228L186,237.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
+        </g>
+    </g>
+    <path d="M312,250L312,266C312,269.311 309.311,272 306,272L66,272C62.689,272 60,269.311 60,266L60,250C60,246.689 62.689,244 66,244L306,244C309.311,244 312,246.689 312,250Z" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.8px;"/>
+    <g transform="matrix(1,0,0,1,186,262)">
+        <text x="-87.271px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(180,83,9);">S = Q · Kᵀ   ·  tensor-core MMA</text>
+    </g>
+    <g transform="matrix(1,0,0,1.333333,0,-90.666667)">
+        <path d="M186,272L186,284" style="fill:none;fill-rule:nonzero;"/>
+        <g transform="matrix(1,-0,-0,0.75,-0,68)">
+            <path d="M188.828,279.515L186,288L183.172,279.515L188.828,279.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+            <path d="M186,272L186,281.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
+        </g>
+    </g>
+    <g transform="matrix(1,0,0,1,0,2)">
+        <path d="M312,292L312,308C312,311.311 309.311,314 306,314L66,314C62.689,314 60,311.311 60,308L60,292C60,288.689 62.689,286 66,286L306,286C309.311,286 312,288.689 312,292Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    </g>
+    <g transform="matrix(1,0,0,1,186,305)">
+        <text x="-82.675px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">online softmax → running m, l</text>
+    </g>
+    <g transform="matrix(1,0,0,1.166667,0,-51.333333)">
+        <path d="M186,314L186,326" style="fill:none;fill-rule:nonzero;"/>
+        <g transform="matrix(1,-0,-0,0.857143,-0,44)">
+            <path d="M188.608,321.177L186,329L183.392,321.177L188.608,321.177Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+            <path d="M186,315L186,322.742" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.74px;"/>
+        </g>
+    </g>
+    <g transform="matrix(1,0,0,1,0,1)">
+        <path d="M312,334L312,350C312,353.311 309.311,356 306,356L66,356C62.689,356 60,353.311 60,350L60,334C60,330.689 62.689,328 66,328L306,328C309.311,328 312,330.689 312,334Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    </g>
+    <g transform="matrix(1,0,0,1,186,347)">
+        <text x="-34.048px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">load V block</text>
+    </g>
+    <g transform="matrix(1,0,0,1.333333,0,-117.666667)">
+        <path d="M186,356L186,368" style="fill:none;fill-rule:nonzero;"/>
+        <g transform="matrix(1,-0,-0,0.75,-0,88.25)">
+            <path d="M188.828,364.515L186,373L183.172,364.515L188.828,364.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+            <path d="M186,357L186,366.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
+        </g>
+    </g>
+    <g transform="matrix(1,0,0,1,0,3)">
+        <path d="M312,376L312,392C312,395.311 309.311,398 306,398L66,398C62.689,398 60,395.311 60,392L60,376C60,372.689 62.689,370 66,370L306,370C309.311,370 312,372.689 312,376Z" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.8px;"/>
+    </g>
+    <g transform="matrix(1,0,0,1,186,391)">
+        <text x="-88.104px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(180,83,9);">O += P<tspan x="-48.724px -45.251px " y="0px 0px "> ·</tspan> V   ·  tensor-core MMA</text>
+    </g>
+    <g transform="matrix(1,0,0,1.029762,0,-8.428571)">
+        <g transform="matrix(1,-0,-0,0.971098,-0,8.184971)">
+            <path d="M314.435,220.675L312,214L317.953,217.879L314.435,220.675Z" style="fill:rgb(148,163,184);"/>
+            <path d="M312,387C388.542,324.255 330.504,238.127 315.355,218.222" style="fill:none;stroke:rgb(148,163,184);stroke-width:1.5px;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:1.5;"/>
+        </g>
+    </g>
+    <g transform="matrix(-0,1,-1,-0,322,300)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:10.5px;fill:rgb(148,163,184);">next K/V block</text>
+    </g>
+    <g transform="matrix(1,0,0,1,0,2)">
+        <path d="M186,398L186,416" style="fill:none;fill-rule:nonzero;"/>
+        <g transform="matrix(1,-0,-0,1,0,-2)">
+            <path d="M188.4,410.8L186,418L183.6,410.8L188.4,410.8Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
+            <path d="M186,400L186,412.24" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.6px;"/>
+        </g>
+    </g>
+    <path d="M312,424L312,442C312,445.311 309.311,448 306,448L66,448C62.689,448 60,445.311 60,442L60,424C60,420.689 62.689,418 66,418L306,418C309.311,418 312,420.689 312,424Z" style="fill:rgb(239,246,255);stroke:rgb(37,99,235);stroke-width:1.6px;"/>
+    <g transform="matrix(1,0,0,1,186,438)">
+        <text x="-108.032px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(30,64,175);">after last block: normalize O → attn out</text>
+    </g>
+    <g transform="matrix(1,0,0,1,186,474)">
+        <text x="-111.579px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:11px;fill:rgb(148,163,184);">the two MMA<tspan x="-48.001px -44.945px " y="0px 0px "> s</tspan>teps (amber) are the hot path ↓</text>
+    </g>
+    <g transform="matrix(1.090909,0,0,1,-34.909091,0)">
+        <g transform="matrix(0.916667,-0,-0,1,32,-0)">
+            <path d="M375.12,149.009L384,150L376.302,154.535L375.12,149.009Z" style="fill:rgb(124,58,237);fill-rule:nonzero;"/>
+            <path d="M312,258C346.58,258 348.921,164.125 377.369,151.417" style="fill:none;fill-rule:nonzero;stroke:rgb(124,58,237);stroke-width:1.88px;stroke-dasharray:5.232,4.186;"/>
+        </g>
+    </g>
+    <g transform="matrix(0.848048,-0.529919,0.529919,0.848048,347.563515,200.713787)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:11px;fill:rgb(124,58,237);">zoom in</text>
+    </g>
+    <g transform="matrix(1,0,0,1,384,120)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12px;fill:rgb(100,116,139);">THE HOT STEP<tspan x="87.123px 90.457px " y="0px 0px ">  </tspan>(load fragments + MMA),  TWO W<tspan x="282.123px 289.688px 297.691px " y="0px 0px 0px ">AYS</tspan></text>
+    </g>
+    <path d="M962,141L962,235C962,239.967 957.967,244 953,244L393,244C388.033,244 384,239.967 384,235L384,141C384,136.033 388.033,132 393,132L953,132C957.967,132 962,136.033 962,141Z" style="fill:rgb(239,246,255);stroke:rgb(37,99,235);stroke-width:1.8px;"/>
+    <g transform="matrix(1,0,0,1,404,157)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:15px;fill:rgb(29,78,216);">little-gemma</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,181)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  manual LDS reads of the <tspan x="152.38px 160.028px 163.501px " y="0px 0px 0px ">A /</tspan> B fragments from shared memory</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,201)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  global K / V loads, not pipelined  ·  one query-head per CT<tspan x="332.812px " y="0px ">A</tspan></text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,228)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(220,38,38);">→ stalls on shared-memory reads — at 8 SMs there are no spare warps to hide it</text>
+    </g>
+    <path d="M962,265L962,359C962,363.967 957.967,368 953,368L393,368C388.033,368 384,363.967 384,359L384,265C384,260.033 388.033,256 393,256L953,256C957.967,256 962,260.033 962,265Z" style="fill:rgb(255,247,237);stroke:rgb(234,88,12);stroke-width:1.8px;"/>
+    <g transform="matrix(1,0,0,1,404,281)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:15px;fill:rgb(194,65,12);">llama.cpp</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,305)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  cp.async: global → shared loads, software-pipelined (overlapped)</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,325)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  ldmatrix.x4: ¼ the fragment-load instructions  ·  GQA<tspan x="302.411px 305.884px " y="0px 0px "> p</tspan>ack: 2 heads / CT<tspan x="409.869px " y="0px ">A</tspan></text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,352)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(22,163,74);">→ latency hidden, instruction-lean</text>
+    </g>
+    <circle cx="895" cy="312" r="34" style="fill:rgb(254,242,242);stroke:rgb(220,38,38);stroke-width:2px;"/>
+    <g transform="matrix(1,0,0,1,895,308)">
+        <text x="-11.401px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:20px;fill:rgb(220,38,38);">8×</text>
+    </g>
+    <g transform="matrix(1,0,0,1,895,326)">
+        <text x="-18.259px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:9px;fill:rgb(185,28,28);">per block</text>
+    </g>
+    <path d="M962,401L962,467C962,471.967 957.967,476 953,476L393,476C388.033,476 384,471.967 384,467L384,401C384,396.033 388.033,392 393,392L953,392C957.967,392 962,396.033 962,401Z" style="fill:rgb(248,250,252);stroke:rgb(226,232,240);stroke-width:1px;"/>
+    <g transform="matrix(1,0,0,1,404,418)">
+        <g transform="matrix(13,0,0,13,140.175293,0)">
+        </g>
+        <g transform="matrix(13,0,0,13,144.504395,0)">
+        </g>
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:13px;fill:rgb(51,65,85);">Same math, same dataﬂow — the gap is instruction economy in this one step.</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,441)">
+        <g transform="matrix(12.5,0,0,12.5,19.451904,0)">
+        </g>
+        <g transform="matrix(12.5,0,0,12.5,22.924805,0)">
+        </g>
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">Preﬁll attention:</text>
+        <text x="89.63px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.67 s</text>
+        <text x="127.856px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(ours) vs</text>
+        <text x="179.944px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.08 s</text>
+        <text x="218.17px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(llama) per 929-token 12B pass on the Orin</text>
+    </g>
+    <g transform="matrix(1,0,0,1,404,461)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">— ~</text>
+        <text x="23.273px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">40%</text>
+        <g transform="matrix(12.5,0,0,12.5,168.859863,0)">
+        </g>
+        <g transform="matrix(12.5,0,0,12.5,172.332764,0)">
+        </g>
+        <text x="51.764px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">of the whole 0.8× preﬁll gap, and the single biggest slice.</text>
+    </g>
+    <g transform="matrix(1,0,0,1,36,522)">
+        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:13px;fill:rgb(51,65,85);">Why we can&apos;t just copy it:</text>
+        <text x="161.999px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13px;fill:rgb(51,65,85);">the 8× isn&apos;t a parameter — it&apos;s how their warps interleave shared-memory reads to hide within-wave latency (codegen).</text>
+    </g>
+    <g transform="matrix(1,0,0,1,36,544)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13px;fill:rgb(51,65,85);">Matching it means adopting ~1,500 lines of their kernel wholesale — at which point it stops being a teachable, dependency-free runner<tspan x="772.897px 776.509px " y="0px 0px ">. </tspan>So 0.8× is a deliberate trade.</text>
+    </g>
+    <g transform="matrix(1,0,0,1,36,566)">
+        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(100,116,139);">(W<tspan x="15.735px 22.687px " y="0px 0px ">e </tspan>took the one graftable slice — GQA<tspan x="222.101px 225.574px " y="0px 0px "> h</tspan>ead-packing, +1.7%. <tspan x="350.085px 357.721px " y="0px 0px ">Th</tspan>e rest is structural: barrier cadence + softmax serialization.)</text>
+    </g>
 </svg>
