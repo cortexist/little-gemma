@@ -24,8 +24,24 @@ path, llama.cpp with `llama-bench` (best of `-fa 0/1`, decode at matched
 context depth). Full tables, methodology, and history:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-**Decode** (tokens/s, batch 1) — ahead on the Jetson, the device this
-project targets, and at parity on desktop:
+**Generation with [MTP](docs/mtp.md) on** (tokens/s) — the shipped
+configuration, and the number that matters in use; output is
+**byte-identical to plain greedy decoding, always**:
+
+| device | model | plain | +MTP chat | +MTP structured |
+|--------|-------|------:|----------:|----------------:|
+| Jetson Orin NX | E4B QAT | 20.7 | **29.9** | **48.6** |
+| Jetson Orin NX | 12B QAT | 9.8 | **14.5** | **20.4** |
+| RTX A5000 | E4B QAT | 134 | **168.8** | **282** |
+| RTX A5000 | 12B QAT | 70.7 | **101.5** | **143.7** |
+
+The gain is content-dependent — Orin E4B by turn type: prose 29.9, image
+description 31.5, code 40.7, fully predictable output 48.6 (57.8 at
+block-4) — and ahead of `llama-server`'s own `draft-mtp` at every point
+measured (prose 24.5, code 34.1, image 28.8).
+
+**Decode** (tokens/s, batch 1, speculation off) — ahead on the Jetson, the
+device this project targets, and at parity on desktop:
 
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
@@ -46,10 +62,7 @@ The pattern is the project's thesis: decode speed is mostly everything
 KV walk is split across the GPU — which a few thousand readable lines can do
 leanly. Prefill runs through llama.cpp's home turf (arch-tuned tensor-core
 GEMMs); the 2026-07 campaign closed it from ~0.2× to 0.8× and measured the
-rest to its structural floor. [MTP](docs/mtp.md) multiplies decode on top —
-Orin E4B: **1.4× prose, 1.5× image description, 1.9× code, 2.3–2.8×
-structured**, byte-identical output, ahead of `llama-server`'s own
-speculative decoding on every content type measured. On media turns,
+rest to its structural floor. On media turns,
 time-to-first-token **inverts in our favor** (1.5–2.4×) — GPU encoder plus
 arrival-overlapped prefill; see [docs/benchmarks.md](docs/benchmarks.md).
 
