@@ -7,7 +7,7 @@ mutually inconsistent figures is at the bottom).
 
 - **Date / builds:** prefill 2026-07-16, decode 2026-07-17 (after the KV-split
   fix — prefill is untouched by it and was re-measured as the control:
-  A5000 E2B 7,260 → 7,307, i.e. unchanged). **E4B QAT rows and the MTP
+  A5000 E2B 7,260 → 7,307, i.e. unchanged). **E4B/12B QAT rows and the MTP
   section: 2026-07-19** (the 2-row MTP verify kernel; llama.cpp fork
   `cd5ad883e` on the Orin, `74ade5274`/b9672 on the A5000 for those pairs).
   little-gemma `7980037`+ (`run-cuda-i8`);
@@ -18,11 +18,13 @@ mutually inconsistent figures is at the bottom).
   numbers are lower) and RTX A5000 24GB (Ampere sm_86, Windows/WDDM, stock
   clocks — the serve harness runs warm back-to-back turns; the clock probe
   shows sustained 1695 MHz boost during decode).
-- **Models:** Gemma 4 **E4B QAT q4_0** (`gemma-4-E4B-it-qat-UD-Q4_K_XL`,
-  unsloth — **the default E4B since 2026-07-19**, with its matched MTP head
-  `mtp-gemma-4-E4B-it.gguf`), 12B Q4_K_M, E2B QAT q4_0
-  (`gemma-4-E2B-it-qat-UD-Q4_K_XL`). The superseded E4B Q4_K_M rows are
-  kept for reference.
+- **Models:** Gemma 4 **E4B and 12B QAT q4_0**
+  (`gemma-4-{E4B,12B}-it-qat-UD-Q4_K_XL`, unsloth — **the defaults since
+  2026-07-19**, with their matched MTP heads `mtp-gemma-4-{E4B,12B}-it.gguf`)
+  and E2B QAT q4_0 (`gemma-4-E2B-it-qat-UD-Q4_K_XL`). The superseded
+  Q4_K_M rows are kept for reference. The 12B QAT load on the 16GB Orin
+  needs a page-cache drop first (the q4_0 repack's device copies race the
+  blob's page cache for nvmap; the settle harness does it).
 
 ## Methodology
 
@@ -55,19 +57,23 @@ Post the **2026-07-17 KV-split fix** (`SPLIT_KEYS 1024 → 64`; see
 | device | model | little-gemma (serve) | llama.cpp (tg128@d512) | ratio | was |
 |--------|-------|---------------------:|-----------------------:|------:|----:|
 | **Orin NX** | **E4B QAT** | **20.7** | 18.7 | **1.11×** | — |
-| **Orin NX** | 12B | **8.3** | 7.4 | **1.12×** | 1.08× |
+| **Orin NX** | **12B QAT** | **9.8** | 9.05 | **1.08×** | — |
 | **Orin NX** | E2B QAT | 34.5 | 37.4 | 0.92× | 0.80× |
 | Orin NX | E4B Q4_K_M *(superseded)* | **17.9** | 14.1 | **1.27×** | 1.17× |
+| Orin NX | 12B Q4_K_M *(superseded)* | **8.3** | 7.4 | **1.12×** | 1.08× |
 | **A5000** | **E4B QAT** | 134 | 136.6 | 0.98× | — |
-| A5000 | 12B | 58.0 | 62.5 | 0.93× | 0.80× |
+| **A5000** | **12B QAT** | 70.7 | 70.7 | **1.00×** | — |
 | **A5000** | E2B QAT | **213.9** | 209.3 | **1.02×** | 0.70× |
 | A5000 | E4B Q4_K_M *(superseded)* | **117.6** | 116.1 | **1.01×** | 0.81× |
+| A5000 | 12B Q4_K_M *(superseded)* | 58.0 | 62.5 | 0.93× | 0.80× |
 
-The QAT switch (2026-07-19) speeds up **both** stacks — Orin 17.9 → 20.7
-for us, 14.1 → 18.7 for llama — and narrows the Orin ratio (1.27× →
-1.11×) for the same reason E2B QAT sits at 0.92×: llama's q4_0 matvec is
-stronger than its q4_K one, so q4_0 models play toward their strength.
-Faster absolute tokens win over a prettier ratio; QAT is the default.
+The QAT switch (2026-07-19) speeds up **both** stacks — Orin E4B 17.9 →
+20.7 for us, 14.1 → 18.7 for llama; 12B 8.3 → 9.8 vs 7.4 → 9.05 — and
+narrows the Orin ratios for the same reason E2B QAT sits at 0.92×: llama's
+q4_0 matvec is stronger than its q4_K one, so q4_0 models play toward its
+strength. Faster absolute tokens win over a prettier ratio; QAT is the
+default. On the A5000 the switch **closes the last decode gap**: 12B goes
+from 0.93× (Q4_K_M) to exact parity at 70.7 tok/s.
 
 **On the edge device this project targets, decode leads llama.cpp on both
 models that matter to it (E4B 1.27×, 12B 1.12×) — and desktop decode is now
@@ -92,9 +98,9 @@ under-filled) than the 8-SM Orin (where `n_head == 8 == SM count` filled the
 board by accident, which is why the Orin lead existed at all and why the droop
 went unnoticed).
 
-The one remaining decode gap is **A5000 12B at 0.93×** — the largest model on
-the widest device, where decode is most weight-bandwidth-bound and llama's
-arch-tuned matvec still leads. [MTP](mtp.md) multiplies on top of these
+The one decode gap left anywhere is the legacy quants: E2B/12B *Q4_K_M*-era
+rows where llama's arch-tuned matvec leads — on the QAT defaults every
+pair is at parity or ahead. [MTP](mtp.md) multiplies on top of these
 numbers, byte-identical output — see the dedicated section below.
 
 ## Prefill (prompt tokens/s, 929-token turns)
@@ -102,13 +108,15 @@ numbers, byte-identical output — see the dedicated section below.
 | device | model | little-gemma | llama.cpp (pp929) | ratio |
 |--------|-------|-------------:|------------------:|------:|
 | Orin NX | **E4B QAT** | 474 | 553 | **0.86×** |
-| Orin NX | 12B | 174 | 217 | 0.80× |
+| Orin NX | **12B QAT** | 193 | 232 | 0.84× |
 | Orin NX | E2B QAT | 834 | 1,020 | 0.82× |
 | Orin NX | E4B Q4_K_M *(superseded)* | 426 | 524 | 0.81× |
+| Orin NX | 12B Q4_K_M *(superseded)* | 174 | 217 | 0.80× |
 | A5000 | **E4B QAT** | 4,335 | 5,254 | 0.83× |
-| A5000 | 12B | 1,782 | 2,207 | 0.81× |
+| A5000 | **12B QAT** | 2,067 | 2,365 | **0.87×** |
 | A5000 | E2B QAT | 7,222 | 8,785 | 0.82× |
 | A5000 | E4B Q4_K_M *(superseded)* | 3,703 | 4,846 | 0.76× |
+| A5000 | 12B Q4_K_M *(superseded)* | 1,782 | 2,207 | 0.81× |
 
 **Prefill is 0.8× llama.cpp — 0.76–0.82 across six pairs on two devices,
 one consistent number.** The 2026-07 prefill campaign took it from ~0.2× to
@@ -163,11 +171,16 @@ beats it by 28%, block-4 by 44%. MTP also survives vision context intact —
 the image row is measured on a turn containing **only** an image, and the
 claim that speculation stops paying there did not reproduce on either stack.
 
+**12B QAT** (the 1024-wide draft head lands ~51% of prose drafts vs the
+E4B 256-wide head's ~37%, so MTP helps chat *more* as the model grows):
+Orin plain 9.8 → prose **14.5 (1.42×)**, counting **20.4 (2.08×)**;
+A5000 plain 70.7 → prose **101.5 (1.44×)**, counting **143.7 (2.03×)**.
+Byte-identity gated on both.
+
 **A5000, E4B QAT:** plain 134 → prose **168.8 (1.26×)**, counting **282
-(2.10×)**. **12B QAT:** prose 101.5, counting 143.7 with MTP. (The 2-row
-kernel is gated to the integrated-GPU path: on the A5000 it helped E4B but
-regressed 12B, so the discrete path keeps the prior verify kernel —
-per-device verdicts, as ever.)
+(2.10×)**. (The 2-row kernel is gated to the integrated-GPU path: on the
+A5000 it helped E4B but regressed 12B, so the discrete path keeps the
+prior verify kernel — per-device verdicts, as ever.)
 
 The kernel investigation — the ncu attribution and the two levers measured
 and falsified on the way (occupancy forcing, shared-memory staging) — is in
@@ -276,6 +289,15 @@ serve template gets a terse thought from the same weights. Even subtracting
 their thought entirely, our media TTFS still leads — but the lesson
 generalizes: for voice, the prompt template's effect on thought length
 dwarfs every kernel in the stack (see `-sys` in [serving.md](serving.md)).
+
+**2026-07-19 addendum — the QAT voice loop.** E4B QAT + MTP + the voice
+`-sys` prompt on the Orin (`bench/ttft_dictate.py`, client clocks, first
+turn discarded): conversational turn TTFS **0.34 s** (plain decode: 0.44),
+929-token *streamed* dictation TTFS 1.05 s. With the streaming TTS's
+0.10 s first-PCM leg, first audio lands **≈0.44 s** after a short question
+— under the old E2B 0.65 s headline, on the bigger model; with the
+persistent-whisper ASR leg (~0.36 s) the full mic-to-audio loop stays
+under a second.
 
 ## Reconciliation with previously published numbers
 

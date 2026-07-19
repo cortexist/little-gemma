@@ -30,16 +30,16 @@ project targets, and at parity on desktop:
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
 | Jetson Orin NX | E4B QAT q4_0 | **20.7** | 18.7 | **1.11×** |
-| Jetson Orin NX | 12B Q4_K_M | **8.3** | 7.4 | **1.12×** |
+| Jetson Orin NX | 12B QAT q4_0 | **9.8** | 9.05 | **1.08×** |
 | Jetson Orin NX | E2B QAT q4_0 | 34.5 | 37.4 | 0.92× |
-| RTX A5000 | E4B / 12B / E2B | 134 / 58.0 / **213.9** | 136.6 / 62.5 / 209.3 | 0.98× / 0.93× / **1.02×** |
+| RTX A5000 | E4B / 12B / E2B | 134 / 70.7 / **213.9** | 136.6 / 70.7 / 209.3 | 0.98× / **1.00×** / **1.02×** |
 
 **Prefill** (929-token prompts) — **0.8×** llama.cpp, consistently:
 
 | device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B / 12B / E2B | 474 / 174 / 834 | 553 / 217 / 1,020 | 0.80–0.86× |
-| RTX A5000 | E4B / 12B / E2B | 4,335 / 1,782 / 7,222 | 5,254 / 2,207 / 8,785 | 0.81–0.83× |
+| Jetson Orin NX | E4B / 12B / E2B | 474 / 193 / 834 | 553 / 232 / 1,020 | 0.82–0.86× |
+| RTX A5000 | E4B / 12B / E2B | 4,335 / 2,067 / 7,222 | 5,254 / 2,365 / 8,785 | 0.82–0.87× |
 
 The pattern is the project's thesis: decode speed is mostly everything
 *around* the matmul — launch overhead, syncs, norms, the PLE path, how the
@@ -76,9 +76,9 @@ All three implement the same `model.h`; only the compute kernels differ.
 run-cuda-i8 -m gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf -p "The capital of France is"
 ```
 
-The default E4B is unsloth's **QAT q4_0** build (with its matched MTP head,
-`mtp-gemma-4-E4B-it.gguf`) — QAT-trained for q4_0, and faster than Q4_K_M
-on both stacks.
+The default E4B and 12B are unsloth's **QAT q4_0** builds (with their
+matched MTP heads, `mtp-gemma-4-{E4B,12B}-it.gguf`) — QAT-trained for
+q4_0, and faster than Q4_K_M on both stacks.
 
 Serve conversations over a Unix-domain socket (multi-turn KV cache, raw
 token stream out — details in [docs/serving.md](docs/serving.md)):

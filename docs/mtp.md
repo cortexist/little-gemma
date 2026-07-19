@@ -27,11 +27,13 @@ Measured in the **socket server**, steady-state, E4B QAT (2026-07-19; the
 | model | counting | code | image-only turn | prose |
 |-------|---------:|-----:|----------------:|------:|
 | E4B QAT (Orin / A5000) | **2.33×** / 2.10× | **1.91×** / — | **1.52×** / — | **1.40×** / 1.26× |
-| 12B (A5000 / Orin, pre-2-row) | 2.16× / 1.85× | — | — | 1.35× / 1.19× |
+| 12B QAT (Orin / A5000) | 2.08× / 2.03× | — | — | **1.42×** / **1.44×** |
 
 (Orin E4B QAT: 20.7 plain → 29.9 prose, 40.7 code, 48.6 counting, 31.5
 describing an image — every one ahead of `llama-server`'s `draft-mtp` on
-the same model, same day; block-depth sweep and llama pairs in
+the same model, same day; Orin 12B QAT 9.8 → 14.5 prose. The 12B's
+1024-wide head lands ~51% of prose drafts vs E4B's ~37% — MTP helps chat
+more as the model grows. Block-depth sweep and llama pairs in
 [benchmarks.md](benchmarks.md).) Block depth is `-DLG_MTP_N` (default 3):
 prose peaks at 2–3, code at 4, counting at 4–5.
 

@@ -12,14 +12,17 @@ SCR=$LL/.scratch
 OUT=/tmp/settle
 mkdir -p $OUT
 
-E4B=~/gguf/gemma-4-e4b-qat/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   # QAT = the default E4B since 2026-07-19
-B12=$SCR/gemma-4-12b/gemma-4-12b-it-Q4_K_M.gguf
+E4B=~/gguf/gemma-4-e4b-qat/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf   # QAT = the defaults since 2026-07-19
+B12=~/gguf/gemma-4-12b-qat/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf
 E2B=$SCR/gemma-4-e2b/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf
 
 DECODE_Q="Explain in detail how a refrigerator works, covering the compressor, the refrigerant cycle, and why the inside gets cold while the back gets warm."
 
 bench_lg() {  # $1=tag $2=model
   local tag=$1 model=$2 sock=/tmp/lg-bench.sock srv
+  # 12B QAT: the q4_0 repack's device copies race the blob's page cache for
+  # nvmap on the 16GB Orin — drop caches first (harmless for the others).
+  sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
   rm -f $sock
   $LG/build/run-cuda-i8 -m "$model" -s $sock 2>$OUT/lg-$tag.err &
   srv=$!
