@@ -90,6 +90,7 @@ struct gguf_context {
     size_t  data_size;             // its size in bytes (file_size - data_offset)
     void   *map_base;              // mmap base when file-mapped (NULL = heap)
     size_t  map_len;               // mapped length incl. the alignment head
+    int     map_fd;                // kept open for gguf_data_dontneed (-1 = none)
 };
 
 // Returns the on-disk size in bytes of a scalar value type, or 0 for
@@ -103,6 +104,15 @@ const char *gguf_type_name(uint32_t type);
 // never silently pages to disk. Free with free_gguf().
 struct gguf_context *load_gguf(const char *filepath);
 void free_gguf(struct gguf_context *ctx);
+
+// Hand the whole pages inside [p, p+bytes) of the mmap'd data section back
+// to the OS — the process mapping and the page cache both. For weights a
+// backend has copied elsewhere the blob bytes are dead, and on a unified-
+// memory board returning them as the copies are made is what lets model +
+// copies coexist. A later read refaults from the file: this is a memory
+// hint, never a correctness event. No-op for heap-loaded data (Windows) and
+// for ranges outside this context's data section.
+void gguf_data_dontneed(const struct gguf_context *ctx, const void *p, size_t bytes);
 
 // Set an upper bound (bytes) on the tensor-data allocation; load_gguf() errors
 // out if the data section is larger. 0 (the default) means "no explicit cap" —

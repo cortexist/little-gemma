@@ -631,6 +631,14 @@ static const unsigned char *rweight(const struct gguf_tensor *t, int *ts) {
     CUDA_CHECK(cudaMalloc(&dev, bytes));
     CUDA_CHECK(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice));
     free(host);
+    // This tensor's blob bytes are dead now — the device copy is the only
+    // reader. On the per-tensor-upload route (integrated GPU, mapping never
+    // pinned) hand the pages back mid-burst so the next cudaMalloc finds
+    // free DRAM (see gguf_data_dontneed). token_embd and the PLE table
+    // stay: the host dequantizes their rows every token.
+    if (g_dw && strcmp(t->name, "token_embd.weight") != 0
+             && strcmp(t->name, "per_layer_token_embd.weight") != 0)
+        gguf_data_dontneed(g_ctx, t->data, tensor_bytes(t));
     return g_rw[i] = dev;
 }
 

@@ -258,6 +258,7 @@ struct gguf_context *load_gguf(const char *filepath) {
         fclose(f);
         return NULL;
     }
+    ctx->map_fd = -1;              // 0 is a valid fd; calloc's zero is not "none"
 
     if (!read_exact(f, &ctx->header, sizeof(ctx->header))) {
         fprintf(stderr, "Failed to read header.\n");
@@ -339,6 +340,7 @@ struct gguf_context *load_gguf(const char *filepath) {
             ctx->map_base = mp;
             ctx->map_len  = ctx->data_size + (ctx->data_offset - moff);
             ctx->data     = (unsigned char *)mp + (ctx->data_offset - moff);
+            ctx->map_fd   = dup(fileno(f));    // gguf_data_dontneed evicts by fd; -1 on failure is fine
         }
 #endif
         if (!ctx->data) {
@@ -386,6 +388,7 @@ fail:
 void free_gguf(struct gguf_context *ctx) {
     if (!ctx) return;
 #ifndef _WIN32
+    if (ctx->map_fd >= 0) close(ctx->map_fd);
     if (ctx->map_base) munmap(ctx->map_base, ctx->map_len);
     else
 #endif
@@ -399,6 +402,33 @@ void free_gguf(struct gguf_context *ctx) {
         free(ctx->tensors);
     }
     free(ctx);
+}
+
+// Hand back the whole pages inside [p, p+bytes): first this process's
+// mapping (madvise), then the now-unmapped clean pages in the page cache
+// (fadvise skips pages that are still mapped, so the order matters). On the
+// Jetson, CUDA allocations and the page cache share one DRAM pool and nvmap
+// fails an allocation rather than force reclaim — returning each repacked
+// tensor's bytes DURING the repack burst is what lets the 12B QAT load
+// (6.2 GB of device copies racing 6.2 GB of just-read cache). Interior
+// pages only: tensors share pages at their 32-byte-aligned edges, and a
+// dropped page refaults from the file on the next read anyway.
+void gguf_data_dontneed(const struct gguf_context *ctx, const void *p, size_t bytes) {
+#ifndef _WIN32
+    if (!ctx || !ctx->map_base || !bytes) return;
+    uintptr_t lo = (uintptr_t)ctx->data, hi = lo + ctx->data_size;
+    if ((uintptr_t)p < lo || (uintptr_t)p + bytes > hi) return;   // another context's range
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t b = ((uintptr_t)p + pg - 1) / pg * pg;              // first whole page
+    uintptr_t e = ((uintptr_t)p + bytes) / pg * pg;               // end of last whole page
+    if (e <= b) return;
+    madvise((void *)b, e - b, MADV_DONTNEED);
+    if (ctx->map_fd >= 0)
+        posix_fadvise(ctx->map_fd, (off_t)(ctx->data_offset / pg * pg) + (off_t)(b - (uintptr_t)ctx->map_base),
+                      (off_t)(e - b), POSIX_FADV_DONTNEED);
+#else
+    (void)ctx; (void)p; (void)bytes;                              // heap blob on Windows
+#endif
 }
 
 // ---- pretty-printing ------------------------------------------------------

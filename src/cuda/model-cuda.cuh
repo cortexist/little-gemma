@@ -759,7 +759,12 @@ static void ensure_weights(struct model *m) {
         // memory, the difference between fitting and not fitting an 8GB
         // Nano. Upload the residual tensors one by one instead and leave the
         // blob a plain host mapping (embedding dequant and the repack
-        // sources still read it; the OS may evict it under pressure).
+        // sources still read it). rweight actively hands each repacked
+        // tensor's pages back as it copies them (gguf_data_dontneed) —
+        // waiting for the OS to evict under pressure was measured NOT to
+        // work on Jetson: nvmap fails the allocation instead of reclaiming,
+        // and the 12B QAT (6.2 GB of copies vs 6.2 GB of just-read cache)
+        // OOM'd at the load boundary.
         size_t inplace = 0;
         for (uint64_t i = 0; i < m->ctx->header.num_tensors; i++) {
             const struct gguf_tensor *t = &m->ctx->tensors[i];

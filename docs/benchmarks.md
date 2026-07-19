@@ -22,9 +22,10 @@ mutually inconsistent figures is at the bottom).
   (`gemma-4-{E4B,12B}-it-qat-UD-Q4_K_XL`, unsloth — **the defaults since
   2026-07-19**, with their matched MTP heads `mtp-gemma-4-{E4B,12B}-it.gguf`)
   and E2B QAT q4_0 (`gemma-4-E2B-it-qat-UD-Q4_K_XL`). The superseded
-  Q4_K_M rows are kept for reference. The 12B QAT load on the 16GB Orin
-  needs a page-cache drop first (the q4_0 repack's device copies race the
-  blob's page cache for nvmap; the settle harness does it).
+  Q4_K_M rows are kept for reference. (The 12B QAT q4_0 repack briefly wants
+  model + copies of DRAM on the 16GB Orin; the loader returns each repacked
+  tensor's blob pages as it copies them — `gguf_data_dontneed` — so it
+  loads under any cache state, measured warm-cache in 5 s.)
 
 ## Methodology
 
