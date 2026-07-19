@@ -1274,3 +1274,51 @@ saturate at 8 for T >= 8192.
   correctly localized to "E2B decode depth scaling" a day earlier from
   benchmarks alone. Only their code said *why*, and the why was a constant we
   already had.
+
+## Why we win Orin decode: the matvec fills the bus, llama's doesn't (2026-07-18)
+
+Ran the decode question all the way down with ncu (E4B, Orin, pinned), after a
+seminar-answer review flagged that "we're faster because we're leaner on
+overhead" was an unmeasured hand-wave. It was also wrong. The measured chain:
+
+- Decode is ~90% matvec for BOTH stacks (ours matmul_i8r 89.5%; llama's
+  mul_mat_vec_q ~90%). Attention is tiny either way (post the SPLIT_KEYS fix).
+- Our decode is ~100% GPU-busy (nsys: GPU-active 14.5s ≈ wall 14.32s), one
+  cudaGraphLaunch/token — no host idle. And llama's decode is graph-INDEPENDENT
+  (under nsys its CUDA graph OOM'd, it fell back to no-graph, and still hit
+  14.13 vs its normal 14.1) — so llama isn't launch/host-overhead bound either.
+  The earlier tegrastats "llama 41% GPU" was load+prefill contamination, retired.
+- So the 27% is in the matvec GPU work, and ncu on the biggest matvec (~44% of
+  decode) names it:
+
+  |            | duration | memory throughput | SM throughput | bound by |
+  |------------|---------:|------------------:|--------------:|----------|
+  | ours       |   690 us |         **84.5%** |         27.3% | memory   |
+  | llama.cpp  |   765 us |         **45.5%** |         59.7% | compute  |
+
+  Across all matvecs: ours 67-84% mem, llama 35-48%. Same bytes, same 102 GB/s
+  bus; we saturate it, llama leaves it half-idle.
+
+THE MECHANISM: llama's mul_mat_vec_q is COMPUTE-bound at 8 SMs (SM 60% > mem
+45%) — it can't issue memory requests fast enough to fill the bus because it
+spends too many instructions per weight (dequant + narrow loads). Ours is
+MEMORY-bound (mem 84% > SM 27%) — the wide int8 loads (one aligned 16-byte load
+per dp4a group, the "wide weight loads" win) mean 8 SMs need far fewer
+instructions per weight and CAN keep the bus full. Decode is bandwidth-bound, so
+filling the bus is the whole game.
+
+WHY ORIN-ONLY (A5000 parity 0.99x): the 64-SM A5000 gives llama 8x the
+instruction-issue capacity, enough to both dequant AND saturate its bus, so both
+kernels fill it and we tie. Instruction efficiency only binds when SMs are
+scarce. Same logic explains the model-size trend (E4B 1.27x -> 12B 1.12x): bigger
+matmuls put more rows/SM, so even llama's kernel edges toward saturation.
+
+The kernel edge is q4_K-specific and INVERTS on E2B q4_0 (0.92x): there llama's
+matvec is the more bus-efficient one (~95% vs our ~88%). The one decode path
+where their kernel fills the Orin bus better than ours.
+
+METHODOLOGY: never nsys/ncu llama's full decode on the 16GB Orin (the graph
+OOMs); ncu single-kernel minimal-section is fine (E4B). tegrastats over a run
+that includes model-load is useless for steady-state GPU% (retired a wrong
+"llama idles" hypothesis). The whole "leaner overhead" story was falsified by
+measurement — it's the matvec kernel's bus utilization at 8 SMs.

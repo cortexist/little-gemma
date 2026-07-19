@@ -8,66 +8,62 @@ and the upstream comparison in [upstream-llama-study.md](upstream-llama-study.md
 
 ## Q1 — What makes little-gemma up to 27% faster at decoding on the Orin? If there are many small tweaks, what's the most remarkable one?
 
-**The framing first, because it's the actual answer:** decode is
-*memory-bandwidth-bound*. The weights cross the bus once per token and that read
-dominates — llama's E2B decode on our board runs at **95% of the 102 GB/s
-ceiling**. When you are that close to the physical wall, no one can win big on
-the matvec itself. So the entire contest is **everything that happens per token
-that isn't the weight read** — and on a small model spread over just 8 SMs, that
-"everything else" is a large slice of wall-clock. That is the remarkable
-inversion: people expect the matmul to be the whole story, and for decode on the
-edge it is the part nobody can improve.
+**The framing:** decode is *memory-bandwidth-bound* — each token reads the
+model's weights once and that read dominates. But here is the part that isn't
+obvious: **on 8 SMs, hitting the bandwidth wall is not automatic.** Whether a
+batch-1 matvec kernel actually *saturates* the bus depends on how many
+instructions it spends per weight — and that is exactly where we beat llama.
 
-We win that slice by doing it lean: the whole decode forward captured as one CUDA
-graph (few, simple nodes), GPU argmax so we never download the 262k-wide logit
-vector to pick the max — 4 bytes come back instead — norms fused with the
-residual add, an f16 KV cache, and split-K attention.
+**The measurement, drilled to the bottom** (`ncu`, same E4B decode, same board,
+the single biggest matvec ≈ 44% of decode): our kernel runs at **84.5% of peak
+memory bandwidth**; llama's at **45.5%**. Same bytes, same 102 GB/s bus — we
+reach it, they leave it half-idle. Across all the matvecs, ours sit at
+**67–84%**, llama's at **35–48%**. That gap *is* the 27%.
 
-**The most remarkable single lever** — and the freshest, measured this week on
-that exact board — is the split-K decode attention, "the split that never
-split." The kernel splits the KV walk across blocks to keep the schedulers fed,
-but a constant capped the *keys per block* at 1024, so below 1024 tokens of
-context it collapsed to one block per head and each block's walk grew linearly
-with depth. One number, `SPLIT_KEYS 1024 -> 64`, and E4B went 1.17x -> 1.27x,
-with the depth droop going from -14% to -0.6%. It is the cleanest illustration
-of the whole principle: decode speed is about *keeping the GPU busy between
-weight reads*, not the reads themselves.
+**Why the bus sits half-idle for llama, and not for us** — ncu names it by which
+resource each kernel runs out of first. On llama's kernel, SM (compute)
+throughput (**60%**) is *higher* than its memory throughput (45%): it is
+**compute-bound** — with only 8 SMs it spends its cycles dequantizing and issuing
+narrow loads and can't fire memory requests fast enough to fill the bus. On ours,
+memory (**84%**) sits far above SM (**27%**): we're **memory-bound**, the SMs
+mostly idle *waiting on the bus* — which is precisely what you want when the bus
+is the bottleneck. The cause is our **wide int8 weight loads** — one aligned
+16-byte load per dp4a group instead of a fistful of byte loads — so 8 SMs need
+far fewer instructions per weight and *can* keep the bus full. llama's
+`mul_mat_vec_q` needs more, and at 8 SMs it runs out of SM throughput first.
 
-**But then — if we now split keys exactly like llama, why are we *faster*
-rather than equal?** This is the crux, and the answer is that the split-K fix
-is *not* the source of the 1.27x — it only *unmasked* it. Two facts pin this
-down. First, **we were already 1.17x before the fix, with strictly worse
-attention** (the drooping split): if attention were where our lead came from,
-we couldn't have led while our attention was the broken part. The fix didn't
-*create* a lead; it removed a self-inflicted drag that was *hiding* one. Second,
-if decode were purely the weight read, both stacks would simply tie — same bytes,
-same bus. The 1.27x exists *because decode isn't purely bandwidth-bound*: a real
-fraction of each token is per-token *overhead* — kernel launches, sync
-round-trips, the norms, rope, the PLE path, picking the argmax — and that
-fraction is large on a small model spread over just 8 SMs. So splitting keys the
-same way made our *attention* a wash with llama's; the lead itself is the
-**everything-around-the-matmul** being leaner in a purpose-built 6,100-line
-runner (the whole forward as one captured graph, GPU argmax instead of a
-262k-logit download + host scan + sync, fused norm+residual, a device-resident
-position that keeps the graph static). The split-K fix just stopped our own
-attention from eating that lead back.
+![Decode matvec memory-bus utilization on the Orin (8 SMs): our matmul_i8r hits
+84.5% of peak bandwidth and is memory-bound (SM 27%); llama's mul_mat_vec_q hits
+only 45.5% and is compute-bound (SM 60%) — it runs out of instruction throughput
+before it fills the bus. Wide int8 loads are why.](fig-decode-membus.svg)
 
-The clinching evidence is the model-size trend: **E4B 1.27x, 12B 1.12x, E2B a
-loss.** Overhead is a roughly fixed cost per token, so the *smaller* the model
-the *bigger* our lead — exactly what you'd see if the lead were overhead and not
-the matmul. On the 12B the weight read dominates and dilutes it; on E2B q4_0 it
-inverts (below).
+**Why it's Orin-specific** (we're at *parity* on the A5000, 0.99×): the desktop
+card has **64 SMs** — 8× the instruction-issue capacity — so llama has plenty to
+both dequantize *and* fill its bus; both kernels saturate and we tie. Instruction
+efficiency only becomes the binding constraint when SMs are scarce. It also
+explains the model-size trend — **E4B 1.27×, 12B 1.12×** — the 12B's bigger
+matmuls put more rows on each SM, so even llama's kernel edges closer to
+saturation and our lead narrows.
 
-**The honest caveat:** this is model-dependent, and we *lose* on E2B (0.92x).
-E2B is q4_0; on that path llama's matvec genuinely hits 95% of bandwidth where
-ours hits 88%. So "the matmul is a wash" is true for the q4_K models (E4B, 12B)
-where we then win on overhead — but on q4_0 their matvec is simply more
-bandwidth-efficient, and that is the one decode gap we haven't closed.
+**The most remarkable *recent* lever** is a separate story, and it's what took us
+from 1.17× to 1.27× this week. Our decode attention had a *self-inflicted* droop:
+the split-K kernel capped *keys per block* at 1024, so below 1024 tokens of
+context it collapsed to one block per head and each block's KV walk grew linearly
+with depth (−14% shallow→deep). That drag had been *masking* part of the matvec
+lead — we were already 1.17× *with* the broken attention. One constant,
+`SPLIT_KEYS 1024 → 64`, made attention depth-flat (−0.6%, matching llama), and
+the full matvec lead showed through: 1.27×. So the split-K fix did not *create*
+the lead — it stopped our own attention from eating it back.
 
 ![Decode attention dataflow: the old code capped the block count and grew the
 per-block KV walk with depth (−14% droop); the fix (and llama.cpp) cap the walk
 and grow the block count, filling the device — flat with
 depth.](fig-decode-attention.svg)
+
+**The honest caveat:** the kernel edge is q4_K-specific, and it *inverts* on E2B
+(0.92×). E2B QAT is q4_0, and there llama's matvec is the more bus-efficient one
+(it reaches ~95% where ours reaches ~88%) — the one decode path where their
+kernel saturates the Orin better than ours.
 
 ## Q2 — What makes little-gemma 20% slower at prefill? If there are many gaps, what's the biggest one, and why can't we do exactly what llama.cpp does to reach parity?
 

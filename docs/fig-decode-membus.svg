@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ma" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="6" y="6" width="988" height="588" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
+
+  <text x="36" y="50" font-size="25" font-weight="700" fill="#0f172a">Decode matvec — who actually fills the memory bus (Orin, 8 SMs)</text>
+  <text x="36" y="76" font-size="13.5" fill="#64748b">Decode reads the weights once per token — bandwidth-bound. But hitting the bus ceiling isn't automatic at 8 SMs: it depends on instructions-per-weight.</text>
+  <text x="36" y="95" font-size="13.5" fill="#64748b">ncu, same E4B decode, same board, the biggest matvec (~44% of decode). Same bytes, same 102 GB/s wall — only one kernel reaches it.</text>
+
+  <!-- ===== two gauges ===== -->
+  <!-- OURS -->
+  <text x="150" y="140" text-anchor="middle" font-size="17" font-weight="700" fill="#2563eb">little-gemma</text>
+  <text x="150" y="160" text-anchor="middle" font-size="12.5" fill="#64748b">matmul_i8r · 690 µs</text>
+
+  <text x="300" y="196" text-anchor="end" font-size="13" fill="#334155">memory bus</text>
+  <rect x="316" y="182" width="560" height="26" rx="5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <rect x="316" y="182" width="473" height="26" rx="5" fill="#2563eb"/>
+  <text x="330" y="200" font-size="13" font-weight="700" fill="#ffffff">84.5%</text>
+  <text x="884" y="200" font-size="12" fill="#16a34a" font-weight="700">← saturated</text>
+
+  <text x="300" y="234" text-anchor="end" font-size="13" fill="#334155">SM (compute)</text>
+  <rect x="316" y="220" width="560" height="26" rx="5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <rect x="316" y="220" width="153" height="26" rx="5" fill="#bfdbfe"/>
+  <text x="330" y="238" font-size="13" font-weight="700" fill="#1e40af">27.3%</text>
+  <text x="486" y="238" font-size="12" fill="#64748b">SMs idle, waiting on the bus &#8212; exactly right when the bus is the limit</text>
+
+  <text x="36" y="270" font-size="13" font-weight="700" fill="#2563eb">MEMORY-bound</text>
+  <text x="150" y="270" font-size="12.5" fill="#475569">— the bus is the bottleneck, and we hold it near full.</text>
+
+  <line x1="36" y1="292" x2="964" y2="292" stroke="#e2e8f0" stroke-width="1.5"/>
+
+  <!-- LLAMA -->
+  <text x="150" y="330" text-anchor="middle" font-size="17" font-weight="700" fill="#ea580c">llama.cpp</text>
+  <text x="150" y="350" text-anchor="middle" font-size="12.5" fill="#64748b">mul_mat_vec_q · 765 µs</text>
+
+  <text x="300" y="386" text-anchor="end" font-size="13" fill="#334155">memory bus</text>
+  <rect x="316" y="372" width="560" height="26" rx="5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <rect x="316" y="372" width="255" height="26" rx="5" fill="#ea580c"/>
+  <text x="330" y="390" font-size="13" font-weight="700" fill="#ffffff">45.5%</text>
+  <text x="585" y="390" font-size="12" fill="#dc2626" font-weight="700">&#189; the bus sits idle</text>
+
+  <text x="300" y="424" text-anchor="end" font-size="13" fill="#334155">SM (compute)</text>
+  <rect x="316" y="410" width="560" height="26" rx="5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <rect x="316" y="410" width="334" height="26" rx="5" fill="#fed7aa"/>
+  <text x="330" y="428" font-size="13" font-weight="700" fill="#9a3412">59.7%</text>
+  <text x="666" y="428" font-size="12" fill="#dc2626">SM &gt; memory: out of compute before the bus fills</text>
+
+  <text x="36" y="460" font-size="13" font-weight="700" fill="#ea580c">COMPUTE-bound</text>
+  <text x="164" y="460" font-size="12.5" fill="#475569">— at 8 SMs it can't issue loads fast enough to reach the bus ceiling.</text>
+
+  <!-- ===== the why + takeaways ===== -->
+  <rect x="36" y="482" width="928" height="52" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="52" y="506" font-size="13" fill="#334155"><tspan font-weight="700">Why:</tspan> our wide int8 loads pull each dp4a group's weights in ONE aligned 16-byte load, not a fistful of byte loads &#8212; so 8 SMs spend far</text>
+  <text x="52" y="525" font-size="13" fill="#334155">fewer instructions per weight and <tspan font-style="italic">can</tspan> keep the bus full. llama's mul_mat_vec_q needs more, and at 8 SMs it runs out of SM throughput first.</text>
+
+  <text x="36" y="560" font-size="13" fill="#334155"><tspan font-weight="700">Why Orin-only:</tspan> the 64-SM A5000 has 8&#215; the issue capacity &#8212; llama fills its bus there too, and we tie (0.99&#215;). Scarce SMs make instruction efficiency the race.</text>
+  <text x="36" y="581" font-size="12.5" fill="#64748b">Same bytes, same bandwidth wall &#8212; we reach it (84%), they don't (45%). That is the 27%. (Inverts on E2B q4_0, where llama's matvec is the leaner one.)</text>
+</svg>
