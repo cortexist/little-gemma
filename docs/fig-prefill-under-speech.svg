@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" font-family="Helvetica, Arial, sans-serif">
+  <!-- Figure 2: prefill under speech. 12B, Orin NX, 929-token spoken instruction.
+       Anchor: x=240 is "last word / turn close" (t=0); 53 px per second after it.
+       The 30 s speech window left of the anchor is compressed (break marks). -->
+  <rect width="760" height="360" fill="#ffffff"/>
+
+  <!-- ===== panel (a): deferred ===== -->
+  <text x="40" y="34" font-size="13" font-weight="bold" fill="#1f2328">(a) deferred — the transcript arrives when the turn closes</text>
+
+  <text x="34" y="63" font-size="11" fill="#555b61" text-anchor="end">mic</text>
+  <rect x="40" y="48" width="200" height="22" fill="#eceef0" stroke="#c9cdd2"/>
+  <text x="140" y="63" font-size="11" fill="#555b61" text-anchor="middle">user speaks — ~30 s, 929 tokens</text>
+  <line x1="132" y1="44" x2="124" y2="74" stroke="#ffffff" stroke-width="6"/>
+  <line x1="130" y1="46" x2="123" y2="72" stroke="#9aa0a6" stroke-width="1.5"/>
+  <line x1="137" y1="46" x2="130" y2="72" stroke="#9aa0a6" stroke-width="1.5"/>
+
+  <text x="34" y="99" font-size="11" fill="#555b61" text-anchor="end">GPU</text>
+  <rect x="240" y="84" width="270.3" height="22" fill="#d8e2f4" stroke="#3e6fbf"/>
+  <text x="375" y="99" font-size="11" fill="#1f2328" text-anchor="middle">prefill 929 tokens — 5.10 s</text>
+  <rect x="510.3" y="84" width="55.7" height="22" fill="url(#hatch)" stroke="#5a5f66"/>
+  <text x="538" y="99" font-size="11" fill="#1f2328" text-anchor="middle">decode</text>
+  <path d="M 510.3 84 l -5 -8 l 10 0 z" fill="#1f2328"/>
+  <text x="510" y="80" font-size="11" fill="#1f2328" text-anchor="end">first token · 5.10 s</text>
+  <path d="M 566.0 84 l -5 -8 l 10 0 z" fill="#1f2328"/>
+  <text x="571" y="80" font-size="11" font-weight="bold" fill="#1f2328" text-anchor="start">first sentence · 6.15 s</text>
+
+  <!-- ===== panel (b): streamed ===== -->
+  <text x="40" y="172" font-size="13" font-weight="bold" fill="#1f2328">(b) streamed — committed words prefill while the user is still speaking</text>
+
+  <text x="34" y="201" font-size="11" fill="#555b61" text-anchor="end">mic</text>
+  <rect x="40" y="186" width="200" height="22" fill="#eceef0" stroke="#c9cdd2"/>
+  <g stroke="#9aa0a6" stroke-width="1">
+    <line x1="56" y1="203" x2="56" y2="208"/><line x1="72" y1="203" x2="72" y2="208"/>
+    <line x1="88" y1="203" x2="88" y2="208"/><line x1="104" y1="203" x2="104" y2="208"/>
+    <line x1="152" y1="203" x2="152" y2="208"/><line x1="168" y1="203" x2="168" y2="208"/>
+    <line x1="184" y1="203" x2="184" y2="208"/><line x1="200" y1="203" x2="200" y2="208"/>
+    <line x1="216" y1="203" x2="216" y2="208"/><line x1="232" y1="203" x2="232" y2="208"/>
+  </g>
+  <text x="140" y="199" font-size="11" fill="#555b61" text-anchor="middle">words stream as text frames, 30 w/s</text>
+  <line x1="132" y1="182" x2="124" y2="212" stroke="#ffffff" stroke-width="6"/>
+  <line x1="130" y1="184" x2="123" y2="210" stroke="#9aa0a6" stroke-width="1.5"/>
+  <line x1="137" y1="184" x2="130" y2="210" stroke="#9aa0a6" stroke-width="1.5"/>
+
+  <text x="34" y="237" font-size="11" fill="#555b61" text-anchor="end">GPU</text>
+  <g fill="#d8e2f4" stroke="#3e6fbf">
+    <rect x="58"  y="222" width="9" height="22"/><rect x="76"  y="222" width="9" height="22"/>
+    <rect x="94"  y="222" width="9" height="22"/><rect x="112" y="222" width="9" height="22"/>
+    <rect x="154" y="222" width="9" height="22"/><rect x="172" y="222" width="9" height="22"/>
+    <rect x="190" y="222" width="9" height="22"/><rect x="208" y="222" width="9" height="22"/>
+    <rect x="226" y="222" width="9" height="22"/>
+  </g>
+  <rect x="240" y="222" width="28.1" height="22" fill="#d8e2f4" stroke="#3e6fbf"/>
+  <rect x="268.1" y="222" width="55.1" height="22" fill="url(#hatch)" stroke="#5a5f66"/>
+  <text x="296" y="237" font-size="11" fill="#1f2328" text-anchor="middle">decode</text>
+  <path d="M 268.1 222 l -5 -8 l 10 0 z" fill="#1f2328"/>
+  <text x="263" y="218" font-size="11" fill="#1f2328" text-anchor="end">first token · 0.53 s</text>
+  <path d="M 323.2 222 l -5 -8 l 10 0 z" fill="#1f2328"/>
+  <text x="329" y="218" font-size="11" font-weight="bold" fill="#1f2328" text-anchor="start">first sentence · 1.57 s</text>
+  <text x="140" y="262" font-size="11" fill="#3e6fbf" text-anchor="middle">prefill chunks ride under the speech —</text>
+  <text x="140" y="276" font-size="11" fill="#3e6fbf" text-anchor="middle">the turn close leaves only the holdback span</text>
+
+  <!-- ===== shared axis ===== -->
+  <line x1="240" y1="40" x2="240" y2="300" stroke="#1f2328" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="240" y1="300" x2="717" y2="300" stroke="#555b61" stroke-width="1"/>
+  <g stroke="#555b61" stroke-width="1">
+    <line x1="240" y1="300" x2="240" y2="305"/><line x1="346" y1="300" x2="346" y2="305"/>
+    <line x1="452" y1="300" x2="452" y2="305"/><line x1="558" y1="300" x2="558" y2="305"/>
+    <line x1="664" y1="300" x2="664" y2="305"/>
+  </g>
+  <g font-size="10" fill="#555b61" text-anchor="middle">
+    <text x="240" y="318">0</text><text x="346" y="318">2</text><text x="452" y="318">4</text>
+    <text x="558" y="318">6</text><text x="664" y="318">8 s</text>
+  </g>
+  <text x="236" y="318" font-size="10" fill="#1f2328" text-anchor="end">last word / turn close</text>
+
+  <text x="380" y="345" font-size="12" fill="#1f2328" text-anchor="middle">12B QAT on Orin NX — TTFT 5.10 → 0.53 s, first sentence 6.15 → 1.57 s; replies byte-identical in both modes.</text>
+
+  <defs>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="#ffffff"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#8a9099" stroke-width="1.5"/>
+    </pattern>
+  </defs>
+</svg>

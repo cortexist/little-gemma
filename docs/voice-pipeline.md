@@ -17,7 +17,7 @@ chunk) → **aplay**.
 | voicecat, clausecat | sibling repo `little-gemma-tools` | voicecat needs `ffmpeg` for mic capture |
 | whisper.cpp | upstream, CUDA build | model `ggml-base.en.bin` |
 | piper | our fork `cortexist/piper1-gpl`, branch `vits-streaming` | `pip install -e .` |
-| LLM weights | `gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` — Unsloth's GGUF of Google's QAT release [TODO: pin HF link] | 12B/E4B: `Q4_K_M` ggufs |
+| LLM weights | `gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` — Unsloth's GGUF of Google's QAT release [TODO: pin HF link] | 12B/E4B: the matching QAT ggufs (`gemma-4-{12B,E4B}-it-qat-UD-Q4_K_XL`) — the defaults since 2026-07-19 |
 | MTP draft head | `mtp-gemma-4-E2B-it.gguf` [TODO: document conversion provenance] | optional but measured with it |
 | TTS voice | any piper voice, e.g. `en_US-kristin-medium` (HF `rhasspy/piper-voices`) | our Orin numbers used a private finetune of the same size |
 

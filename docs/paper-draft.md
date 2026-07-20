@@ -28,7 +28,7 @@ near 20 W. Four techniques carry the result, none of which modify the
 models: (1) *prefill under speech* — streaming ASR commits prefill into the
 open turn while the user is still speaking, backed by a proof that
 space-boundary splits are exact for SentencePiece, cutting post-speech TTFT
-from 5.37 s to 0.55 s on the 12B; (2) *the LLM as clause splitter* — a
+from 5.1 s to 0.53 s on the 12B; (2) *the LLM as clause splitter* — a
 system prompt that makes the model create TTS flush points, motivated by
 the measured finding that the baseline model emits 21-word sentences with
 zero commas, leaving a clause-flushing TTS layer nothing to flush; (3) *a
@@ -37,8 +37,9 @@ piper's monolithic VITS at the latent boundary so the HiFi-GAN decoder
 (finite receptive field) runs in overlapped chunks, making first PCM O(1)
 in clause length (0.10 s vs 0.27–0.49 s), sample-exact against the
 monolithic decode; (4) *multi-token-prediction speculative decoding*
-characterized honestly as content-dependent (1.1–2.1×) and as a battery
-feature (2.29 vs 2.85 J/token). A cross-silicon
+characterized honestly as content-dependent (1.4–2.3×, ahead of
+llama-server's own speculative path at every content type measured) and
+as a battery feature (2.29 vs 2.85 J/token). A cross-silicon
 study against Moshi on an RTX A5000 finds the remaining gap to
 speech-native models is structural (one decoded clause + one vocoder call,
 ~0.2 s) — and that the datacenter GPU buys only 1.7× over the 20 W board,
@@ -84,8 +85,8 @@ Contributions:
    by streaming-ASR commit semantics, with a correctness lemma — SentencePiece
    pieces never cross a space boundary, so word-boundary splits reproduce the
    one-shot tokenization exactly (verified: equal token ids, byte-identical
-   replies). A 929-token spoken instruction costs 0.55 s TTFT after the last
-   word instead of 5.37 s (12B; 0.10 s on the 2B).
+   replies). A 929-token spoken instruction costs 0.53 s TTFT after the last
+   word instead of 5.1 s (12B; 0.10 s on the 2B).
 2. **The LLM as the clause splitter** (§4.3): the split policy for streaming
    TTS must live in the model, because the measured baseline emits 21-word,
    comma-free sentences — there is nothing downstream to flush. A system
@@ -109,8 +110,9 @@ Contributions:
    intelligence tiers from one runner (12B / E4B / E2B); 4.2 GB unreclaimable
    for ears+brain+mouth (8 GB-board feasible, with the measurement
    methodology that makes that number honest on Jetson); a decode rate that
-   *beats* llama.cpp on the same board (1.17–1.26×) from ~6,000 lines of
-   C/CUDA.
+   *beats* llama.cpp on the same board (1.08–1.11× plain, and with the
+   family's MTP head engaged, ahead of llama-server's own speculative
+   decoding at every content type measured) from ~6,000 lines of C/CUDA.
 6. **A cross-silicon study** (§5.8) against Moshi on its own class of
    hardware, locating the cascade's structural floor (one clause of decode +
    one VITS call) and showing the conversational regime is floor-bound: a
@@ -159,10 +161,11 @@ open turn), speculative decoding tuned for short structured replies, and a
 server that streams the raw token channel for downstream clause flushing.
 little-gemma is not a llama.cpp competitor; it is a demonstration that a
 small, single-family runner can occupy a design point the general runtime
-does not: on the same Orin, matching ~0.8× of llama.cpp's prefill while
-*beating* it 1.17–1.26× in decode, and — the relevant number for this paper
-— reaching first-sentence 18–48× earlier on multimodal turns (§5.2, thought
-suppression and encode-off-critical-path).
+does not: on the same Orin, matching 0.82–0.86× of llama.cpp's prefill
+while *beating* it in decode (1.08–1.11× plain; ahead of llama-server's
+own speculative decoding once each side's MTP head is engaged), and — the
+relevant number for this paper — reaching first-sentence 18–48× earlier on
+multimodal turns (§5.2, thought suppression and encode-off-critical-path).
 
 **Streaming ASR.** whisper_streaming / LocalAgreement-2 [13]
 provides the commit semantics our prefill rides on; the ASR side is
@@ -276,15 +279,15 @@ kept unprefilled to absorb ASR revisions of the most recent words; MSG_PEEK
 lets the server prefill right up to the pending frame without consuming it.)
 
 ![Figure 2 — prefill under speech: deferred vs streamed delivery of a
-929-token spoken instruction (12B, Orin NX)](fig-prefill-under-speech.svg)
+929-token spoken instruction (12B, Orin NX)](fig-prefill-under-speech.png)
 
-*Figure 2: In deferred delivery (a) the 5.37 s prefill starts only when the
+*Figure 2: In deferred delivery (a) the 5.10 s prefill starts only when the
 turn closes; streamed (b), committed words prefill during the speech itself
-and the turn close leaves only the holdback span — TTFT 5.37 → 0.55 s with
-byte-identical replies.*
+and the turn close leaves only the holdback span — TTFT 5.10 → 0.53 s with
+byte-identical replies (12B QAT).*
 
 Measured on the Orin (TTFT after last word, deferred → paced): 12B
-**5.37 → 0.55 s**, E4B **2.23 → 0.26 s**, E2B **1.15 → 0.10 s**. The
+**5.10 → 0.53 s**, E4B **2.04 → 0.16 s**, E2B **1.15 → 0.10 s**. The
 mechanism generalizes beyond dictation: camera and video frames prefill on
 arrival the same way (media spans, 3.0× video TTFT), which is what makes
 the same pipeline camera-capable — the flexibility argument against
@@ -361,15 +364,28 @@ models: their codecs stream by construction; ours now does too.
 Gemma 4's first-party MTP head drafts the next N tokens; greedy
 verification makes output byte-identical to plain decoding *by
 construction* — only tokens/s and acceptance move. What it is worth is
-sharply content-dependent (block-3, serve mode, steady-state): structured
-output ~2× (12B A5000 2.16×, Orin 1.85×, 100% acceptance), free prose
-1.10–1.35× (the 12B's 1024-wide head lands ~49% of prose drafts; E4B's
-256-wide head ~30%). We report the *distribution*, not a flat multiplier —
-flat claims in the spec-decoding literature do not survive contact with
-prose. On the battery angle: MTP cuts energy per token from 2.85 to 2.29
-J/token on the Orin (the GPU is bandwidth-bound; fewer full passes per
-token is less DRAM traffic) — for a robot, spec decoding is a battery
-feature before it is a latency feature.
+content-dependent (block-3, serve mode, steady-state, QAT builds):
+structured output 2.0–2.3× (Orin E4B 20.7 → 48.6 tok/s at ~99%
+acceptance), code 1.9×, image description 1.5× (measured on image-only
+turns — speculation survives vision context intact), free prose 1.40–1.44×
+(the 12B's 1024-wide head lands ~51% of prose drafts; E4B's 256-wide head
+~37% — MTP helps chat *more* as the model grows). We report the
+*distribution*, not a flat multiplier — flat claims in the spec-decoding
+literature do not survive contact with prose.
+
+Getting prose past ~1.1× took a kernel observation: the verify batch
+(B = 2–5) is its own regime — too narrow for tensor-core prefill tiles,
+priced per-column on the decode matvec — and a verify kernel that shares
+each column's activation registers across two output rows drops B=2
+verify to ~1.01× the cost of a decode step (details in the repository
+journals [18]). With it, the same board and models out-generate
+`llama-server`'s own `draft-mtp` speculative path at every content type
+measured, same day, same GGUFs (prose 29.9 vs 24.5 tok/s; code 40.7 vs
+34.1; image description 31.5 vs 28.8). On the battery angle: MTP cuts
+energy per token from 2.85 to 2.29 J/token on the Orin (the GPU is
+bandwidth-bound; fewer full passes per token is less DRAM traffic;
+measured pre-kernel — the cheaper verify only widens it) — for a robot,
+spec decoding is a battery feature before it is a latency feature.
 
 ### 4.6 The substrate, briefly
 
@@ -382,9 +398,11 @@ mmap'd and unpinned where the quantization is repacked anyway. Every
 optimization is gated byte-identical against a f32 reference and, for the
 speculative path, by acceptance-rate tripwires (which caught three real
 bugs). Full engineering logs, including the falsified dead ends, are in the
-repository journals [18]. The result on the Orin: ~0.8× of
-llama.cpp's prefill throughput and 1.17–1.26× its decode, from a codebase a
-single reviewer can actually read (~6,000 lines).
+repository journals [18]. The result on the Orin: 0.82–0.86× of
+llama.cpp's prefill throughput and 1.08–1.11× its decode on the QAT
+defaults (1.17–1.27× on the earlier Q4_K_M builds), with MTP-on generation
+ahead of llama-server's own speculative path — from a codebase a single
+reviewer can actually read (~6,000 lines).
 
 ## 5. Evaluation
 
@@ -392,40 +410,53 @@ single reviewer can actually read (~6,000 lines).
 
 Orin NX 16GB, JetPack 6.2.1, pinned clocks for benchmarks (jetson_clocks;
 production ships DVFS — a reboot resets the pin, and every number here was
-re-verified against that trap), models: Gemma 4 12B-it Q4_K_M, E4B-it
-Q4_K_M, E2B-it QAT q4_0 (Google's quantization-aware release), each with
-its MTP head; whisper.cpp CUDA base.en; piper en_US voices. Cross-silicon:
-RTX A5000 (Windows) + i7-8086K. All measurements are client-side per §4.1.
+re-verified against that trap), models: Gemma 4 QAT q4_0 releases across
+the family — 12B-it, E4B-it, E2B-it (Google's quantization-aware
+checkpoints, unsloth GGUFs), each with its matched MTP head; whisper.cpp
+CUDA base.en; piper en_US voices. Cross-silicon: RTX A5000 (Windows) +
+i7-8086K. All measurements are client-side per §4.1. The E4B and 12B rows
+in §5.2, §5.3 and §5.5 were re-measured 2026-07-19 on the QAT builds
+(which sped up *both* stacks — llama.cpp's q4_0 decode gains more than
+ours); the multimodal comparison in §5.2 and the cross-silicon study
+(§5.8) predate the switch (Q4_K_M builds) and are labeled — the switch
+only improves our side of those.
 
 ### 5.2 The substrate vs llama.cpp
 
-Serve-mode prefill, tok/s (929-token turn, warm):
-
-| device | model | little-gemma | vs llama.cpp |
-|---|---|---:|---|
-| Orin | 12B | ~173 | 0.80× |
-| Orin | E4B | ~417 | 0.82× |
-| Orin | E2B QAT | ~815 | **0.80×** |
-
-Plain decode, tok/s (256 tokens, warm; llama-bench reference):
+Serve-mode prefill, tok/s (929-token turns, warm, first discarded;
+llama.cpp = llama-bench pp929, best of fa 0/1, same-day pairs):
 
 | device | model | little-gemma | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Orin | E4B | 16.80 | 13.36 | **1.26×** |
-| Orin | 12B | 8.27 | 7.04 | **1.17×** |
-| Orin | E2B QAT | 36.4 | 37.9 | 0.96× |
+| Orin | 12B QAT | 193 | 232 | 0.84× |
+| Orin | E4B QAT | 474 | 553 | 0.86× |
+| Orin | E2B QAT | 834 | 1,020 | 0.82× |
 
-(The E2B QAT row is its own same-session pinned-clocks pair — serve-mode
-turns with 78-token replies against llama-bench tg32, both sides stable to
-under 1% across repeats — rather than the 256-token protocol above.
-Near-parity is the honest reading: q4_0 is llama.cpp's oldest and most
-heavily tuned decode quant, while ours rides the q4_K-shaped repack path.)
+Plain decode, tok/s (serve mode, 1,024-token replies — sustained over
+0–1K context; llama-bench tg128 at matched depth, best of fa 0/1):
 
-MTP multiplies on top (§4.5). Where the design point shows is multimodal
-turns: little-gemma reaches first-sentence on an image+question turn in
+| device | model | little-gemma | llama.cpp | ratio |
+|---|---|---:|---:|---:|
+| Orin | E4B QAT | 20.7 | 18.7 | **1.11×** |
+| Orin | 12B QAT | 9.8 | 9.05 | **1.08×** |
+| Orin | E2B QAT | 34.5 | 37.4 | 0.92× |
+
+(Two honest notes. The serve numbers include our per-token serving
+overhead while llama-bench measures bare kernels, so the ratios are
+conservative. And q4_0 is llama.cpp's oldest, most heavily tuned decode
+quant — on the earlier Q4_K_M builds our lead was 1.17–1.27× — so the QAT
+switch, which speeds up both stacks in absolute terms, narrows the ratio;
+we take the faster absolute tokens.)
+
+MTP multiplies on top, and there the comparison inverts decisively: with
+each family's first-party MTP head engaged, little-gemma out-generates
+`llama-server`'s own speculative path at every content type measured
+(§4.5). Where the design point shows most is multimodal turns:
+little-gemma reaches first-sentence on an image+question turn in
 **1.98 s (E4B) / 5.22 s (12B)** on the Orin vs 35.8 / 98.6 s for
 llama-server (which burns its lead in an unsuppressed thinking channel and
-host-side encode) — the raw-token-stream server and encode-off-critical-path
+host-side encode; Q4_K_M-era measurement — the QAT builds only shorten our
+side) — the raw-token-stream server and encode-off-critical-path
 choices are TTFB choices, not throughput choices.
 
 ### 5.3 The dictation matrix (Orin)
@@ -434,8 +465,8 @@ choices are TTFB choices, not throughput choices.
 
 | model | deferred | paced (30 w/s) |
 |---|---|---|
-| 12B | 5.37 / 8.13 | 0.55 / 3.31 |
-| E4B | 2.23 / 3.20 | 0.26 / 1.24 |
+| 12B QAT | 5.10 / 6.15 | 0.53 / 1.57 |
+| E4B QAT | 2.04 / 2.93 | 0.16 / 1.05 |
 | E2B QAT | 1.15 / 1.76 | **0.10 / 0.72** |
 
 (Burst delivery pays frame padding and is dominated by deferred — measured,
@@ -447,7 +478,7 @@ E2B QAT, voice-sys prompt, streamed dictation of the 30-second spoken
 instruction, everything on-device:
 
 ![Figure 3 — anatomy of first audio: baseline vs voice-sys prompt (E2B QAT,
-Orin NX)](fig-first-audio-anatomy.svg)
+Orin NX)](fig-first-audio-anatomy.png)
 
 *Figure 3: The same question, three configurations. The voice-sys prompt
 cuts the first speakable unit from 21 to 8 words (1.21 → 0.82 s); the
@@ -467,21 +498,26 @@ One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 
 | tier | intelligence | TTFB (paced) | where it lands [1,2] |
 |---|---|---:|---|
-| 12B | strongest open-weight ≤16GB | ~3.4 s | "common experience" (P90 region) |
-| E4B | high | ~1.35 s | just under the industry median (1.4–1.7 s) |
+| 12B QAT | strongest open-weight ≤16GB | ~1.7 s | at the industry median (1.4–1.7 s) — on device |
+| E4B QAT | high | ~1.15 s | between the median and the natural window |
 | E2B QAT | good | **0.65 s** | inside the "theoretical ideal", rarely achieved in production |
 
 ![Figure 4 — the three tiers against production voice-AI latency
-bands](fig-tiers-vs-industry.svg)
+bands](fig-tiers-vs-industry.png)
 
 *Figure 4: One board, one pipeline, three operating points. The E2B tier
 lands inside the natural-conversation window that production telemetry
-reports as rarely achieved; the E4B matches the industry median; the 12B
-trades latency for the strongest answers.*
+reports as rarely achieved; the E4B sits between that window and the
+industry median; the 12B — the strongest open-weight model the board
+holds — answers at the median itself.*
 
 The tier table is the product story: the same hardware and pipeline lets a
 robot answer trivia with the 12B and do fluent small talk with the E2B —
-switching is a model file, not an architecture.
+switching is a model file, not an architecture. The table's stimulus is
+deliberately the hard case (a 30-second instruction); on a
+conversational-length question the E4B tier answers in **≈0.44 s** (TTFS
+0.34 s + the vocoder's 0.10 s) — a mid-family model inside the natural
+window.
 
 ### 5.6 Memory: does it fit an 8 GB Nano?
 
@@ -592,7 +628,7 @@ constant in prompt length on both sides; the *size* of those constants
 already settled in Figure 3.
 
 ![Figure 5 — time to first audio vs. spoken prompt length (E2B QAT, one
-Orin NX)](fig-ttfb-vs-length.svg)
+Orin NX)](fig-ttfb-vs-length.png)
 
 *Figure 5: The same board and E2B weights, swept over prompt length. Our
 TTFB is flat (0.65 s streamed-text; ≈1.0 s live-mic once the streaming-ASR
@@ -611,7 +647,7 @@ pinned clocks, SoC otherwise idle), driven turn after turn with fixed
 after 42 turns (~7,475 tokens).
 
 ![Figure 6 — session aging: TTFT and first audio vs conversation depth (E2B
-QAT, one Orin NX)](fig-session-aging.svg)
+QAT, one Orin NX)](fig-session-aging.png)
 
 *Figure 6: TTFT and first audio (measured TTFS + the streaming vocoder's
 0.10 s first-PCM constant, §4.4) as one conversation fills the window. Both
@@ -647,7 +683,8 @@ at 1/6th the power class* — because the floor is set by clause decoding
 and vocoding, not by FLOPs. TTFB pursuit and throughput pursuit diverge
 here: past the point where prefill hides under speech and decode outruns
 speech playback (~3 tok/s suffices for real-time listening; even the 12B's
-8.3 tok/s clears it), *more* tokens/s stops buying experienced fluency.
+9.8 tok/s — 14.5 with MTP on prose — clears it), *more* tokens/s stops
+buying experienced fluency.
 That is why this work no longer competes with llama.cpp on llama.cpp's
 axis — and why a 6,000-line runner can hold the design point at all.
 
@@ -836,6 +873,23 @@ quantization levels by gate.
 - [x] Burst-mode row values — RESOLVED (decided against): §5.3 keeps only
       deferred + paced; burst is frame-padding-dominated (≈ deferred) and is
       folded into the §5.3 note, so no separate rows are needed.
+- [x] E4B/12B QAT refresh — MEASURED (2026-07-19, pinned clocks, same-day
+      llama pairs): the family's QAT q4_0 releases became the defaults and
+      §5.1/§5.2/§5.3/§5.5 were re-measured on them, with the 2-row MTP
+      verify kernel shipped the same day. Substrate: decode 20.7/9.8/34.5
+      (1.11×/1.08×/0.92×), prefill 474/193/834 (0.86×/0.84×/0.82×). §4.5
+      rewritten: MTP prose 1.40–1.44× (was 1.1–1.35×), and MTP-on
+      generation now beats llama-server's draft-mtp at every content type
+      measured, including image-only turns. Dictation matrix: 12B paced
+      TTFS 3.31 → 1.57 s; the §5.5 tier table moved wholesale (12B lands
+      at the industry median). Deferred-vs-paced byte-identity re-verified
+      on the QAT builds. Figures 2 and 4 redrawn (SVG sources restored to
+      the repo after being lost in the .tex import).
+- [ ] J/token re-measure post-2-row-kernel: the 2.29 vs 2.85 figure (§4.5,
+      §5.7) predates the cheaper verify; direction can only improve, but the
+      number should be re-taken before submission.
+- [ ] §5.8 cross-silicon table is Q4_K_M-era on our side (labeled in §5.1);
+      re-run on QAT + streaming TTS both sides is already listed in §8.
 - [x] Related-work / intro citations filled (2026-07-06, References section
       added, refs [1]-[17]): hamming.ai (2 companion articles, exact P50/P90/
       P95/P99 pulled from their published table), Moshi (arXiv:2410.00037,
