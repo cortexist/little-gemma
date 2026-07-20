@@ -39,7 +39,11 @@ in clause length (0.10 s vs 0.27–0.49 s), sample-exact against the
 monolithic decode; (4) *multi-token-prediction speculative decoding*
 characterized honestly as content-dependent (1.4–2.3×, ahead of
 llama-server's own speculative path at every content type measured) and
-as a battery feature (2.29 vs 2.85 J/token). A cross-silicon
+as a battery feature (2.29 vs 2.85 J/token). When Google's QAT releases
+repaired the family's native audio encoder mid-project, the same engine —
+unchanged — streamed the model's own ears to **0.46 s first audio** (E2B;
+0.54 s on the E4B), whisper becoming one of two interchangeable ear
+configurations rather than a hard dependency. A cross-silicon
 study against Moshi on an RTX A5000 finds the remaining gap to
 speech-native models is structural (one decoded clause + one vocoder call,
 ~0.2 s) — and that the datacenter GPU buys only 1.7× over the 20 W board,
@@ -112,7 +116,10 @@ Contributions:
    methodology that makes that number honest on Jetson); a decode rate that
    *beats* llama.cpp on the same board (1.08–1.11× plain, and with the
    family's MTP head engaged, ahead of llama-server's own speculative
-   decoding at every content type measured) from ~6,000 lines of C/CUDA.
+   decoding at every content type measured) from ~6,000 lines of C/CUDA;
+   and two interchangeable ear configurations — the whisper lane, and,
+   since the QAT releases repaired the family's audio encoder, the model's
+   own ears at 0.46 s first audio (E2B; 0.54 s on the E4B, §5.5).
 6. **A cross-silicon study** (§5.8) against Moshi on its own class of
    hardware, locating the cascade's structural floor (one clause of decode +
    one VITS call) and showing the conversational regime is floor-bound: a
@@ -223,15 +230,25 @@ Three processes, one GPU owner:
   the whole-clause wait itself: the same voice files, split at the latent 
   boundary, stream first PCM in 0.10 s.
 
-**Why external ASR when Gemma 4 is natively multimodal?** Because we
-measured the native path and it fails three ways (§7 for details): the
-E2B/E4B conformer audio path confabulates rather than transcribes; the 12B
-hears speech but behaves as ASR-only for non-speech sound; and — the finding
-we could not have predicted — **vision in context disables hearing on the
-12B** (seven arrangements tested, asymmetric, session-scoped, survives black
-frames). A voice+camera product on this family *requires* an external ASR
-lane; our pipeline's soundtrack policy (audio rides as a whisper transcript
-under the video span) is the direct product of that finding.
+**Why external ASR when Gemma 4 is natively multimodal?** Because when we
+built it, the native path failed three ways (§7 for details): the E2B/E4B
+conformer audio path confabulated rather than transcribed; the 12B hears
+speech but behaves as ASR-only for non-speech sound; and — the finding we
+could not have predicted — **vision in context disables hearing on the
+12B** (seven arrangements tested, asymmetric, session-scoped, survives
+black frames). Mid-project, Google's QAT releases repaired the first
+failure: the fault was the original mmproj's audio-encoder export, and the
+QAT-era encoder transcribes verbatim once its exported fake-quant
+activation ranges are applied (§5.5) — so the same engine now also runs
+**whisper-free on the E2B and E4B tiers**, streaming the model's own ears
+to 0.46 s first audio. The other two failures stand, and they scope the
+two lanes:
+whisper remains the lane wherever a session may see frames or needs
+non-speech awareness (music, ambient — audio rides as a whisper transcript
+under the video span), and for the 12B tier; native ears are the
+speech-only, vision-free option that removes the ASR process entirely.
+The flexibility itself is the point: the ears, like the brain, are a
+swappable part.
 
 ## 4. Where the time goes, and how it is reclaimed
 
@@ -290,8 +307,10 @@ Measured on the Orin (TTFT after last word, deferred → paced): 12B
 **5.10 → 0.53 s**, E4B **2.04 → 0.16 s**, E2B **1.15 → 0.10 s**. The
 mechanism generalizes beyond dictation: camera and video frames prefill on
 arrival the same way (media spans, 3.0× video TTFT), which is what makes
-the same pipeline camera-capable — the flexibility argument against
-purpose-trained speech models made concrete.
+the same pipeline camera-capable — and, once the QAT releases repaired the
+family's native audio encoder, raw audio chunks ride it too (§5.5, TTFT
+flat in utterance length with zero engine changes) — the flexibility
+argument against purpose-trained speech models made concrete.
 
 A protocol note: at a real speaking pace the hiding is essentially free —
 prefill chunks slot into the pauses between frames. Burst delivery pays
@@ -505,19 +524,73 @@ One runner, one board, three operating points (TTFS + TTS ≈ TTFB):
 ![Figure 4 — the three tiers against production voice-AI latency
 bands](fig-tiers-vs-industry.png)
 
-*Figure 4: One board, one pipeline, three operating points. The E2B tier
-lands inside the natural-conversation window that production telemetry
-reports as rarely achieved; the E4B sits between that window and the
-industry median; the 12B — the strongest open-weight model the board
-holds — answers at the median itself.*
+*Figure 4: One board, one pipeline, six operating points, sorted by
+latency — blue marks the sub-second class. The whisper-lane rows carry
+the 30-second instruction: the 12B — the strongest open-weight model the
+board holds — answers at the industry median, the E4B under it, the E2B
+inside the natural-conversation window that production telemetry reports
+as rarely achieved. The native-ears rows are a conversational turn with
+the hearing included (§5.5), and they move every tier down a class: the
+12B to ≈1.5 s, and the E4B and E2B into the sub-second window at 0.54
+and 0.46 s — where the whisper lane on the same turn composes to
+≈0.8 s.*
 
 The tier table is the product story: the same hardware and pipeline lets a
 robot answer trivia with the 12B and do fluent small talk with the E2B —
 switching is a model file, not an architecture. The table's stimulus is
 deliberately the hard case (a 30-second instruction); on a
-conversational-length question the E4B tier answers in **≈0.44 s** (TTFS
-0.34 s + the vocoder's 0.10 s) — a mid-family model inside the natural
-window.
+conversational-length question the E4B tier answers in ≈0.44 s of server
+work (TTFS 0.34 s + the vocoder's 0.10 s), ≈0.8 s from end of speech once
+the whisper pass is counted.
+
+**Native ears join the picture with the QAT releases.** Google's QAT
+checkpoints (our defaults, §5.1) quietly fixed the E2B/E4B native audio
+path: the original failure was the mmproj's audio-encoder export, and the
+QAT-era encoder transcribes the reference clip verbatim — even under the
+pre-QAT backbone — once its exported fake-quant activation ranges are
+applied (120 per-projection clamp scalars; without them speech degenerates
+into token loops). Our conformer implements it behind a switch (log-mel
+front end on the host, the 12 blocks on the tensor cores, 0.2 s warm for
+11 s of audio), and §4.2's streaming applies unchanged: audio chunks
+prefill on arrival, zero engine changes. The causal conformer sets the
+chunk dial — 3 s chunks are lossless on verbatim transcription across
+boundaries (2 s drops words, 1 s collapses) — and, measured end to end
+(E4B QAT, voice prompt, MTP, client-side clocks, warm):
+
+| model | delivery | utterance | TTFT | TTFS | first audio |
+|---|---|---|---:|---:|---:|
+| E4B | deferred (one frame) | 4.5 s speech | 0.43 | 0.75 | ≈0.85 s |
+| E4B | streamed, 3 s chunks, paced | 4.5 s speech | 0.24 | 0.44 | ≈0.54 s |
+| E4B | streamed, 3 s chunks, paced | 11 s speech | 0.25 | 0.64 | ≈0.74 s |
+| E2B | streamed, 3 s chunks, paced | 4.5 s speech | 0.15 | 0.36 | **≈0.46 s** |
+| E2B | streamed, 3 s chunks, paced | 11 s speech | 0.16 | 0.53 | ≈0.63 s |
+| 12B | deferred (whole span — see text) | 4.5 s speech | 0.78 | 1.39 | ≈1.49 s |
+
+**0.46 s with the hearing included** — the fastest first audio in this
+paper (E2B deferred: 0.49 s; the E4B tier does 0.54 s streamed), under the
+whisper-lane headline with one fewer process, and TTFT flat in utterance
+length (§4.2's signature, now for audio; Figure 4 shows all six operating
+points on one axis). Native ears move every tier down a class: the E4B —
+a mid-family model — lands inside the natural window, and even the 12B
+(via its always-on unified audio path) answers at ≈1.5 s, under its own
+whisper lane. The architecture decides who streams: the E2B/E4B conformer
+is causal (5-tap causal convolutions, a 12-frame causal attention window),
+so it chunks gracefully; the 12B's unified encoder is bidirectional
+within a span — chunk it and the model degrades into thought loops — so
+the 12B takes the whole span deferred. Two verification nuances travel
+with the table: the E2B transcribes verbatim through the *chunked* path —
+the streaming configuration — while a single 11 s span truncates
+(chunking helps the smaller model), and the 12B's verbatim hearing was
+gated on the whole-span path. Both lanes ship deliberately, and not only because the 12B's
+vision-hearing exclusion demands whisper there (§7): a transcript is
+*editable text* between ear and brain — the pipeline can gate, correct,
+or annotate what the model reads before it reads it — leverage native
+ears give up by design. Whisper remains the shipped default; native ears
+are the speech-only option that trades that leverage for latency and a
+process. Honest scope: speech-only (non-speech confabulates, §7); vision
+in the same session still degrades hearing (a checkpoint behavior — the
+engine delivers both modalities in one turn and needs no change when a
+fixed checkpoint lands); the chunk dial is validated on one clip so far.
 
 ### 5.6 Memory: does it fit an 8 GB Nano?
 
@@ -719,7 +792,7 @@ axis — and why a 6,000-line runner can hold the design point at all.
 
 | configuration | native-audio result | status |
 |---|---|---|
-| E2B / E4B, speech | Confabulates — output tracks the *prompt*, not the audio; coarse comprehension ("a man speaking") survives, verbatim ASR fails. | Model limit, not our bug: the fork's `llama-mtmd-cli` and `llama-server`, and mainline llama.cpp, all confabulate on the same clip, each differently. |
+| E2B / E4B, speech | Original release: confabulates — output tracks the *prompt*, not the audio (all four independent pipelines failed on the same clip, each differently). **QAT release: fixed** — verbatim ASR, isolated to the repaired audio-encoder export plus its fake-quant activation ranges (§5.5); verified on E4B and E2B QAT (the E2B verbatim through the chunked streaming path; a single long span truncates on the smaller model). | Native ears usable for speech (behind a switch); whisper remains the default lane. |
 | 12B, speech alone | Accurate ASR (JFK transcribed verbatim over the socket). | Usable — spoken words only. |
 | 12B, non-speech alone | Confabulates or denies; describes whatever instrument the prompt names. | Speech-only scope; music/ambient need an external tag. |
 | 12B, any vision in the session | Hearing disabled — all seven arrangements fail (audio before/after/interleaved, black frames, even an earlier turn); vision survives audio, so the exclusion is asymmetric and session-scoped. | Whisper is mandatory whenever a session may also see frames. |
@@ -730,6 +803,10 @@ Finetune for human pause placement (shorter than grammatical clauses);
 persistent whisper service (flips the streaming-vs-endpass verdict
 unconditionally); integrate the streaming vocoder (§4.4) into the
 live-mic loop and re-measure the composed 0.65 s as one system;
+live-mic native ears (§5.5) — mic chunks as media frames aligned to a
+far-field front end's speech segments, and the chunk dial validated
+across speakers and boundary placements; E2B QAT native-audio
+verification;
 the rigorous Moshi head-to-head (stream a recorded question, anchor the
 clock at its final word — §7); re-run the A5000 cross-silicon table with
 streaming TTS on both sides;
@@ -885,6 +962,14 @@ quantization levels by gate.
       at the industry median). Deferred-vs-paced byte-identity re-verified
       on the QAT builds. Figures 2 and 4 redrawn (SVG sources restored to
       the repo after being lost in the .tex import).
+- [x] Native audio measured (2026-07-19, after the QAT releases repaired the
+      E2B/E4B encoder): §5.5 gained a native-ears half — encoder-export fault isolated via
+      mtmd-cli cells, fake-quant activation clamps implemented, verbatim
+      reference transcription, chunk dial (3 s lossless / 2 s edge / 1 s
+      collapse), deferred 0.85 s vs streamed 0.54 s first audio
+      (conversational, E4B QAT). §3, §4.2, §7, contributions and abstract
+      updated to the two-ear-lanes framing; harness committed as
+      bench/ttfb_audio.py.
 - [ ] J/token re-measure post-2-row-kernel: the 2.29 vs 2.85 figure (§4.5,
       §5.7) predates the cheaper verify; direction can only improve, but the
       number should be re-taken before submission.
