@@ -606,7 +606,10 @@ extern "C" float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n
     return out;
 }
 
+static void a_gpu_free_state(struct media *md);   // gemma4a conformer state, below
+
 extern "C" void v_gpu_free(struct media *md) {
+    a_gpu_free_state(md);                          // audio state has its own pointer
     if (!md->gpu || md->gpu == (void *)-1) return;
     if (!md->legacy_v) {
         struct uvcuda *vc = (struct uvcuda *)md->gpu;
@@ -634,4 +637,319 @@ extern "C" void v_gpu_free(struct media *md) {
     free(vc->vl);
     free(vc);
     md->gpu = NULL;
+}
+
+#include <cfloat>              // FLT_MAX: the inactive-clamp sentinel
+
+// ===== gemma4a audio conformer (GPU) =========================================
+// The 12-block conformer that media.c runs on the host (a_blocks_host), as CUDA
+// kernels. The front end (log-mel + the two subsampling convs) stays on the
+// host and hands us F[T][n_feat]; here we project in, run the stack, and
+// project out to the LLM width. Rides the vision encoder's kernels where the
+// shapes let it (k_gemm — which rounds activations to f16 for the tensor
+// cores, the same relaxed-numerics class as the vision path — plus k_rms,
+// k_add, k_addrow); the host a_blocks_host stays in as the LG_MEDIA_VERIFY
+// oracle. Ported back from the audio-encoder branch (4418a6e) when the QAT
+// releases fixed the encoder; only reachable under LG_GEMMA4A=1 (media.c).
+
+struct ald {                                  // device mirror of struct alayer
+    float *ffn_norm, *ffn_post, *ffn_norm1, *ffn_post1;
+    float *attn_pre, *attn_post, *pds;        // pds [dh]
+    float *norm_conv, *conv_norm, *ln2, *dw;  // dw [ne][5]
+    __half *ffn_up, *ffn_down, *ffn_up1, *ffn_down1;
+    __half *q, *k, *v, *o, *k_rel, *pw1, *pw2;
+};
+
+struct acuda {
+    struct ald *al;
+    __half *inp_proj, *out_proj, *mm_a;
+    float *out_proj_b, *rpe;                  // out_proj_b [ao], rpe [13][ne]
+    int ne, nh, dh, n_layer, n_feat, ao, n_embd;
+    int t_cap;                                // size of the work buffers, in frames
+    float *F, *X, *H, *G, *D, *Q, *K, *V, *P, *Y, *rows;
+    float *S;                                 // clamp scratch (q/k/v share their input)
+};
+
+// dst = clamp(src, lo, hi); dst == src is fine (same-index read/write).
+static __global__ void k_clamp(float *dst, const float *src, float lo, float hi, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull) {
+        float v = src[i];
+        dst[i] = v < lo ? lo : v > hi ? hi : v;
+    }
+}
+
+// The QAT clippable-linear halves: input clamps src into tmp (or in place),
+// output clamps in place. Inactive ranges (+/-FLT_MAX, pre-QAT files) launch
+// nothing — the gemm reads the original buffer.
+static const float *cl_in(float *tmp, const float *x, size_t n, const struct aclamp *c) {
+    if (c->ilo <= -FLT_MAX && c->ihi >= FLT_MAX) return x;
+    k_clamp<<<(int)((n + 255) / 256), 256>>>(tmp, x, c->ilo, c->ihi, n);
+    return tmp;
+}
+static void cl_out(float *x, size_t n, const struct aclamp *c) {
+    if (c->olo <= -FLT_MAX && c->ohi >= FLT_MAX) return;
+    k_clamp<<<(int)((n + 255) / 256), 256>>>(x, x, c->olo, c->ohi, n);
+}
+
+static __global__ void k_silu(float *x, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull) {
+        float v = x[i]; x[i] = v / (1.0f + __expf(-v));
+    }
+}
+
+// x += s * a   (s = 0.5 for the macaron half-step FFNs, 1.0 for full residuals).
+static __global__ void k_madd(float *x, const float *a, float s, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull) x[i] += s * a[i];
+}
+
+// Q *= q_scale * per_dim_scale[i % dh];  K *= k_scale.  P (the rel-pos term) is
+// left unscaled, exactly as the host does — the score is q_scaled . (k_scaled + p).
+static __global__ void k_qk_scale(float *Q, float *K, const float *pds, int dh,
+                                  float qs, float ks, size_t total) {
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < total; i += gridDim.x * 256ull) {
+        Q[i] *= qs * pds[i % dh];
+        K[i] *= ks;
+    }
+}
+
+// GLU: D[t][i] = G[t][i] * sigmoid(G[t][ne + i])   (G is [T][2 ne]).
+static __global__ void k_glu(float *D, const float *G, int ne, size_t total) {
+    for (size_t idx = blockIdx.x * 256ull + threadIdx.x; idx < total; idx += gridDim.x * 256ull) {
+        int i = idx % ne; size_t t = idx / ne;
+        const float *g = G + t * 2 * ne;
+        D[idx] = g[i] / (1.0f + __expf(-g[ne + i]));
+    }
+}
+
+// Causal depthwise conv, 5 taps: H[t][i] = sum_j D[t-4+j][i] * dw[i][j], ts >= 0.
+static __global__ void k_depthwise(float *H, const float *D, const float *dw, int ne, size_t total) {
+    for (size_t idx = blockIdx.x * 256ull + threadIdx.x; idx < total; idx += gridDim.x * 256ull) {
+        int i = idx % ne, t = (int)(idx / ne);
+        float s = 0.0f;
+        for (int j = 0; j < 5; j++) {
+            int ts = t - 4 + j;
+            if (ts >= 0) s += D[(size_t)ts * ne + i] * dw[(size_t)i * 5 + j];
+        }
+        H[idx] = s;
+    }
+}
+
+// Chunked local attention: each frame t attends to the causal 12-frame window
+// [t-11, t]. Block = (frame, head), blockDim.x = dh (a power of 2, <= 1024).
+// score = 50*tanh(q.(k+p)/50) over the window, softmax, then the V-weighted sum;
+// p is the projected rel-pos row for distance t-gk (table index 12-(t-gk), 12 = self).
+static __global__ void k_local_attn(float *Dout, const float *Q, const float *K, const float *V,
+                                    const float *P, int ne, int dh) {
+    int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    __shared__ float red[1024];
+    __shared__ float att[12];
+    __shared__ float ssum;
+    const float *qh = Q + (size_t)t * ne + h * dh;
+    float qv = qh[i];
+    int k0 = t - 11 > 0 ? t - 11 : 0, nk = t - k0 + 1;
+    for (int g = 0; g < nk; g++) {                     // 12 windowed dot products
+        int gk = k0 + g;
+        const float *kh = K + (size_t)gk * ne + h * dh;
+        const float *ph = P + (size_t)(12 - (t - gk)) * ne + h * dh;
+        red[i] = qv * (kh[i] + ph[i]);
+        __syncthreads();
+        for (int s = dh >> 1; s; s >>= 1) { if (i < s) red[i] += red[i + s]; __syncthreads(); }
+        if (i == 0) att[g] = 50.0f * tanhf(red[0] / 50.0f);
+        __syncthreads();
+    }
+    if (i == 0) {                                      // softmax over the <=12 scores
+        float mx = -1e30f;
+        for (int g = 0; g < nk; g++) if (att[g] > mx) mx = att[g];
+        float sum = 0.0f;
+        for (int g = 0; g < nk; g++) { att[g] = expf(att[g] - mx); sum += att[g]; }
+        ssum = sum;
+    }
+    __syncthreads();
+    float o = 0.0f;
+    for (int g = 0; g < nk; g++) o += att[g] * V[(size_t)(k0 + g) * ne + h * dh + i];
+    Dout[(size_t)t * ne + h * dh + i] = o / ssum;
+}
+
+// ---- audio upload / init ----------------------------------------------------
+
+static struct acuda *acuda_init(struct media *md) {
+    int ne = md->a_embd, nh = md->a_head, dh = ne / nh;
+    int ao = (int)md->a_out_proj->dims[1];
+    if (dh > 1024 || (dh & (dh - 1)) != 0) {       // the local-attn reduction wants a pow2 dh
+        fprintf(stderr, "media-cuda: audio head dim %d unsupported, using the host conformer\n", dh);
+        return NULL;
+    }
+    if ((ne | ao | md->n_embd) & 1) {              // k_gemm stages/writes in pairs: dims must be even
+        fprintf(stderr, "media-cuda: odd audio width (%d/%d/%d), using the host conformer\n",
+                ne, ao, md->n_embd);
+        return NULL;
+    }
+    struct acuda *ac = (struct acuda *)calloc(1, sizeof *ac);
+    if (!ac) return NULL;
+    ac->al = (struct ald *)calloc((size_t)md->a_layer, sizeof *ac->al);
+    ac->ne = ne; ac->nh = nh; ac->dh = dh; ac->n_layer = md->a_layer;
+    ac->ao = ao;
+    ac->n_embd = md->n_embd;
+    ac->inp_proj = up_h(md->a_inp_proj);
+    ac->out_proj = up_h(md->a_out_proj);
+    ac->mm_a     = up_h(md->mm_a);
+    ac->out_proj_b = up_f(md->a_out_proj_b, (size_t)ac->ao);
+    ac->rpe        = up_f(md->rpe, (size_t)13 * ne);
+    int ok = ac->al && ac->inp_proj && ac->out_proj && ac->mm_a && ac->out_proj_b && ac->rpe;
+    for (int L = 0; ok && L < md->a_layer; L++) {
+        const struct alayer *s = &md->al[L];
+        struct ald *d = &ac->al[L];
+        ok = (d->ffn_norm = up_f(s->ffn_norm, ne)) && (d->ffn_post = up_f(s->ffn_post, ne)) &&
+             (d->ffn_norm1 = up_f(s->ffn_norm1, ne)) && (d->ffn_post1 = up_f(s->ffn_post1, ne)) &&
+             (d->attn_pre = up_f(s->attn_pre, ne)) && (d->attn_post = up_f(s->attn_post, ne)) &&
+             (d->pds = up_f(s->pds, dh)) && (d->norm_conv = up_f(s->norm_conv, ne)) &&
+             (d->conv_norm = up_f(s->conv_norm, ne)) && (d->ln2 = up_f(s->ln2, ne)) &&
+             (d->dw = up_f(s->dw, (size_t)ne * 5)) &&
+             (d->ffn_up = up_h(s->ffn_up)) && (d->ffn_down = up_h(s->ffn_down)) &&
+             (d->ffn_up1 = up_h(s->ffn_up1)) && (d->ffn_down1 = up_h(s->ffn_down1)) &&
+             (d->q = up_h(s->q)) && (d->k = up_h(s->k)) && (d->v = up_h(s->v)) &&
+             (d->o = up_h(s->o)) && (d->k_rel = up_h(s->k_rel)) &&
+             (d->pw1 = up_h(s->pw1)) && (d->pw2 = up_h(s->pw2)) != NULL;
+    }
+    if (!ok) {
+        fprintf(stderr, "media-cuda: audio weight upload failed, using the host conformer\n");
+        free(ac->al); free(ac);                    // partial uploads leaked (startup OOM only)
+        return NULL;
+    }
+    return ac;
+}
+
+static int ensure_abufs(struct acuda *ac, int T) {
+    if (T <= ac->t_cap) return 0;
+    int ne = ac->ne, ao = ac->ao, nf = ac->n_feat, ce = ac->n_embd;
+    float **bufs[] = { &ac->F, &ac->X, &ac->H, &ac->G, &ac->D, &ac->Q, &ac->K, &ac->V,
+                       &ac->P, &ac->Y, &ac->rows, &ac->S };
+    size_t sz[] = { (size_t)T * nf, (size_t)T * ne, (size_t)T * ne, (size_t)T * 4 * ne,
+                    (size_t)T * 2 * ne, (size_t)T * ne, (size_t)T * ne, (size_t)T * ne,
+                    (size_t)13 * ne, (size_t)T * ao, (size_t)T * ce, (size_t)T * ne };
+    for (int i = 0; i < 12; i++) {
+        cudaFree(*bufs[i]);
+        if (cudaMalloc(bufs[i], sz[i] * 4) != cudaSuccess) { ac->t_cap = 0; return -1; }
+    }
+    ac->t_cap = T;
+    return 0;
+}
+
+// ---- the conformer ----------------------------------------------------------
+
+extern "C" float *a_blocks_gpu(struct media *md, const float *F, int T, int n_feat, int *n_tokens) {
+    if (md->audio_gpu == (void *)-1) return NULL;      // init already failed once
+    struct acuda *ac = (struct acuda *)md->audio_gpu;
+    if (!ac) {
+        ac = acuda_init(md);
+        md->audio_gpu = ac ? (void *)ac : (void *)-1;
+        if (!ac) return NULL;
+    }
+    const int ne = ac->ne, nh = ac->nh, dh = ac->dh, ao = ac->ao, n_embd = ac->n_embd;
+    const float eps = 1e-6f;
+    if (n_feat & 1) return NULL;                       // k_gemm stages K in pairs
+    ac->n_feat = n_feat;
+    if (ensure_abufs(ac, T) != 0) return NULL;
+    cudaMemcpy(ac->F, F, (size_t)T * n_feat * 4, cudaMemcpyHostToDevice);
+
+    #define AGG(rows, cols) dim3(((cols) + 63) / 64, ((rows) + 63) / 64)
+    const size_t Tne = (size_t)T * ne;
+    const int e_ne  = (int)((Tne + 255) / 256);                    // elementwise grid, [T][ne]
+    const int e_4ne = (int)(((size_t)T * 4 * ne + 255) / 256);
+    const float q_scale = (1.0f / sqrtf((float)dh)) / logf(2.0f);  // same constants as the host
+    const float k_scale = logf(1.0f + expf(1.0f)) / logf(2.0f);
+
+    k_gemm<<<AGG(T, ne), 256>>>(ac->X, ac->F, ac->inp_proj, T, n_feat, ne);   // project F in
+
+    for (int L = 0; L < ac->n_layer; L++) {
+        const struct ald *a = &ac->al[L];
+        const struct alayer *cl = &md->al[L];              // the QAT clamp quads
+
+        // FFN 1 (half-step residual)
+        k_rms<<<T, 256>>>(ac->H, ac->X, a->ffn_norm, ne, eps);
+        k_gemm<<<AGG(T, 4 * ne), 256>>>(ac->G, cl_in(ac->H, ac->H, Tne, &cl->c_ffn_up), a->ffn_up, T, ne, 4 * ne);
+        cl_out(ac->G, (size_t)T * 4 * ne, &cl->c_ffn_up);
+        k_silu<<<e_4ne, 256>>>(ac->G, (size_t)T * 4 * ne);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->D, cl_in(ac->G, ac->G, (size_t)T * 4 * ne, &cl->c_ffn_down), a->ffn_down, T, 4 * ne, ne);
+        cl_out(ac->D, Tne, &cl->c_ffn_down);
+        k_rms<<<T, 256>>>(ac->D, ac->D, a->ffn_post, ne, eps);
+        k_madd<<<e_ne, 256>>>(ac->X, ac->D, 0.5f, Tne);
+
+        // chunked local attention with relative positions
+        k_rms<<<T, 256>>>(ac->H, ac->X, a->attn_pre, ne, eps);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->Q, cl_in(ac->S, ac->H, Tne, &cl->c_q), a->q, T, ne, ne);
+        cl_out(ac->Q, Tne, &cl->c_q);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->K, cl_in(ac->S, ac->H, Tne, &cl->c_k), a->k, T, ne, ne);
+        cl_out(ac->K, Tne, &cl->c_k);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->V, cl_in(ac->S, ac->H, Tne, &cl->c_v), a->v, T, ne, ne);
+        cl_out(ac->V, Tne, &cl->c_v);
+        k_gemm<<<AGG(13, ne), 256>>>(ac->P, ac->rpe, a->k_rel, 13, ne, ne);   // k_rel: no QAT ranges
+        k_qk_scale<<<e_ne, 256>>>(ac->Q, ac->K, a->pds, dh, q_scale, k_scale, Tne);
+        k_local_attn<<<dim3(T, nh), dh>>>(ac->D, ac->Q, ac->K, ac->V, ac->P, ne, dh);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->H, cl_in(ac->D, ac->D, Tne, &cl->c_o), a->o, T, ne, ne);
+        cl_out(ac->H, Tne, &cl->c_o);
+        k_rms<<<T, 256>>>(ac->H, ac->H, a->attn_post, ne, eps);
+        k_add<<<e_ne, 256>>>(ac->X, ac->H, Tne);
+
+        // convolution module
+        k_rms<<<T, 256>>>(ac->H, ac->X, a->norm_conv, ne, eps);
+        k_gemm<<<AGG(T, 2 * ne), 256>>>(ac->G, cl_in(ac->H, ac->H, Tne, &cl->c_pw1), a->pw1, T, ne, 2 * ne);
+        cl_out(ac->G, (size_t)T * 2 * ne, &cl->c_pw1);
+        k_glu<<<e_ne, 256>>>(ac->D, ac->G, ne, Tne);
+        k_depthwise<<<e_ne, 256>>>(ac->H, ac->D, a->dw, ne, Tne);
+        k_rms<<<T, 256>>>(ac->H, ac->H, a->conv_norm, ne, eps);
+        k_silu<<<e_ne, 256>>>(ac->H, Tne);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->D, cl_in(ac->H, ac->H, Tne, &cl->c_pw2), a->pw2, T, ne, ne);
+        cl_out(ac->D, Tne, &cl->c_pw2);
+        k_add<<<e_ne, 256>>>(ac->X, ac->D, Tne);
+
+        // FFN 2 (half-step residual)
+        k_rms<<<T, 256>>>(ac->H, ac->X, a->ffn_norm1, ne, eps);
+        k_gemm<<<AGG(T, 4 * ne), 256>>>(ac->G, cl_in(ac->H, ac->H, Tne, &cl->c_ffn_up1), a->ffn_up1, T, ne, 4 * ne);
+        cl_out(ac->G, (size_t)T * 4 * ne, &cl->c_ffn_up1);
+        k_silu<<<e_4ne, 256>>>(ac->G, (size_t)T * 4 * ne);
+        k_gemm<<<AGG(T, ne), 256>>>(ac->D, cl_in(ac->G, ac->G, (size_t)T * 4 * ne, &cl->c_ffn_down1), a->ffn_down1, T, 4 * ne, ne);
+        cl_out(ac->D, Tne, &cl->c_ffn_down1);
+        k_rms<<<T, 256>>>(ac->D, ac->D, a->ffn_post1, ne, eps);
+        k_madd<<<e_ne, 256>>>(ac->X, ac->D, 0.5f, Tne);
+
+        // layer output norm
+        k_rms<<<T, 256>>>(ac->X, ac->X, a->ln2, ne, eps);
+    }
+
+    // out proj -> + bias -> plain RMS -> the LLM-width projection
+    k_gemm<<<AGG(T, ao), 256>>>(ac->Y, ac->X, ac->out_proj, T, ne, ao);
+    k_addrow<<<(int)(((size_t)T * ao + 255) / 256), 256>>>(ac->Y, ac->out_proj_b, ao, (size_t)T * ao);
+    k_rms<<<T, 256>>>(ac->Y, ac->Y, NULL, ao, eps);
+    k_gemm<<<AGG(T, n_embd), 256>>>(ac->rows, ac->Y, ac->mm_a, T, ao, n_embd);
+    #undef AGG
+
+    float *out = (float *)malloc((size_t)T * n_embd * 4);
+    if (!out) return NULL;
+    VC_CHECK(cudaMemcpy(out, ac->rows, (size_t)T * n_embd * 4, cudaMemcpyDeviceToHost));
+    VC_CHECK(cudaGetLastError());
+    *n_tokens = T;
+    return out;
+}
+
+static void a_gpu_free_state(struct media *md) {
+    struct acuda *ac = (struct acuda *)md->audio_gpu;
+    if (!ac || md->audio_gpu == (void *)-1) { md->audio_gpu = NULL; return; }
+    for (int L = 0; L < ac->n_layer; L++) {
+        struct ald *d = &ac->al[L];
+        cudaFree(d->ffn_norm); cudaFree(d->ffn_post); cudaFree(d->ffn_norm1); cudaFree(d->ffn_post1);
+        cudaFree(d->attn_pre); cudaFree(d->attn_post); cudaFree(d->pds);
+        cudaFree(d->norm_conv); cudaFree(d->conv_norm); cudaFree(d->ln2); cudaFree(d->dw);
+        cudaFree(d->ffn_up); cudaFree(d->ffn_down); cudaFree(d->ffn_up1); cudaFree(d->ffn_down1);
+        cudaFree(d->q); cudaFree(d->k); cudaFree(d->v); cudaFree(d->o); cudaFree(d->k_rel);
+        cudaFree(d->pw1); cudaFree(d->pw2);
+    }
+    cudaFree(ac->inp_proj); cudaFree(ac->out_proj); cudaFree(ac->mm_a);
+    cudaFree(ac->out_proj_b); cudaFree(ac->rpe);
+    cudaFree(ac->F); cudaFree(ac->X); cudaFree(ac->H); cudaFree(ac->G); cudaFree(ac->D);
+    cudaFree(ac->Q); cudaFree(ac->K); cudaFree(ac->V); cudaFree(ac->P); cudaFree(ac->Y);
+    cudaFree(ac->rows); cudaFree(ac->S);
+    free(ac->al);
+    free(ac);
+    md->audio_gpu = NULL;
 }

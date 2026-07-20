@@ -21,4 +21,9 @@ float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n_samples, i
     return NULL;
 }
 
+float *a_blocks_gpu(struct media *md, const float *F, int T, int n_feat, int *n_tokens) {
+    (void)md; (void)F; (void)T; (void)n_feat; (void)n_tokens;
+    return NULL;   // no GPU here -> caller uses a_blocks_host
+}
+
 void v_gpu_free(struct media *md) { (void)md; }
