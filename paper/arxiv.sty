@@ -14,7 +14,7 @@
     textwidth=6.5in,
     top=1in,
     headheight=14pt,
-    headsep=25pt,
+    headsep=15pt,
     footskip=30pt
   }
 }
@@ -123,13 +123,6 @@
 
 \setlength{\abovecaptionskip}{\@abovecaptionskip}
 \setlength{\belowcaptionskip}{\@belowcaptionskip}
-
-% swap above/belowcaptionskip lengths for tables
-\renewenvironment{table}
-  {\setlength{\abovecaptionskip}{\@belowcaptionskip}%
-   \setlength{\belowcaptionskip}{\@abovecaptionskip}%
-   \@float{table}}
-  {\end@float}
 
 % footnote formatting
 \setlength{\footnotesep }{6.65\p@}
