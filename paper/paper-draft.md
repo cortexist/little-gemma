@@ -68,7 +68,8 @@ places the median production voice agent at 1.4–1.7 s with a P90 of
 
 The two properties pull apart because of where each is cheap. Datacenter
 cascades are cohesive but pay network, queueing, and orchestration latency.
-Speech-native full-duplex models such as Moshi [3] are strikingly
+Speech-native full-duplex models such as Moshi [3] — the architecture
+NVIDIA's recent PersonaPlex builds on directly [19] — are strikingly
 fluent — we measure ~130 ms TTFB on an RTX A5000 — but are purpose-trained
 speech models (a ~7B Helium backbone fused to a neural codec), trained once,
 at great cost, with the conversational behavior baked in: no drop-in model
@@ -114,9 +115,11 @@ Contributions:
    intelligence tiers from one runner (12B / E4B / E2B); 4.2 GB unreclaimable
    for ears+brain+mouth (8 GB-board feasible, with the measurement
    methodology that makes that number honest on Jetson); a decode rate that
-   *beats* llama.cpp on the same board (1.08–1.11× plain, and with the
-   family's MTP head engaged, ahead of llama-server's own speculative
-   decoding at every content type measured) from ~6,000 lines of C/CUDA;
+   *beats* llama.cpp on the same board on the E4B and 12B tiers (1.08–1.11×
+   plain; 0.92× on the E2B against llama.cpp's most-tuned q4_0 path — and
+   with the family's MTP head engaged, ahead of llama-server's own
+   speculative decoding at every content type measured) from
+   ~6,000 lines of C/CUDA;
    and two interchangeable ear configurations — the whisper lane, and,
    since the QAT releases repaired the family's audio encoder, the model's
    own ears at 0.46 s first audio (E2B; 0.54 s on the E4B, §5.5).
@@ -143,7 +146,14 @@ conservative in Moshi's favor: our run used the uncompiled PyTorch q8 path
 of input streaming, measuring the full-duplex loop latency (~one 80 ms Mimi
 frame + one model step) rather than a turn response; §7 discusses the anchor
 mismatch with our end-of-speech metric. Mini-Omni and its successor [7,8] follow the
-same species. These systems set the fluency bar, at the price of a fixed,
+same species, and the species is compounding: NVIDIA's PersonaPlex [19] —
+the strongest recent entrant, adding role control by text prompt and voice
+conditioning by audio sample — is built directly on Moshi (the same
+streaming architecture and Mimi codec, a 7B backbone; per NVIDIA's release
+materials, see [19]). We therefore benchmark the species through Moshi
+itself and do not measure PersonaPlex separately: the fluency ceiling and
+the frozen-backbone price characterized here transfer to its descendants
+by construction. These systems set the fluency bar, at the price of a fixed,
 purpose-trained model: the backbone is frozen into a speech topology, so the
 brain cannot be swapped for next quarter's better open-weight release, and
 text-ecosystem capabilities (tools, structured output, long instructions,
@@ -169,8 +179,9 @@ server that streams the raw token channel for downstream clause flushing.
 little-gemma is not a llama.cpp competitor; it is a demonstration that a
 small, single-family runner can occupy a design point the general runtime
 does not: on the same Orin, matching 0.82–0.86× of llama.cpp's prefill
-while *beating* it in decode (1.08–1.11× plain; ahead of llama-server's
-own speculative decoding once each side's MTP head is engaged), and — the
+while *beating* it in decode on the larger tiers (1.08–1.11× plain, §5.2;
+ahead of llama-server's own speculative decoding once each side's MTP
+head is engaged), and — the
 relevant number for this paper — reaching first-sentence 18–48× earlier on
 multimodal turns (§5.2, thought suppression and encode-off-critical-path).
 
@@ -204,11 +215,16 @@ end of speech.*
 
 Three processes, one GPU owner:
 
-- **Ears — voicecat + whisper.cpp** (CUDA base.en): energy VAD, streaming
-  transcription with LocalAgreement-2 commits, timestamp-based window
-  trimming, barge-in (one byte stops the reply mid-stream). Committed words
-  stream into the runner as typed text frames *while the turn is still
-  open*.
+- **Ears — voicecat + whisper.cpp** (CUDA base.en): energy VAD to open an
+  utterance, streaming transcription with LocalAgreement-2 commits,
+  timestamp-based window trimming, barge-in (one byte stops the reply
+  mid-stream), transcript-verdict endpointing (consecutive ASR passes with
+  zero words are the ear's own "nothing is being said" — the turn closes
+  even under sustained music, which pins a pure energy VAD open), and
+  ambient-sound captions (whisper's bracketed non-speech tags, deduplicated,
+  ride the turn close so the model can truthfully answer about what it
+  heard). Committed words stream into the runner as typed text frames
+  *while the turn is still open*.
 - **Brain — Gemma 4 on little-gemma**: a ~6,000-line C/CUDA runner for the
   Gemma 4 family (int8 tensor-core prefill, dp4a decode, GPU vision encoder,
   MTP speculative decoding, all quantizations byte-identical to the f32
@@ -248,7 +264,9 @@ non-speech awareness (music, ambient — audio rides as a whisper transcript
 under the video span), and for the 12B tier; native ears are the
 speech-only, vision-free option that removes the ASR process entirely.
 The flexibility itself is the point: the ears, like the brain, are a
-swappable part.
+swappable part. (§5.5 develops the choice as a fusion spectrum — Moshi at
+one end, the whisper cascade at the other, native ears between — with
+speech over background music as the deciding scenario.)
 
 ## 4. Where the time goes, and how it is reclaimed
 
@@ -403,8 +421,9 @@ measured, same day, same GGUFs (prose 29.9 vs 24.5 tok/s; code 40.7 vs
 34.1; image description 31.5 vs 28.8). On the battery angle: MTP cuts
 energy per token from 2.85 to 2.29 J/token on the Orin (the GPU is
 bandwidth-bound; fewer full passes per token is less DRAM traffic;
-measured pre-kernel — the cheaper verify only widens it) — for a robot,
-spec decoding is a battery feature before it is a latency feature.
+measured pre-kernel on the Q4_K_M-era builds; the cheaper verify only
+widens it, and a QAT-era re-measure is queued in Appendix B) — for a
+robot, spec decoding is a battery feature before it is a latency feature.
 
 ### 4.6 The substrate, briefly
 
@@ -418,9 +437,10 @@ optimization is gated byte-identical against a f32 reference and, for the
 speculative path, by acceptance-rate tripwires (which caught three real
 bugs). Full engineering logs, including the falsified dead ends, are in the
 repository journals [18]. The result on the Orin: 0.82–0.86× of
-llama.cpp's prefill throughput and 1.08–1.11× its decode on the QAT
-defaults (1.17–1.27× on the earlier Q4_K_M builds), with MTP-on generation
-ahead of llama-server's own speculative path — from a codebase a single
+llama.cpp's prefill throughput and, on the E4B/12B tiers, 1.08–1.11× its
+decode on the QAT defaults (1.17–1.27× on the earlier Q4_K_M builds;
+the E2B sits at 0.92×, §5.2), with MTP-on generation ahead of
+llama-server's own speculative path — from a codebase a single
 reviewer can actually read (~6,000 lines).
 
 ## 5. Evaluation
@@ -436,9 +456,9 @@ CUDA base.en; piper en_US voices. Cross-silicon: RTX A5000 (Windows) +
 i7-8086K. All measurements are client-side per §4.1. The E4B and 12B rows
 in §5.2, §5.3 and §5.5 were re-measured 2026-07-19 on the QAT builds
 (which sped up *both* stacks — llama.cpp's q4_0 decode gains more than
-ours); the multimodal comparison in §5.2 and the cross-silicon study
-(§5.8) predate the switch (Q4_K_M builds) and are labeled — the switch
-only improves our side of those.
+ours); the multimodal comparison in §5.2 and the 12B/E4B rows of the
+cross-silicon study (§5.8) predate the switch (Q4_K_M builds) and are
+labeled in place — the switch only improves our side of those.
 
 ### 5.2 The substrate vs llama.cpp
 
@@ -555,7 +575,7 @@ front end on the host, the 12 blocks on the tensor cores, 0.2 s warm for
 prefill on arrival, zero engine changes. The causal conformer sets the
 chunk dial — 3 s chunks are lossless on verbatim transcription across
 boundaries (2 s drops words, 1 s collapses) — and, measured end to end
-(E4B QAT, voice prompt, MTP, client-side clocks, warm):
+(QAT builds, voice prompt, MTP, client-side clocks, warm):
 
 | model | delivery | utterance | TTFT | TTFS | first audio |
 |---|---|---|---:|---:|---:|
@@ -581,13 +601,43 @@ the 12B takes the whole span deferred. Two verification nuances travel
 with the table: the E2B transcribes verbatim through the *chunked* path —
 the streaming configuration — while a single 11 s span truncates
 (chunking helps the smaller model), and the 12B's verbatim hearing was
-gated on the whole-span path. Both lanes ship deliberately, and not only because the 12B's
-vision-hearing exclusion demands whisper there (§7): a transcript is
-*editable text* between ear and brain — the pipeline can gate, correct,
-or annotate what the model reads before it reads it — leverage native
-ears give up by design. Whisper remains the shipped default; native ears
-are the speech-only option that trades that leverage for latency and a
-process. Honest scope: speech-only (non-speech confabulates, §7); vision
+gated on the whole-span path.
+
+**Both lanes ship deliberately, because choosing an ear is choosing a
+point on a fusion spectrum.** The axis is how much of the system lives
+inside model weights. Moshi fuses everything — hearing, speaking,
+turn-taking — and is the fastest (~0.13 s, §5.8) and least governable:
+the backbone is frozen (§2). The whisper lane fuses nothing: between ear
+and brain sits an editable transcript, and the pipeline can gate,
+correct, or annotate what the model reads before it reads it. The native
+lane sits between whisper and Moshi: hearing fuses into the checkpoint
+(one fewer process, 0.46–0.54 s first audio), the brain stays a
+swappable text LLM — but the text gap where a cascade keeps its policy
+is closed. Each step toward fusion buys latency by surrendering exactly
+that surface, and what the surface is worth stops being abstract the
+moment the audio gets complicated. Speech over background music — a
+living-room default — needs three things, and all three live in the gap.
+*Endpointing* needs a mid-utterance content verdict ("the talker
+stopped; the sound continues"): the whisper lane has one — consecutive
+ASR passes over the open window returning zero words close the turn
+even as the music plays on (§3) — while the native lane's first content
+judgment is the model's reply itself, too late to gate a turn, and the
+cheap substitutes fail measurably (an energy VAD holds the turn open for
+the duration of the music; a DoA tracker promotes a loud phone speaker
+to a talker). *Awareness* needs a non-speech classifier: whisper's
+bracketed sound captions ([Music]) ride the turn close as real
+detections the model can truthfully report; the native encoder is
+speech-only by measurement and confabulates when prompted about
+non-speech (§7). *Improvement* needs training freedom: the whisper ear
+is a 74M-parameter model behind a text interface — finetunable for a
+designed tag vocabulary, noise robustness, or one room's acoustics with
+zero risk to the LLM — while the native ear's weights are fused into the
+multimodal checkpoint whose fragilities §7 catalogs. Add the 12B's
+vision-hearing exclusion (§7), and the shipping policy follows: whisper
+is the default lane; native ears are the speech-only, vision-free
+configuration that buys back most of the speech-native species' latency
+while keeping the swappable brain — and gives up the governable ear.
+Honest scope: speech-only (non-speech confabulates, §7); vision
 in the same session still degrades hearing (a checkpoint behavior — the
 engine delivers both modalities in one turn and needs no change when a
 fixed checkpoint lands); the chunk dial is validated on one clip so far.
@@ -617,9 +667,15 @@ Moshi on our A5000: **~0.13 s** TTFB warm. Our pipeline on the same card
 
 | model | first token | first clause | + piper | last word → first audio |
 |---|---:|---:|---:|---:|
-| 12B | 0.090 | 0.241 | 0.109 | **0.35 s** |
-| E4B | 0.065 | 0.132 | 0.108 | **0.24 s** |
+| 12B (Q4_K_M) | 0.090 | 0.241 | 0.109 | **0.35 s** |
+| E4B (Q4_K_M) | 0.065 | 0.132 | 0.108 | **0.24 s** |
 | E2B QAT | 0.121 | 0.29 | 0.193 | **0.48 s** |
+
+(Quantization era is per-row: this study predates the QAT default switch
+on the 12B/E4B tiers — §5.1 — while the E2B tier was already QAT. The
+switch sped up decode in absolute terms on every tier, so a QAT re-run —
+listed in §8 together with streaming TTS on both sides — could only
+tighten our side; the readings below do not depend on it.)
 
 Three readings. (1) The remaining 2–4× is *structural*: a speech-native
 model starts vocoding without waiting for a speakable text unit; the
@@ -794,7 +850,7 @@ axis — and why a 6,000-line runner can hold the design point at all.
 |---|---|---|
 | E2B / E4B, speech | Original release: confabulates — output tracks the *prompt*, not the audio (all four independent pipelines failed on the same clip, each differently). **QAT release: fixed** — verbatim ASR, isolated to the repaired audio-encoder export plus its fake-quant activation ranges (§5.5); verified on E4B and E2B QAT (the E2B verbatim through the chunked streaming path; a single long span truncates on the smaller model). | Native ears usable for speech (behind a switch); whisper remains the default lane. |
 | 12B, speech alone | Accurate ASR (JFK transcribed verbatim over the socket). | Usable — spoken words only. |
-| 12B, non-speech alone | Confabulates or denies; describes whatever instrument the prompt names. | Speech-only scope; music/ambient need an external tag. |
+| 12B, non-speech alone | Confabulates or denies; describes whatever instrument the prompt names. | Speech-only scope; music/ambient need an external tag — which the whisper lane supplies (its sound captions ride the turn close, §3). |
 | 12B, any vision in the session | Hearing disabled — all seven arrangements fail (audio before/after/interleaved, black frames, even an earlier turn); vision survives audio, so the exclusion is asymmetric and session-scoped. | Whisper is mandatory whenever a session may also see frames. |
 
 ## 8. Future work
@@ -805,8 +861,7 @@ unconditionally); integrate the streaming vocoder (§4.4) into the
 live-mic loop and re-measure the composed 0.65 s as one system;
 live-mic native ears (§5.5) — mic chunks as media frames aligned to a
 far-field front end's speech segments, and the chunk dial validated
-across speakers and boundary placements; E2B QAT native-audio
-verification;
+across speakers and boundary placements;
 the rigorous Moshi head-to-head (stream a recorded question, anchor the
 clock at its final word — §7); re-run the A5000 cross-silicon table with
 streaming TTS on both sides;
@@ -904,6 +959,14 @@ a good trade for most embodied products.
 [18] Cortexist. "little-gemma" (GitHub repository).
      https://github.com/cortexist/little-gemma
 
+[19] R. Roy, J. Raiman, S.-g. Lee, T.-D. Ene, R. Kirby, S. Kim, J. Kim,
+     B. Catanzaro. "PersonaPlex: Voice and Role Control for Full Duplex
+     Conversational Speech Models." arXiv:2602.06053, 2026.
+     https://arxiv.org/abs/2602.06053 — NVIDIA's release materials (model
+     card and project page) state the 7B model is powered by the Moshi
+     streaming architecture and the Mimi codec; the Moshi-lineage detail
+     is sourced there, in the style of [5].
+
 ---
 
 ## Appendix A: Reproducibility
@@ -973,7 +1036,8 @@ quantization levels by gate.
 - [ ] J/token re-measure post-2-row-kernel: the 2.29 vs 2.85 figure (§4.5,
       §5.7) predates the cheaper verify; direction can only improve, but the
       number should be re-taken before submission.
-- [ ] §5.8 cross-silicon table is Q4_K_M-era on our side (labeled in §5.1);
+- [ ] §5.8 cross-silicon 12B/E4B rows are Q4_K_M-era (now labeled per-row
+      in the table itself, with an era note; the E2B row was already QAT);
       re-run on QAT + streaming TTS both sides is already listed in §8.
 - [x] Related-work / intro citations filled (2026-07-06, References section
       added, refs [1]-[17]): hamming.ai (2 companion articles, exact P50/P90/
