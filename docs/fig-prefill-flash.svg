@@ -1,208 +1,131 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg width="1000" height="600" viewBox="0 0 1000 600" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;">
-    <path d="M994,20L994,580C994,587.727 987.727,594 980,594L20,594C12.273,594 6,587.727 6,580L6,20C6,12.273 12.273,6 20,6L980,6C987.727,6 994,12.273 994,20Z" style="fill:white;stroke:rgb(226,232,240);stroke-width:2px;"/>
-    <g transform="matrix(1,0,0,1,36,50)">
-        <g transform="matrix(25,0,0,25,40.307617,0)">
-        </g>
-        <g transform="matrix(25,0,0,25,48.632812,0)">
-        </g>
-        <g transform="matrix(25,0,0,25,76.416016,0)">
-        </g>
-        <g transform="matrix(25,0,0,25,84.741211,0)">
-        </g>
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:25px;fill:rgb(15,23,42);">Preﬁll ﬂash attention — where the 8× gap forms</text>
-    </g>
-    <g transform="matrix(0.979138,0,0,0.979138,35.999587,75.794957)">
-        <g transform="matrix(13.5,0,0,13.5,280.632568,0)">
-        </g>
-        <g transform="matrix(13.5,0,0,13.5,284.383301,0)">
-        </g>
-        <g transform="matrix(13.5,0,0,13.5,472.486816,0)">
-        </g>
-        <g transform="matrix(13.5,0,0,13.5,476.237549,0)">
-        </g>
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13.5px;fill:rgb(100,116,139);">A<tspan x="8.26px 12.01px " y="0px 0px "> c</tspan>hunk of query rows sweeps the K/V blocks (ﬂash / online softmax). <tspan x="419.199px 427.445px " y="0px 0px ">Th</tspan>e dataﬂow is identical on both stacks — the gap is entirely inside the per-block inner step.</text>
-    </g>
-    <path d="M336,110L336,482C336,487.519 331.519,492 326,492L46,492C40.481,492 36,487.519 36,482L36,110C36,104.481 40.481,100 46,100L326,100C331.519,100 336,104.481 336,110Z" style="fill:rgb(251,253,255);stroke:rgb(203,213,225);stroke-width:1.5px;"/>
-    <g transform="matrix(1,0,0,1,52,126)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12px;fill:rgb(100,116,139);">FLASH LOOP</text>
-    </g>
-    <g transform="matrix(1,0,0,1,52,143)">
-        <g transform="matrix(11,0,0,11,64.82373,0)">
-        </g>
-        <g transform="matrix(11,0,0,11,67.879883,0)">
-        </g>
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:11px;fill:rgb(148,163,184);">identical dataﬂow<tspan x="83.778px 86.834px " y="0px 0px ">, </tspan>both stacks</text>
-    </g>
-    <path d="M312,160L312,178C312,181.311 309.311,184 306,184L66,184C62.689,184 60,181.311 60,178L60,160C60,156.689 62.689,154 66,154L306,154C309.311,154 312,156.689 312,160Z" style="fill:rgb(240,253,244);stroke:rgb(22,163,74);stroke-width:1.6px;"/>
-    <g transform="matrix(1,0,0,1,186,174)">
-        <text x="-102.985px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(21,128,61);">IN: Q tile · B query rows + K/V blocks</text>
-    </g>
-    <g>
-        <path d="M186,184L186,200" style="fill:none;fill-rule:nonzero;"/>
-        <path d="M188.4,192.8L186,200L183.6,192.8L188.4,192.8Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-        <path d="M186,184L186,194.24" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.6px;"/>
-    </g>
-    <g transform="matrix(1,0,0,1,0,-2)">
-        <path d="M312,208L312,224C312,227.311 309.311,230 306,230L66,230C62.689,230 60,227.311 60,224L60,208C60,204.689 62.689,202 66,202L306,202C309.311,202 312,204.689 312,208Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
-    </g>
-    <g transform="matrix(1,0,0,1,186,220)">
-        <text x="-34.048px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">load K block</text>
-    </g>
-    <g transform="matrix(1,0,0,1.333333,0,-78.666667)">
-        <path d="M186,230L186,242" style="fill:none;fill-rule:nonzero;"/>
-        <g transform="matrix(1,-0,-0,0.75,-0,59)">
-            <path d="M188.828,235.515L186,244L183.172,235.515L188.828,235.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-            <path d="M186,228L186,237.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
-        </g>
-    </g>
-    <path d="M312,250L312,266C312,269.311 309.311,272 306,272L66,272C62.689,272 60,269.311 60,266L60,250C60,246.689 62.689,244 66,244L306,244C309.311,244 312,246.689 312,250Z" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.8px;"/>
-    <g transform="matrix(1,0,0,1,186,262)">
-        <text x="-87.271px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(180,83,9);">S = Q · Kᵀ   ·  tensor-core MMA</text>
-    </g>
-    <g transform="matrix(1,0,0,1.333333,0,-90.666667)">
-        <path d="M186,272L186,284" style="fill:none;fill-rule:nonzero;"/>
-        <g transform="matrix(1,-0,-0,0.75,-0,68)">
-            <path d="M188.828,279.515L186,288L183.172,279.515L188.828,279.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-            <path d="M186,272L186,281.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
-        </g>
-    </g>
-    <g transform="matrix(1,0,0,1,0,2)">
-        <path d="M312,292L312,308C312,311.311 309.311,314 306,314L66,314C62.689,314 60,311.311 60,308L60,292C60,288.689 62.689,286 66,286L306,286C309.311,286 312,288.689 312,292Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
-    </g>
-    <g transform="matrix(1,0,0,1,186,305)">
-        <text x="-82.675px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">online softmax → running m, l</text>
-    </g>
-    <g transform="matrix(1,0,0,1.166667,0,-51.333333)">
-        <path d="M186,314L186,326" style="fill:none;fill-rule:nonzero;"/>
-        <g transform="matrix(1,-0,-0,0.857143,-0,44)">
-            <path d="M188.608,321.177L186,329L183.392,321.177L188.608,321.177Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-            <path d="M186,315L186,322.742" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.74px;"/>
-        </g>
-    </g>
-    <g transform="matrix(1,0,0,1,0,1)">
-        <path d="M312,334L312,350C312,353.311 309.311,356 306,356L66,356C62.689,356 60,353.311 60,350L60,334C60,330.689 62.689,328 66,328L306,328C309.311,328 312,330.689 312,334Z" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
-    </g>
-    <g transform="matrix(1,0,0,1,186,347)">
-        <text x="-34.048px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">load V block</text>
-    </g>
-    <g transform="matrix(1,0,0,1.333333,0,-117.666667)">
-        <path d="M186,356L186,368" style="fill:none;fill-rule:nonzero;"/>
-        <g transform="matrix(1,-0,-0,0.75,-0,88.25)">
-            <path d="M188.828,364.515L186,373L183.172,364.515L188.828,364.515Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-            <path d="M186,357L186,366.212" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.89px;"/>
-        </g>
-    </g>
-    <g transform="matrix(1,0,0,1,0,3)">
-        <path d="M312,376L312,392C312,395.311 309.311,398 306,398L66,398C62.689,398 60,395.311 60,392L60,376C60,372.689 62.689,370 66,370L306,370C309.311,370 312,372.689 312,376Z" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.8px;"/>
-    </g>
-    <g transform="matrix(1,0,0,1,186,391)">
-        <text x="-88.104px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(180,83,9);">O += P<tspan x="-48.724px -45.251px " y="0px 0px "> ·</tspan> V   ·  tensor-core MMA</text>
-    </g>
-    <g transform="matrix(1,0,0,1.029762,0,-8.428571)">
-        <g transform="matrix(1,-0,-0,0.971098,-0,8.184971)">
-            <path d="M314.435,220.675L312,214L317.953,217.879L314.435,220.675Z" style="fill:rgb(148,163,184);"/>
-            <path d="M312,387C388.542,324.255 330.504,238.127 315.355,218.222" style="fill:none;stroke:rgb(148,163,184);stroke-width:1.5px;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:1.5;"/>
-        </g>
-    </g>
-    <g transform="matrix(-0,1,-1,-0,322,300)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:10.5px;fill:rgb(148,163,184);">next K/V block</text>
-    </g>
-    <g transform="matrix(1,0,0,1,0,2)">
-        <path d="M186,398L186,416" style="fill:none;fill-rule:nonzero;"/>
-        <g transform="matrix(1,-0,-0,1,0,-2)">
-            <path d="M188.4,410.8L186,418L183.6,410.8L188.4,410.8Z" style="fill:rgb(148,163,184);fill-rule:nonzero;"/>
-            <path d="M186,400L186,412.24" style="fill:none;fill-rule:nonzero;stroke:rgb(148,163,184);stroke-width:1.6px;"/>
-        </g>
-    </g>
-    <path d="M312,424L312,442C312,445.311 309.311,448 306,448L66,448C62.689,448 60,445.311 60,442L60,424C60,420.689 62.689,418 66,418L306,418C309.311,418 312,420.689 312,424Z" style="fill:rgb(239,246,255);stroke:rgb(37,99,235);stroke-width:1.6px;"/>
-    <g transform="matrix(1,0,0,1,186,438)">
-        <text x="-108.032px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(30,64,175);">after last block: normalize O → attn out</text>
-    </g>
-    <g transform="matrix(1,0,0,1,186,474)">
-        <text x="-111.579px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:11px;fill:rgb(148,163,184);">the two MMA<tspan x="-48.001px -44.945px " y="0px 0px "> s</tspan>teps (amber) are the hot path ↓</text>
-    </g>
-    <g transform="matrix(1.090909,0,0,1,-34.909091,0)">
-        <g transform="matrix(0.916667,-0,-0,1,32,-0)">
-            <path d="M375.12,149.009L384,150L376.302,154.535L375.12,149.009Z" style="fill:rgb(124,58,237);fill-rule:nonzero;"/>
-            <path d="M312,258C346.58,258 348.921,164.125 377.369,151.417" style="fill:none;fill-rule:nonzero;stroke:rgb(124,58,237);stroke-width:1.88px;stroke-dasharray:5.232,4.186;"/>
-        </g>
-    </g>
-    <g transform="matrix(0.848048,-0.529919,0.529919,0.848048,347.563515,200.713787)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:11px;fill:rgb(124,58,237);">zoom in</text>
-    </g>
-    <g transform="matrix(1,0,0,1,384,120)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12px;fill:rgb(100,116,139);">THE HOT STEP<tspan x="87.123px 90.457px " y="0px 0px ">  </tspan>(load fragments + MMA),  TWO W<tspan x="282.123px 289.688px 297.691px " y="0px 0px 0px ">AYS</tspan></text>
-    </g>
-    <path d="M962,141L962,235C962,239.967 957.967,244 953,244L393,244C388.033,244 384,239.967 384,235L384,141C384,136.033 388.033,132 393,132L953,132C957.967,132 962,136.033 962,141Z" style="fill:rgb(239,246,255);stroke:rgb(37,99,235);stroke-width:1.8px;"/>
-    <g transform="matrix(1,0,0,1,404,157)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:15px;fill:rgb(29,78,216);">little-gemma</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,181)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  manual LDS reads of the <tspan x="152.38px 160.028px 163.501px " y="0px 0px 0px ">A /</tspan> B fragments from shared memory</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,201)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  global K / V loads, not pipelined  ·  one query-head per CT<tspan x="332.812px " y="0px ">A</tspan></text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,228)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(220,38,38);">→ stalls on shared-memory reads — at 8 SMs there are no spare warps to hide it</text>
-    </g>
-    <path d="M962,265L962,359C962,363.967 957.967,368 953,368L393,368C388.033,368 384,363.967 384,359L384,265C384,260.033 388.033,256 393,256L953,256C957.967,256 962,260.033 962,265Z" style="fill:rgb(255,247,237);stroke:rgb(234,88,12);stroke-width:1.8px;"/>
-    <g transform="matrix(1,0,0,1,404,281)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:15px;fill:rgb(194,65,12);">llama.cpp</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,305)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  cp.async: global → shared loads, software-pipelined (overlapped)</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,325)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(51,65,85);">•  ldmatrix.x4: ¼ the fragment-load instructions  ·  GQA<tspan x="302.411px 305.884px " y="0px 0px "> p</tspan>ack: 2 heads / CT<tspan x="409.869px " y="0px ">A</tspan></text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,352)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(22,163,74);">→ latency hidden, instruction-lean</text>
-    </g>
-    <circle cx="895" cy="312" r="34" style="fill:rgb(254,242,242);stroke:rgb(220,38,38);stroke-width:2px;"/>
-    <g transform="matrix(1,0,0,1,895,308)">
-        <text x="-11.401px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:20px;fill:rgb(220,38,38);">8×</text>
-    </g>
-    <g transform="matrix(1,0,0,1,895,326)">
-        <text x="-18.259px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:9px;fill:rgb(185,28,28);">per block</text>
-    </g>
-    <path d="M962,401L962,467C962,471.967 957.967,476 953,476L393,476C388.033,476 384,471.967 384,467L384,401C384,396.033 388.033,392 393,392L953,392C957.967,392 962,396.033 962,401Z" style="fill:rgb(248,250,252);stroke:rgb(226,232,240);stroke-width:1px;"/>
-    <g transform="matrix(1,0,0,1,404,418)">
-        <g transform="matrix(13,0,0,13,140.175293,0)">
-        </g>
-        <g transform="matrix(13,0,0,13,144.504395,0)">
-        </g>
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:13px;fill:rgb(51,65,85);">Same math, same dataﬂow — the gap is instruction economy in this one step.</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,441)">
-        <g transform="matrix(12.5,0,0,12.5,19.451904,0)">
-        </g>
-        <g transform="matrix(12.5,0,0,12.5,22.924805,0)">
-        </g>
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">Preﬁll attention:</text>
-        <text x="89.63px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.67 s</text>
-        <text x="127.856px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(ours) vs</text>
-        <text x="179.944px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.08 s</text>
-        <text x="218.17px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(llama) per 929-token 12B pass on the Orin</text>
-    </g>
-    <g transform="matrix(1,0,0,1,404,461)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">— ~</text>
-        <text x="23.273px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">40%</text>
-        <g transform="matrix(12.5,0,0,12.5,168.859863,0)">
-        </g>
-        <g transform="matrix(12.5,0,0,12.5,172.332764,0)">
-        </g>
-        <text x="51.764px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(71,85,105);">of the whole 0.8× preﬁll gap, and the single biggest slice.</text>
-    </g>
-    <g transform="matrix(1,0,0,1,36,522)">
-        <text x="0px" y="0px" style="font-family:'Arial-BoldMT', 'Arial', sans-serif;font-weight:700;font-size:13px;fill:rgb(51,65,85);">Why we can&apos;t just copy it:</text>
-        <text x="161.999px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13px;fill:rgb(51,65,85);">the 8× isn&apos;t a parameter — it&apos;s how their warps interleave shared-memory reads to hide within-wave latency (codegen).</text>
-    </g>
-    <g transform="matrix(1,0,0,1,36,544)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:13px;fill:rgb(51,65,85);">Matching it means adopting ~1,500 lines of their kernel wholesale — at which point it stops being a teachable, dependency-free runner<tspan x="772.897px 776.509px " y="0px 0px ">. </tspan>So 0.8× is a deliberate trade.</text>
-    </g>
-    <g transform="matrix(1,0,0,1,36,566)">
-        <text x="0px" y="0px" style="font-family:'ArialMT', 'Arial', sans-serif;font-size:12.5px;fill:rgb(100,116,139);">(W<tspan x="15.735px 22.687px " y="0px 0px ">e </tspan>took the one graftable slice — GQA<tspan x="222.101px 225.574px " y="0px 0px "> h</tspan>ead-packing, +1.7%. <tspan x="350.085px 357.721px " y="0px 0px ">Th</tspan>e rest is structural: barrier cadence + softmax serialization.)</text>
-    </g>
+<svg width="1060" height="860" viewBox="0 0 1060 860" version="1.1" xmlns="http://www.w3.org/2000/svg" xml:space="preserve">
+    <path d="M1054,20L1054,840C1054,847.727 1047.727,854 1040,854L20,854C12.273,854 6,847.727 6,840L6,20C6,12.273 12.273,6 20,6L1040,6C1047.727,6 1054,12.273 1054,20Z" style="fill:white;stroke:rgb(226,232,240);stroke-width:2px;"/>
+
+    <text x="36" y="46" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:24px;fill:rgb(15,23,42);">Prefill flash attention — inside the hot step, where the 8× forms</text>
+    <text x="36" y="72" style="font-family:'ArialMT','Arial',sans-serif;font-size:13px;fill:rgb(100,116,139);">Identical flash dataflow on both stacks: sweep K/V blocks — S = Q·Kᵀ → online softmax → O += P·V. Below: what one block actually costs, substep by substep.</text>
+
+    <!-- header row -->
+    <rect x="44" y="92" width="148" height="34" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="108" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:11px;fill:rgb(100,116,139);">FLASH LOOP</text>
+    <text x="56" y="120" style="font-family:'ArialMT','Arial',sans-serif;font-size:9.5px;fill:rgb(148,163,184);">32-key block, both stacks</text>
+    <rect x="202" y="92" width="416" height="34" rx="5" style="fill:rgb(239,246,255);stroke:rgb(37,99,235);stroke-width:1.8px;"/>
+    <text x="214" y="114" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:14px;fill:rgb(29,78,216);">little-gemma — 0.67 s attention / pass</text>
+    <rect x="628" y="92" width="396" height="34" rx="5" style="fill:rgb(255,247,237);stroke:rgb(234,88,12);stroke-width:1.8px;"/>
+    <text x="640" y="114" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:14px;fill:rgb(194,65,12);">llama.cpp — 0.08 s attention / pass</text>
+
+    <!-- row 1: K block arrives -->
+    <rect x="44" y="134" width="148" height="60" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="158" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(51,65,85);">K block arrives</text>
+    <rect x="202" y="134" width="416" height="60" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="155" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">nothing in flight — K fragments are fetched from the KV ring on</text>
+    <text x="214" y="170" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">demand, inside the MMA loop; the first MMAs of every block eat</text>
+    <text x="214" y="185" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">the full DRAM latency</text>
+    <rect x="628" y="134" width="396" height="60" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="155" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">already in shared — cp.async copied this block's K and V during</text>
+    <text x="640" y="170" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">the previous block's P·V (double-buffered); the tensor cores</text>
+    <text x="640" y="185" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">never wait for it</text>
+
+    <!-- row 2: S = Q.Kt MMA -->
+    <rect x="44" y="202" width="148" height="60" rx="5" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.6px;"/>
+    <text x="56" y="228" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(180,83,9);">S = Q·Kᵀ</text>
+    <text x="56" y="243" style="font-family:'ArialMT','Arial',sans-serif;font-size:10.5px;fill:rgb(180,83,9);">tensor-core MMA</text>
+    <rect x="202" y="202" width="416" height="60" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="223" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">hand-issued fragment loads: 4 shared reads (Q) + 2 global reads</text>
+    <text x="214" y="238" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">(K) per MMA ≈ 5 memory instructions each; a warp computes one</text>
+    <text x="214" y="253" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">q-tile × k-tile of S</text>
+    <rect x="628" y="202" width="396" height="60" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="223" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">ldmatrix.x4 from the shared tiles: ONE instruction delivers 4</text>
+    <text x="640" y="238" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">fragments — ~4× fewer fragment instructions for the same MMAs</text>
+
+    <!-- row 3: S hand-off -->
+    <rect x="44" y="270" width="148" height="60" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="296" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(51,65,85);">S hand-off</text>
+    <text x="56" y="311" style="font-family:'ArialMT','Arial',sans-serif;font-size:10.5px;fill:rgb(148,163,184);">MMA → softmax</text>
+    <rect x="202" y="270" width="416" height="60" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="291" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">S (f32) is spilled to shared, then BARRIER — the warp that</text>
+    <text x="214" y="306" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">computed a k-tile of S is not the warp that owns those rows</text>
+    <text x="214" y="321" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">for the softmax</text>
+    <rect x="628" y="270" width="396" height="60" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="291" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">none: S stays in the MMA C-fragments, in registers; each warp</text>
+    <text x="640" y="306" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">owns its query columns end-to-end</text>
+
+    <!-- row 4: online softmax -->
+    <rect x="44" y="338" width="148" height="74" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="370" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(51,65,85);">online softmax</text>
+    <text x="56" y="385" style="font-family:'ArialMT','Arial',sans-serif;font-size:10.5px;fill:rgb(148,163,184);">running m, l</text>
+    <rect x="202" y="338" width="416" height="74" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="359" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">warp-SERIAL: each warp walks its 8 rows one at a time — masked</text>
+    <text x="214" y="374" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">read from shared, 5-shuffle max tree, expf, 5-shuffle sum tree —</text>
+    <text x="214" y="389" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">tensor cores idle throughout; P (f16) is written back to shared,</text>
+    <text x="214" y="404" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">then BARRIER</text>
+    <rect x="628" y="338" width="396" height="74" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="359" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">in-register: expf runs directly on the C-tile accumulators,</text>
+    <text x="640" y="374" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">max/sum take a few column shuffles, and the O-accumulator</text>
+    <text x="640" y="389" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">rescale also stays in registers — no shared write, no barrier</text>
+
+    <!-- row 5: V block arrives -->
+    <rect x="44" y="420" width="148" height="60" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="444" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(51,65,85);">V block arrives</text>
+    <rect x="202" y="420" width="416" height="60" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="441" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">no stage (falsified twice): V fragments are built from global</text>
+    <text x="214" y="456" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">SINGLE-HALF strided loads — V is consumed key-major (stride</text>
+    <text x="214" y="471" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">kv_dim), so there is no adjacent pair to load together</text>
+    <rect x="628" y="420" width="396" height="60" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="441" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">same cp.async-staged tile as K; a Vᵀ fragment is ONE</text>
+    <text x="640" y="456" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">ldmatrix_trans — the transpose comes free inside the load</text>
+
+    <!-- row 6: O += P.V MMA -->
+    <rect x="44" y="488" width="148" height="74" rx="5" style="fill:rgb(255,247,237);stroke:rgb(245,158,11);stroke-width:1.6px;"/>
+    <text x="56" y="520" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(180,83,9);">O += P·V</text>
+    <text x="56" y="535" style="font-family:'ArialMT','Arial',sans-serif;font-size:10.5px;fill:rgb(180,83,9);">tensor-core MMA</text>
+    <rect x="202" y="488" width="416" height="74" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="509" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">per fragment: 4 shared reads bring P back (the round-trip's</text>
+    <text x="214" y="524" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">return leg) + 4 single-half global reads build V — the mio</text>
+    <text x="214" y="539" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">instruction-count wall (mio_throttle ~5 on both devices)</text>
+    <rect x="628" y="488" width="396" height="74" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="509" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">P is already the B-fragment — a register re-type, zero memory</text>
+    <text x="640" y="524" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">instructions (B[k] = get_half2(KQ_C[k])); V costs one</text>
+    <text x="640" y="539" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">ldmatrix_trans per fragment</text>
+
+    <!-- row 7: end of block -->
+    <rect x="44" y="570" width="148" height="60" rx="5" style="fill:rgb(248,250,252);stroke:rgb(203,213,225);stroke-width:1px;"/>
+    <text x="56" y="594" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(51,65,85);">end of block</text>
+    <rect x="202" y="570" width="416" height="60" rx="5" style="fill:rgb(251,253,255);stroke:rgb(191,219,254);stroke-width:1.2px;"/>
+    <text x="214" y="591" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">BARRIER, then back to the top — only now may the next K block</text>
+    <text x="214" y="606" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">be touched; nothing was in flight during any of the steps above</text>
+    <rect x="628" y="570" width="396" height="60" rx="5" style="fill:rgb(255,252,246);stroke:rgb(254,215,170);stroke-width:1.2px;"/>
+    <text x="640" y="591" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">the next K block has been streaming in since the P·V began;</text>
+    <text x="640" y="606" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(51,65,85);">the block-end barrier is a buffer swap, hidden by the pipeline</text>
+
+    <!-- loop-back arrow, next block -->
+    <path d="M44,600 L32,600 L32,164 L36,164" style="fill:none;stroke:rgb(148,163,184);stroke-width:1.5px;"/>
+    <path d="M44,164 L36,160 L36,168 Z" style="fill:rgb(148,163,184);"/>
+    <text transform="matrix(0,-1,1,0,26,436)" style="font-family:'ArialMT','Arial',sans-serif;font-size:10.5px;fill:rgb(148,163,184);">next K/V block</text>
+
+    <!-- verdict strip -->
+    <rect x="36" y="642" width="988" height="64" rx="6" style="fill:rgb(248,250,252);stroke:rgb(226,232,240);stroke-width:1px;"/>
+    <text x="52" y="663" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:13px;fill:rgb(51,65,85);">Same MMA FLOPs on both sides — the 8× is the choreography around the MMAs, not the math.</text>
+    <text x="52" y="681" style="font-family:'ArialMT','Arial',sans-serif;font-size:12px;fill:rgb(71,85,105);">Ours re-maps warp→data three times per block (k-tiles for S → rows for softmax → hd-slices for PV); every re-map is a shared round-trip + a barrier.</text>
+    <text x="52" y="699" style="font-family:'ArialMT','Arial',sans-serif;font-size:12px;fill:rgb(71,85,105);">llama keeps one mapping — a warp owns its query columns throughout — so the score matrix never leaves registers and every load flies under the MMAs.</text>
+    <circle cx="984" cy="674" r="26" style="fill:rgb(254,242,242);stroke:rgb(220,38,38);stroke-width:2px;"/>
+    <text x="984" y="672" text-anchor="middle" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:18px;fill:rgb(220,38,38);">8×</text>
+    <text x="984" y="686" text-anchor="middle" style="font-family:'ArialMT','Arial',sans-serif;font-size:8.5px;fill:rgb(185,28,28);">per pass</text>
+
+    <!-- amber footnote: the two MMAs fail differently -->
+    <rect x="36" y="716" width="988" height="62" rx="6" style="fill:rgb(255,251,240);stroke:rgb(245,158,11);stroke-width:1.6px;"/>
+    <text x="52" y="737" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12px;fill:rgb(180,83,9);">Are S = Q·Kᵀ and O += P·V failing the same way? No.</text>
+    <text x="396" y="737" style="font-family:'ArialMT','Arial',sans-serif;font-size:12px;fill:rgb(120,86,40);">Q·Kᵀ stalled on LATENCY — long_scoreboard 11.5 cyc/instr on the f32→f16 pack over per-fragment</text>
+    <text x="52" y="754" style="font-family:'ArialMT','Arial',sans-serif;font-size:12px;fill:rgb(120,86,40);">global K loads — cured by K-staging (954 → 856 µs), then removed outright by the f16 rings. O += P·V is walled on memory-INSTRUCTION COUNT (mio_throttle ~5):</text>
+    <text x="52" y="771" style="font-family:'ArialMT','Arial',sans-serif;font-size:12px;fill:rgb(120,86,40);">staging falsified twice (an LDS replaces an LDG one-for-one; mio counts both), pipelining exactly neutral; only GQA packing — fewer instructions — paid.</text>
+
+    <!-- bottom stats + trade -->
+    <text x="36" y="800" style="font-family:'ArialMT','Arial',sans-serif;font-size:12.5px;fill:rgb(71,85,105);">Prefill attention:</text>
+    <text x="125.6" y="800" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.67 s</text>
+    <text x="163.9" y="800" style="font-family:'ArialMT','Arial',sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(ours) vs</text>
+    <text x="215.9" y="800" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12.5px;fill:rgb(15,23,42);">0.08 s</text>
+    <text x="254.2" y="800" style="font-family:'ArialMT','Arial',sans-serif;font-size:12.5px;fill:rgb(71,85,105);">(llama) per 929-token 12B pass on the Orin — ~40% of the whole 0.8× prefill gap, the single biggest slice.</text>
+    <text x="36" y="820" style="font-family:'Arial-BoldMT','Arial',sans-serif;font-weight:700;font-size:12.5px;fill:rgb(51,65,85);">Why we can't just copy it:</text>
+    <text x="204" y="820" style="font-family:'ArialMT','Arial',sans-serif;font-size:12.5px;fill:rgb(51,65,85);">it is their whole register/pipeline architecture — matching it means adopting their kernels wholesale; 0.8× is a priced trade.</text>
+    <text x="36" y="840" style="font-family:'ArialMT','Arial',sans-serif;font-size:11.5px;fill:rgb(100,116,139);">(GQA head-packing was the one graftable slice, +1.7%; both columns pack 2 query heads per KV group. Sources: nsys/ncu, 2026-07 — prefill-performance-journal.md.)</text>
 </svg>

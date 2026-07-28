@@ -42,9 +42,17 @@ pdfkeywords={voice assistants, edge computing, streaming ASR, speculative decodi
 \maketitle
 
 \begin{abstract}
-A voice assistant is fluent when its reply begins within the human turn-taking window --- first audio in well under a second --- and cohesive when the thing replying is a full large language model rather than an intent router. Production voice AI today gets one or the other: datacenter cascades median 1.4--1.7 s to first audio \citep{sharma2026latency,hamming2026metrics}, and the systems that beat the window do it with purpose-trained speech-to-speech models (Moshi \citep{defossez2024moshi}) that give up the text LLM's generality. We show both are achievable at the same time, entirely on a 20 W, credit-card-sized edge board, using unmodified state-of-the-art open-weight models.
+A voice assistant is fluent when the reply begins inside the human turn-taking window (first audio well under a second), and cohesive when a full large language model produces the reply rather than an intent router. Production systems today usually get one property or the other: datacenter ASR→LLM→TTS cascades median 1.4–1.7 s to first audio, while purpose-trained speech-to-speech models such as Moshi beat that window but forfeit the generality of a text LLM. We show both are achievable at once, entirely on a 20 W, credit-card-sized edge board, using unmodified state-of-the-art open-weight models.
 
-Our pipeline --- streaming ASR (whisper.cpp), a Gemma 4 model (2B--12B) on a purpose-built $\sim$6,000-line C/CUDA runner, and a VITS TTS (piper) --- reaches 0.65 s from end of speech to first audio on a Jetson Orin NX 16GB responding to a 30-second spoken instruction, with the entire stack holding 4.2 GB of unreclaimable memory (it fits an 8 GB Jetson Nano) and peaking near 20 W. Four techniques carry the result, none of which modify the models: (1) prefill under speech --- streaming ASR commits prefill into the open turn while the user is still speaking, backed by a proof that space-boundary splits are exact for SentencePiece, cutting post-speech TTFT from 5.1 s to 0.53 s on the 12B; (2) the LLM as clause splitter --- a system prompt that makes the model create TTS flush points, motivated by the measured finding that the baseline model emits 21-word sentences with zero commas, leaving a clause-flushing TTS layer nothing to flush; (3) a streaming vocoder from stock TTS voices --- ONNX graph surgery splits piper's monolithic VITS at the latent boundary so the HiFi-GAN decoder (finite receptive field) runs in overlapped chunks, making first PCM O(1) in clause length (0.10 s vs 0.27--0.49 s), sample-exact against the monolithic decode; (4) multi-token-prediction speculative decoding characterized honestly as content-dependent (1.4--2.3×, ahead of llama-server's own speculative path at every content type measured) and as a battery feature (2.29 vs 2.85 J/token). When Google's QAT releases repaired the family's native audio encoder mid-project, the same engine --- unchanged --- streamed the model's own ears to 0.46 s first audio (E2B; 0.54 s on the E4B), whisper becoming one of two interchangeable ear configurations rather than a hard dependency. A cross-silicon study against Moshi on an RTX A5000 finds the remaining gap to speech-native models is structural (one decoded clause + one vocoder call, $\sim$0.2 s) --- and that the datacenter GPU buys only 1.7× over the 20 W board, because in the conversational regime the pipeline is floor-bound, not compute-bound.
+Our pipeline pairs streaming speech recognition (whisper.cpp) with a Gemma 4 model (2B–12B) on a purpose-built 6,000-line C/CUDA runner and the piper speech synthesizer — reaches 0.65 s from end of speech to first audio on a Jetson Orin NX 16GB for a 30-second spoken instruction. The full stack holds 4.2 GB of unreclaimable memory (it fits an 8 GB Jetson Nano) and peaks near 20 W.
+
+Four techniques carry the result, none of which modify the models: 
+(1) prefill under speech, so most of the prompt is already processed when the user finishes; 
+(2)  The model as its own clause splitter, creating early TTS flush points that stock models otherwise omit; 
+(3) a streaming vocoder obtained by piper's graph surgery on stock piper voices, so first audio is constant-time in clause length; and 
+(4) multi-token prediction speculative decoding, characterized as content-dependent for latency and beneficial for energy. 
+
+With the family’s repaired native audio encoder, the same engine reaches 0.46–0.54 s first audio without whisper as a hard dependency. A cross-silicon comparison against Moshi shows that the remaining gap to speech-native models is structural (~0.2 s for one clause plus one vocoder call), and that a datacenter GPU buys only ~1.7× over the 20 W board: in the conversational regime the pipeline is floor-bound, not compute-bound.
 \end{abstract}
 
 \keywords{voice assistants \and edge computing \and streaming ASR \and speculative decoding \and text-to-speech \and large language models}
@@ -87,14 +95,14 @@ Contributions:
 
 \section{System}
 
-Hardware: Jetson Orin NX 16GB module (Ampere iGPU, shared LPDDR5), NVMe SSD, JetPack 6.2.1, headless. Rationale: the NX is the robotics operating point --- credit-card footprint, 10--25 W envelope (40 W MAXN available), $\sim$\$600-class as a bare module (1KU pricing) or $\sim$\$900-class as a complete carrier-board dev kit \citep{arrow2026orin}. The AGX buys performance with a power/cost step that changes the product class; the Nano 8GB cannot hold the 12B tier (Section \ref{sec:memory} qualifies what it \textit{can} hold).
-
 \begin{figure}[H]
 	\centering
 	\includegraphics[width=0.9\linewidth]{orin-nx.png}
 	\caption{The system under test. Every edge number in Section \ref{sec:eval} was measured on this board --- a Jetson Orin NX 16GB on its carrier board (fan attached), 355 mL can for scale. The compute module itself is 69.6 × 45 mm, smaller than a credit card; this is the entire machine that answers 0.65 s after end of speech.}
 	\label{fig:orin-nx}
 \end{figure}
+
+Hardware: Jetson Orin NX 16GB module (Ampere iGPU, shared LPDDR5), NVMe SSD, JetPack 6.2.1, headless. Rationale: the NX is the robotics operating point --- credit-card footprint, 10--25 W envelope (40 W MAXN available), $\sim$\$600-class as a bare module (1KU pricing) or $\sim$\$900-class as a complete carrier-board dev kit \citep{arrow2026orin}. The AGX buys performance with a power/cost step that changes the product class; the Nano 8GB cannot hold the 12B tier (Section \ref{sec:memory} qualifies what it \textit{can} hold).
 
 Three processes, one GPU owner:
 
@@ -284,7 +292,6 @@ Table~\ref{tab:three-tiers-exp} intentionally uses the hard case---a
 substantially lower: the E4B whisper lane reaches first audio in
 $\approx$0.8\,s end-to-end once the Whisper pass is included
 ($0.34$\,s TTFS + $\approx0.10$\,s vocoder).
-
 \begin{figure}[H]
 	\centering
 	\includegraphics[width=0.9\linewidth]{fig-tiers-vs-industry.png}
@@ -454,6 +461,10 @@ The cleanest ablation of our techniques is another cascade with everything else 
 
 The remaining difference is precisely the paper's contribution list run in reverse: their chain is serial after end of speech --- a full ASR pass, a full prompt prefill, the first sentence's decode, and a whole-first-sentence VITS synthesis (their default even batches THREE sentences before the first TTS call; changing that one number is the 1.6 $\rightarrow$ 0.9 difference). Their first-audio latency therefore scales with reply length, where ours is $\sim$O(1) after Section \ref{sec:prefill}--\ref{sec:vocoder}. VAD hang time is not the story on either side (their silence threshold is 64 ms).
 
+Two qualifications, both in their favor and against. Their flagship TTS backends (Qwen3-TTS via CUDA-graph codec decoding, Kyutai's Pocket) do stream natively --- the whole-sentence behavior we measured is their CPU-viable tier --- but the streaming tier is a different model architecture wanting a GPU, not a retrofit onto stock voices like Section \ref{sec:vocoder}. And their measured 0.9 s carried an artificially light ASR leg: the VAD only captured $\sim$0.9 s fragments of our synthetic-voice question. On long input the comparison collapses entirely: a 31.8 s natural spoken question is segmented at breath pauses and answered INTO the user's ongoing speech (first audio 25--28 s before end of speech), and even with perfect segmentation the post-speech chain scales with utterance length (their ASR leg alone measures 3.9 s for 31.8 s of audio on this CPU) --- where prefill-under-speech holds ours at 0.65 s regardless (Section \ref{sec:prefill}'s 929-token case is the measured proof).
+
+Figure \ref{fig:ttfb-vs-length} makes the divergence explicit. We swept six spoken questions of increasing length (3.8--32 s, synthesized and measured on the same board) and clocked each leg. Our prefill term is flat --- and, at these lengths, nearly free in either placement: streamed ttft stays at 0.09--0.12 s across the range, and even a deferred one-shot prefill of the 90-word question costs 0.20 s. Natural speech arrives at $\sim$3 tokens/s against a prefill rate of $\sim$800 (E2B); anything a user can say in a turn is cheap to prefill. What the open turn hides at conversational lengths is therefore the ASR pass, not the prefill --- prefill hiding earns its keep at dictation lengths and on the slower 12B tier (Section \ref{sec:prefill}). The HuggingFace floor is not a line we could measure end-to-end --- its VAD replies into our synthetic speech past $\sim$15 s --- so we compose its best case: the measured faster-whisper base-int8 ASR pass (1.20 s at 3.8 s of audio, rising to 3.52 s at 32 s) plus a 0.45 s downstream constant (prefill, first-sentence decode, first MMS-TTS call) anchored to their measured 0.9 s tuned point. Even granting perfect segmentation, the floor rises from $\sim$1.6 s at a 5 s prompt to $\sim$3.9 s at 30 s. The gap the reader sees is the ASR placement: run serially after end of speech it scales with the utterance; committed during speech it costs one final pass, a constant. Everything else --- the LLM prefill, the first speakable unit's decode, the vocoder --- is constant in prompt length on both sides; the size of those constants (clause-first flushing, the streaming vocoder) is Section \ref{sec:clause}--\ref{sec:vocoder}'s fight, already settled in Figure \ref{fig:first-audio-anatomy}.
+
 \begin{figure}[H]
 	\centering
 	\includegraphics[width=0.9\linewidth]{fig-ttfb-vs-length.png}
@@ -461,13 +472,7 @@ The remaining difference is precisely the paper's contribution list run in rever
 	\label{fig:ttfb-vs-length}
 \end{figure}
 
-Two qualifications, both in their favor and against. Their flagship TTS backends (Qwen3-TTS via CUDA-graph codec decoding, Kyutai's Pocket) do stream natively --- the whole-sentence behavior we measured is their CPU-viable tier --- but the streaming tier is a different model architecture wanting a GPU, not a retrofit onto stock voices like Section \ref{sec:vocoder}. And their measured 0.9 s carried an artificially light ASR leg: the VAD only captured $\sim$0.9 s fragments of our synthetic-voice question. On long input the comparison collapses entirely: a 31.8 s natural spoken question is segmented at breath pauses and answered INTO the user's ongoing speech (first audio 25--28 s before end of speech), and even with perfect segmentation the post-speech chain scales with utterance length (their ASR leg alone measures 3.9 s for 31.8 s of audio on this CPU) --- where prefill-under-speech holds ours at 0.65 s regardless (Section \ref{sec:prefill}'s 929-token case is the measured proof).
-
-Figure \ref{fig:ttfb-vs-length} makes the divergence explicit. We swept six spoken questions of increasing length (3.8--32 s, synthesized and measured on the same board) and clocked each leg. Our prefill term is flat --- and, at these lengths, nearly free in either placement: streamed ttft stays at 0.09--0.12 s across the range, and even a deferred one-shot prefill of the 90-word question costs 0.20 s. Natural speech arrives at $\sim$3 tokens/s against a prefill rate of $\sim$800 (E2B); anything a user can say in a turn is cheap to prefill. What the open turn hides at conversational lengths is therefore the ASR pass, not the prefill --- prefill hiding earns its keep at dictation lengths and on the slower 12B tier (Section \ref{sec:prefill}). The HuggingFace floor is not a line we could measure end-to-end --- its VAD replies into our synthetic speech past $\sim$15 s --- so we compose its best case: the measured faster-whisper base-int8 ASR pass (1.20 s at 3.8 s of audio, rising to 3.52 s at 32 s) plus a 0.45 s downstream constant (prefill, first-sentence decode, first MMS-TTS call) anchored to their measured 0.9 s tuned point. Even granting perfect segmentation, the floor rises from $\sim$1.6 s at a 5 s prompt to $\sim$3.9 s at 30 s. The gap the reader sees is the ASR placement: run serially after end of speech it scales with the utterance; committed during speech it costs one final pass, a constant. Everything else --- the LLM prefill, the first speakable unit's decode, the vocoder --- is constant in prompt length on both sides; the size of those constants (clause-first flushing, the streaming vocoder) is Section \ref{sec:clause}--\ref{sec:vocoder}'s fight, already settled in Figure \ref{fig:first-audio-anatomy}.
-
 \subsection{Session aging: does it hold as the context fills?}
-
-A fair question the single-turn numbers do not answer: does responsiveness decay over a long conversation as the 8K window fills? We measured it directly --- one persistent E2B QAT session on the Orin (plain serve, no MTP, pinned clocks, SoC otherwise idle), driven turn after turn with fixed $\sim$178-token turns until the server reported the context full, which happened after 42 turns ($\sim$7,475 tokens).
 
 \begin{figure}[H]
 	\centering
@@ -475,6 +480,8 @@ A fair question the single-turn numbers do not answer: does responsiveness decay
 	\caption{TTFT and first audio (measured TTFS + the streaming vocoder's 0.10 s first-PCM constant, Section \ref{sec:vocoder}) as one conversation fills the window. Both rise gently and slightly sub-linearly --- TTFT 0.25 $\rightarrow$ 0.45 s, first audio 0.49 $\rightarrow$ 0.75 s --- and both stay inside the conversational band for the entire session. Plain decode slows 39.6 $\rightarrow$ 28.6 tok/s (attention over the growing KV), still far above the $\sim$3 tok/s real-time-listening floor (Section \ref{sec:discussion}).}
 	\label{fig:session-aging}
 \end{figure}
+
+A fair question the single-turn numbers do not answer: does responsiveness decay over a long conversation as the 8K window fills? We measured it directly --- one persistent E2B QAT session on the Orin (plain serve, no MTP, pinned clocks, SoC otherwise idle), driven turn after turn with fixed $\sim$178-token turns until the server reported the context full, which happened after 42 turns ($\sim$7,475 tokens).
 
 The growth is bounded because most layers use sliding-window attention --- their cost is window-bounded and constant --- so only the global layers pay for the accumulating KV. Absolute values reflect this fixed short-turn stimulus, chosen to fill the context at a constant rate; the load-bearing result is the slope: a full session adds only $\sim$0.2 s to TTFT and $\sim$0.26 s to first audio, and the pipeline still answers in under 0.75 s at context-full. The design point holds across the whole session, not just the first turn.
 

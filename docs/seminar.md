@@ -130,8 +130,30 @@ edge that costs llama nothing on a 64-SM desktop costs us more on the edge devic
 — which is exactly why the residual is a scheduling property, not an algorithmic
 one.
 
-![Prefill flash attention dataflow: identical flash loop on both stacks (load K,
-QKᵀ, online softmax, load V, accumulate PV); the ~8× gap is entirely inside the
-per-block load+MMA step, where llama uses cp.async pipelining, ldmatrix.x4, and
-GQA packing while we do manual shared reads — codegen, not a transplantable
-slice.](fig-prefill-flash.svg)
+**Do the two MMAs fail the same way? No — and we can prove it, because we
+cured one and couldn't cure the other.** The `S = Q·Kᵀ` side's problem was
+*latency*: ncu put the kernel's top stall on the f32→f16 pack consuming its
+per-fragment global K loads (long_scoreboard 11.5 cyc/instr); staging the K
+block through shared cured it (954 → 856 µs), and the f16 rings then removed
+the conversion outright. The `O += P·V` side's problem is *memory-instruction
+count*: V is consumed key-major, so its fragments are built from single-half
+strided loads, and the kernel sits at mio_throttle ~5 on both devices. That
+distinction is measured, not aesthetic — V-staging was falsified twice (a
+shared stage swaps each LDG for an LDS one-for-one, and mio counts both), and
+pipelining the V fragments was exactly neutral: you can hide latency, you
+cannot hide an instruction count. Only GQA packing paid on that side, because
+it is the one lever that *removes* instructions (each fragment is fetched once
+for both heads). What the two MMAs *share* is everything between them: our
+warp→data mapping changes three times per block (k-tiles for S, rows for the
+softmax, hd-slices for PV), and every change is a shared round-trip plus a
+barrier — that hand-off machinery, not either MMA, is the structural floor.
+llama's kernel keeps one mapping end-to-end, so its score matrix never leaves
+registers. The figure below walks one K/V block substep by substep, both
+stacks side by side.
+
+![Inside the flash hot step, one K/V block substep by substep, little-gemma
+and llama.cpp side by side: same flash dataflow, but ours pays hand-issued
+fragment loads, two shared round-trips of the score matrix, three barriers,
+and a warp-serial softmax per block, while llama's cp.async/ldmatrix pipeline
+keeps the score matrix in registers and every load in flight — the 8× is the
+choreography between the MMAs, not the math.](fig-prefill-flash.svg)

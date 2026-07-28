@@ -264,6 +264,141 @@ flash_attn_n_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,   // 
 static size_t flash_shm(int hd, int G, bool kstage) {
     return (size_t)32*G*hd*2 + (size_t)32*G*32*6 + (size_t)32*G*12 + (kstage ? (size_t)32*(hd+8)*2 : 0);
 }
+// ---- register-resident variant (experiment, LG_FLASH_REG=1) ---------------
+// Same math as flash_attn_n_kernel; what changes is the warp->data mapping.
+// 4 warps (128 threads), G=2 -> ROWS=64, and warp w owns query rows [w*16,+16)
+// for the WHOLE kernel: QK^T, the softmax and PV all use that one mapping, so
+// the score matrix never leaves registers. The n-kernel splits KEYS across
+// warps for S (qt=warp>>2, kt=warp&3), so no warp holds a full P row -- S must
+// go out to sS, come back for the softmax, go out again as sP and come back for
+// PV. Two shared round-trips and three barriers per K/V block, which
+// docs/seminar.md names as the structural floor. Here the K loop has ZERO
+// barriers on f16 K/V (one on f32, for the K stage), and sS/sP do not exist.
+// The S->P handoff needs no transpose: m16n8k16's C layout (thread t holds rows
+// t/4 and t/4+8, cols (t%4)*2 and +1) is exactly its A layout, so an S
+// accumulator tile packs straight into a P A-fragment. llama.cpp needs
+// get_transposed() there only because its cols_per_warp==8 shape lands
+// differently. What is being measured: acc is HD/8 x 4 = 128 floats/thread at
+// hd 256 (one warp now owns a whole 16 x HD output block), so occupancy lands
+// near 3 CTAs/SM = 12 warps against the n-kernel's 2 x 8 = 16 -- less latency
+// to hide, but the shared reads that needed hiding are gone.
+template<int HD, bool RING, typename KT>
+__global__ static void __launch_bounds__(128, 3)
+flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
+                    int kv_dim, int gqa, const int *d_pos, int window, int seq, int B, int n_head,
+                    const int *seg, int bidir_hi){
+    const int FKB=32, G=2, ROWS=32*G, NT=HD/8;   // NT = PV n-tiles of 8 hd each
+    const bool KSTAGE = sizeof(KT)==4;           // f32 K: stage once, as in the n-kernel
+    extern __shared__ unsigned char rsh[];
+    __half *sQ=(__half*)rsh;                                  // [ROWS*HD]
+    __half *sK=(__half*)(rsh + (size_t)ROWS*HD*2);            // [KSTAGE ? 32*(HD+8) : 0]
+    const int head0=blockIdx.x*G, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
+    const int gid=lane>>2, tid=lane&3, kvh=head0/gqa, pos0=*d_pos;
+    const int qbase=blockIdx.y*32, qn=(B-qbase<32)?(B-qbase):32;
+    const int row0=warp*16, rA=row0+gid, rB=row0+gid+8;   // the 2 tile rows this thread owns
+    float acc[NT][4];
+    #pragma unroll
+    for(int n=0;n<NT;n++){acc[n][0]=0.f;acc[n][1]=0.f;acc[n][2]=0.f;acc[n][3]=0.f;}
+    float mA=-1e30f,mB=-1e30f,lA=0.f,lB=0.f;             // per-row softmax state, in registers
+    for(int t=tix;t<ROWS*HD;t+=128){int b=t/HD,i=t%HD;
+        sQ[t]=((b&31)<qn)?__float2half(q[(size_t)(qbase+(b&31))*n_head*HD+(size_t)(head0+(b>>5))*HD+i]):(__half)0;}
+    __syncthreads();
+    const int hA=head0+(rA>>5), qAi=rA&31, qBi=rB&31;    // rA/rB share a head (row0 is 16-aligned)
+    const int posA=pos0+qbase+qAi, posB=pos0+qbase+qBi;
+    const int stA=(window>0&&posA-window+1>0)?posA-window+1:0;
+    const int stB=(window>0&&posB-window+1>0)?posB-window+1:0;
+    int pmax=pos0+qbase+qn-1, smin=(window>0&&pos0+qbase-window+1>0)?pos0+qbase-window+1:0;
+    int khi=(seg&&bidir_hi>pmax)?bidir_hi:pmax;
+    for(int kb0=(smin/FKB)*FKB; kb0<=khi; kb0+=FKB){
+        if(KSTAGE){
+            for(int e=tix;e<32*HD;e+=128){int key=kb0+e/HD, rr=RING?key%seq:key;
+                sK[(e/HD)*(HD+8)+e%HD]=__float2half(((const float*)Kc)[(size_t)rr*kv_dim+(size_t)kvh*HD+e%HD]);}
+            __syncthreads();
+        }
+        float S[4][4];                                   // 4 key-subtiles x m16n8 C
+        #pragma unroll
+        for(int kt=0;kt<4;kt++){S[kt][0]=0.f;S[kt][1]=0.f;S[kt][2]=0.f;S[kt][3]=0.f;}
+        #pragma unroll
+        for(int ks=0;ks<HD;ks+=16){                      // full hd in this warp: no cross-warp reduce
+            uint32_t a0=*(uint32_t*)&sQ[(size_t)rA*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(size_t)rB*HD+ks+tid*2];
+            uint32_t a2=*(uint32_t*)&sQ[(size_t)rA*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(size_t)rB*HD+ks+tid*2+8];
+            #pragma unroll
+            for(int kt=0;kt<4;kt++){
+                uint32_t b0,b1;
+                if(KSTAGE){const __half *kh=&sK[(kt*8+gid)*(HD+8)+ks];
+                    b0=*(const uint32_t*)(kh+tid*2); b1=*(const uint32_t*)(kh+tid*2+8);}
+                else{int key=kb0+kt*8+gid, rr=RING?key%seq:key;
+                    const KT *kp=Kc+(size_t)rr*kv_dim+(size_t)kvh*HD+ks;
+                    b0=fa_ld2<KT>(kp+tid*2); b1=fa_ld2<KT>(kp+tid*2+8);}
+                fa_mma(S[kt][0],S[kt][1],S[kt][2],S[kt][3],a0,a1,a2,a3,b0,b1);
+            }
+        }
+        // mask + online softmax, entirely in registers. A thread's 4 tid-siblings
+        // hold the other 24 keys of the same 2 rows -> a 2-step xor shuffle is the
+        // whole row reduction. S is rewritten in place as P (saves 16 registers).
+        float rmA=-1e30f, rmB=-1e30f;
+        #pragma unroll
+        for(int kt=0;kt<4;kt++){
+            #pragma unroll
+            for(int c=0;c<2;c++){
+                int kabs=kb0+kt*8+tid*2+c;
+                bool okA=(qAi<qn)&&(kabs>=stA)&&(kabs<=posA), okB=(qBi<qn)&&(kabs>=stB)&&(kabs<=posB);
+                if(seg&&kabs<=bidir_hi){                 // same media span -> bidirectional
+                    int sk=seg[kabs];
+                    if(!okA&&qAi<qn){int sq=seg[posA]; okA=(sq!=0)&&(sq==sk);}
+                    if(!okB&&qBi<qn){int sq=seg[posB]; okB=(sq!=0)&&(sq==sk);}
+                }
+                S[kt][c]  =okA?S[kt][c]  :-1e30f;
+                S[kt][2+c]=okB?S[kt][2+c]:-1e30f;
+                rmA=fmaxf(rmA,S[kt][c]); rmB=fmaxf(rmB,S[kt][2+c]);
+            }
+        }
+        rmA=fmaxf(rmA,__shfl_xor_sync(~0u,rmA,1)); rmA=fmaxf(rmA,__shfl_xor_sync(~0u,rmA,2));
+        rmB=fmaxf(rmB,__shfl_xor_sync(~0u,rmB,1)); rmB=fmaxf(rmB,__shfl_xor_sync(~0u,rmB,2));
+        float mnA=fmaxf(mA,rmA), mnB=fmaxf(mB,rmB);
+        float corrA=__expf(mA-mnA), corrB=__expf(mB-mnB), sumA=0.f, sumB=0.f;
+        #pragma unroll
+        for(int kt=0;kt<4;kt++)
+            #pragma unroll
+            for(int c=0;c<2;c++){
+                float pA=(S[kt][c]  >-1e29f)?__expf(S[kt][c]  -mnA):0.f;
+                float pB=(S[kt][2+c]>-1e29f)?__expf(S[kt][2+c]-mnB):0.f;
+                S[kt][c]=pA; S[kt][2+c]=pB; sumA+=pA; sumB+=pB;
+            }
+        sumA+=__shfl_xor_sync(~0u,sumA,1); sumA+=__shfl_xor_sync(~0u,sumA,2);
+        sumB+=__shfl_xor_sync(~0u,sumB,1); sumB+=__shfl_xor_sync(~0u,sumB,2);
+        lA=lA*corrA+sumA; mA=mnA; lB=lB*corrB+sumB; mB=mnB;
+        #pragma unroll
+        for(int n=0;n<NT;n++){acc[n][0]*=corrA;acc[n][1]*=corrA;acc[n][2]*=corrB;acc[n][3]*=corrB;}
+        // PV. The P A-fragments come straight out of the S accumulators: kc picks
+        // the 16-key half, S[2kc] supplies k=tid*2(+1) and S[2kc+1] k=tid*2+8(+9).
+        #pragma unroll
+        for(int kc=0;kc<2;kc++){
+            uint32_t pa0=fa_pk(__float2half(S[2*kc][0]),  __float2half(S[2*kc][1]));
+            uint32_t pa1=fa_pk(__float2half(S[2*kc][2]),  __float2half(S[2*kc][3]));
+            uint32_t pa2=fa_pk(__float2half(S[2*kc+1][0]),__float2half(S[2*kc+1][1]));
+            uint32_t pa3=fa_pk(__float2half(S[2*kc+1][2]),__float2half(S[2*kc+1][3]));
+            int k0=kb0+kc*16+tid*2;
+            int r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
+            #pragma unroll
+            for(int n=0;n<NT;n++){                       // this warp owns the FULL hd now
+                const KT *vb=Vc+(size_t)kvh*HD+n*8+gid;
+                uint32_t b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
+                uint32_t b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim));
+                fa_mma(acc[n][0],acc[n][1],acc[n][2],acc[n][3],pa0,pa1,pa2,pa3,b0,b1);
+            }
+        }
+        if(KSTAGE) __syncthreads();                      // sK is reused next block
+    }
+    #pragma unroll
+    for(int n=0;n<NT;n++){
+        int hdc=n*8+tid*2;
+        if(qAi<qn){xb[((size_t)(qbase+qAi)*n_head+hA)*HD+hdc]=acc[n][0]/lA; xb[((size_t)(qbase+qAi)*n_head+hA)*HD+hdc+1]=acc[n][1]/lA;}
+        if(qBi<qn){xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc]=acc[n][2]/lB; xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc+1]=acc[n][3]/lB;}
+    }
+}
+static size_t flash_r_shm(int hd, bool kstage){ return (size_t)64*hd*2 + (kstage?(size_t)32*(hd+8)*2:0); }
+
 // The packed launches live in a specialization so the hd-512 packed
 // instantiation (it would spill, and nothing ever launches it) never exists
 // in the binary. G=2 ships all four KT/RING flavors; G=4 (one CTA/SM, the
@@ -321,6 +456,29 @@ static void launch_flash(float *dxb, const float *dq, const void *Kc, const void
         const char *e = getenv("LG_FLASH_GQA");
         if (e) pack_pol = atoi(e);
         else { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); pack_pol = p.integrated ? 1 : 0; }
+    }
+    // LG_FLASH_REG=1: the register-resident experiment (see flash_attn_r_kernel).
+    // Takes precedence over GQA packing because it IS a G=2 pack, just with the
+    // score matrix kept in registers instead of round-tripped through sS/sP.
+    static int reg_pol = -2;
+    if (reg_pol == -2) { const char *e = getenv("LG_FLASH_REG"); reg_pol = e ? atoi(e) : 0; }
+    if (reg_pol && HD == 256 && gqa % 2 == 0 && n_head % 2 == 0) {
+        dim3 g(n_head / 2, (B + 31) / 32);
+        size_t shm = flash_r_shm(256, !f16);
+        static int rcarve = 0;
+        if (!rcarve) {                                     // 32 KB f16 / ~48.5 KB f32 > the 48 KB default
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,__half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,false));
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, __half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,false));
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,true));
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,true));
+            rcarve = 1;                                    // wiring proof: a zero delta must be visible
+            fprintf(stderr, "flash: register-resident kernel engaged (n_head %d, gqa %d, f16 %d)\n", n_head, gqa, (int)f16);
+        }
+        if (f16 && ring) flash_attn_r_kernel<256,true, __half><<<g,128,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else if (f16)    flash_attn_r_kernel<256,false,__half><<<g,128,shm>>>(dxb,dq,(const __half*)Kc,(const __half*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else if (ring)   flash_attn_r_kernel<256,true, float ><<<g,128,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        else             flash_attn_r_kernel<256,false,float ><<<g,128,shm>>>(dxb,dq,(const float*)Kc,(const float*)Vc,kv_dim,gqa,d_pos,window,seq,B,n_head,seg,bidir_hi);
+        return;
     }
     if (pack_pol && HD == 256) {
         int cap = pack_pol == 1 ? 2 : pack_pol;            // auto = G2: G4 measured SLOWER than
