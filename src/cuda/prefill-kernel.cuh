@@ -679,7 +679,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
         mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
         pf_tick(&g_pf_mm);
-        geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
+        geglu_n_kernel<<<gridn4(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
         pf_tick(&g_pf_elem);
         mm(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         pf_tick(&g_pf_mm);
@@ -691,7 +691,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (has_ple) {
             const int ple = c->n_embd_per_layer;
             mm(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
-            geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
+            geglu_n_kernel<<<gridn4(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
             mm(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
             norm_add_n(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0, B);
             pf_tick(&g_pf_ple);
