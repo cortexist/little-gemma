@@ -27,6 +27,11 @@ struct mtp {
     // host-draft scratch (CPU backend; sized once at open)
     float *cat, *x, *h, *q, *xb, *o, *g1, *g2, *att, *logits;
     int att_cap;
+    // Reduced-vocabulary draft head (LG_MTP_IDS; docs/mtp-vocab-trim.md).
+    // When set, `head` points at head_trim — K rows gathered at open — and
+    // n_vocab is K; d2t maps draft row -> target token id. NULL = full head.
+    int32_t *d2t;
+    struct gguf_tensor head_trim;    // .data owned (the malloc'd row gather)
     void *cuda;        // device state (model-cuda.cuh), or NULL
 };
 

@@ -366,7 +366,8 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
 
     int best = -1;
     CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
-    return best;
+    // trimmed head (LG_MTP_IDS): the argmax is a draft ROW; map to target id
+    return best >= 0 && t->d2t ? t->d2t[best] : best;
 }
 
 // The chained draft for block-3 (LG_MTP_N=3): draft the token after `token` (itself
@@ -398,7 +399,7 @@ extern "C" int mtp_draft_chain_device(struct mtp *t, const struct model *m, cons
 
     int best = -1;
     CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
-    return best;
+    return best >= 0 && t->d2t ? t->d2t[best] : best;
 }
 
 extern "C" void mtp_free_device(struct mtp *t) {

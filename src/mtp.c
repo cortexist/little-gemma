@@ -170,6 +170,46 @@ struct mtp *mtp_open(const char *path, const struct model *m) {
     }
     t->n_vocab = (int)t->head->dims[1];
 
+    // LG_MTP_IDS=idlist.bin (u32 LE target token ids): reduced-vocabulary
+    // draft head. Gather those K head rows once, here — the draft then
+    // argmaxes over K rows and maps back through d2t. Verification is against
+    // the target's FULL vocabulary, so a trimmed head can only lose
+    // acceptance, never change output; the gather itself is exact — head rows
+    // are independent, whole-byte quantized spans (docs/mtp-vocab-trim.md).
+    // The original GGUF is never modified: "reset to full" = unset LG_MTP_IDS.
+    const char *idpath = getenv("LG_MTP_IDS");
+    if (idpath) {
+        const size_t row = (size_t)((int)t->head->dims[0] / ggml_blck_size(t->head->type))
+                         * ggml_type_size(t->head->type);
+        FILE *fp = fopen(idpath, "rb");
+        long fsz = 0;
+        if (fp) { fseek(fp, 0, SEEK_END); fsz = ftell(fp); fseek(fp, 0, SEEK_SET); }
+        int k = (int)(fsz / 4);
+        uint32_t *ids = malloc((size_t)k * 4 + 4);
+        unsigned char *rows = malloc((size_t)k * row + 1);
+        int ok = fp && fsz > 0 && fsz % 4 == 0 && k <= t->n_vocab && ids && rows &&
+                 fread(ids, 4, (size_t)k, fp) == (size_t)k;
+        for (int i = 0; ok && i < k; i++) {
+            if (ids[i] >= (uint32_t)t->n_vocab) { ok = 0; break; }
+            memcpy(rows + (size_t)i * row, (const unsigned char *)t->head->data + ids[i] * row, row);
+        }
+        if (fp) fclose(fp);
+        if (!ok) {
+            fprintf(stderr, "mtp: bad id list %s (want 1..%d u32 ids, each < %d)\n",
+                    idpath, t->n_vocab, t->n_vocab);
+            free(ids); free(rows);
+            mtp_free(t);
+            return NULL;
+        }
+        t->head_trim = *t->head;
+        t->head_trim.dims[1] = (uint64_t)k;
+        t->head_trim.data = rows;
+        t->head = &t->head_trim;
+        t->d2t = (int32_t *)ids;
+        fprintf(stderr, "mtp: draft vocab trimmed %d -> %d rows (%s)\n", t->n_vocab, k, idpath);
+        t->n_vocab = k;
+    }
+
     // The target KV the blocks attend: the LAST target layer of each attention
     // type — which, past n_kv_start, stores in the last OWNING layer of that
     // type (full: n_kv_start-1, SWA: n_kv_start-2; see model-cpu.c kv_src).
@@ -236,6 +276,7 @@ void mtp_free(struct mtp *t) {
     if (!t) return;
     mtp_free_device(t);
     free_gguf(t->ctx);
+    if (t->d2t) { free(t->d2t); free(t->head_trim.data); }
     free(t->l);
     free(t->cat); free(t->x); free(t->h); free(t->q); free(t->xb);
     free(t->o); free(t->g1); free(t->g2); free(t->att); free(t->logits);
@@ -352,5 +393,5 @@ int mtp_draft(struct mtp *t, const struct model *m, const struct kvcache *kv,
     int best = 0;
     for (int v = 1; v < t->n_vocab; v++)
         if (t->logits[v] > t->logits[best]) best = v;
-    return best;
+    return t->d2t ? t->d2t[best] : best;
 }
