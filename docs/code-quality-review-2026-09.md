@@ -193,3 +193,20 @@ register-resident softmax) — is the reason both exist; keep it inline.
 ship it as default, flip that for the SWA layers and validate E2B/12B; the n-kernel's HD-256 G=2
 branch then becomes dead (n stays for HD-512, G=1, G=4). Coherence screen on the rebased build:
 **PASS** (0 degenerate, 14/24 exact, 2 known-correct hard divergences — identical to pre-rebase).
+
+---
+
+## Sequencing note (relative to PR #16, the flash pipeline)
+
+This review was taken against `main` (`d1c4c8f`). PR #16 (gelu + flash V-stage/pad + screen)
+touches only **2 of the 15 reviewed files** — `src/cuda/model-cuda.cuh` and
+`src/cuda/prefill-kernel.cuh` — plus new files under `bench/coherence-screen/` (not reviewed). The
+other 13 files' findings and line numbers are independent of PR #16 and apply as-is.
+
+**Do the cleanup AFTER PR #16 merges, based on the merged `main`** — not before. Cleaning first
+would refactor those two files out from under the PR (hard rebase). Landing the feature first means
+the cleanup is the only change to those files and cannot conflict; at that point re-anchor just:
+- `prefill-kernel.cuh` — the flash-family helpers (the addendum above is already branch-relative), and
+- `model-cuda.cuh` — the geglu region (the gelu float4 moves the launch sites).
+
+The 13 non-overlapping files can be cleaned in any order.
