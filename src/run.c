@@ -45,9 +45,14 @@ static double now_sec(void) {
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
-// One block-LG_MTP_N speculative step (shared by serve and -p): draft LG_MTP_N-1
-// tokens (chained for the 2nd+), then verify the LG_MTP_N batch in one weight pass.
-// Fills toks[LG_MTP_N] (toks[0]=best) and out[LG_MTP_N]; returns adv (1..LG_MTP_N) =
+// Live MTP block depth, one per process. Seeds from the compile-time LG_MTP_N
+// (clamped into [2, LG_MTP_N_MAX]); env LG_MTP_N overrides it once in main().
+// The verify path in every backend reads it (declared extern in model.h).
+int g_mtp_n = LG_MTP_N < 2 ? 2 : (LG_MTP_N > LG_MTP_N_MAX ? LG_MTP_N_MAX : LG_MTP_N);
+
+// One block-g_mtp_n speculative step (shared by serve and -p): draft g_mtp_n-1
+// tokens (chained for the 2nd+), then verify the g_mtp_n batch in one weight pass.
+// Fills toks[0..g_mtp_n-1] (toks[0]=best) and out[]; returns adv (1..g_mtp_n) =
 // the run of drafts that held, +1. Accumulates draft/verify time and draft/accept
 // counts. An unavailable draft (no head / no chaining) is padded so the verify just
 // rejects it. Greedy verify keeps the emitted text byte-identical to plain decode.
@@ -57,7 +62,7 @@ static int mtp_step(struct mtp *t, struct model *m, struct kvcache *kv, int best
     toks[0] = best;
     int d = mtp_draft(t, m, kv, best, pos);
     toks[1] = d >= 0 ? d : best;
-    for (int j = 2; j < LG_MTP_N; j++) {
+    for (int j = 2; j < g_mtp_n; j++) {
         int dj = mtp_draft_chain(t, m, kv, toks[j - 1], pos + j - 1);
         toks[j] = dj >= 0 ? dj : toks[j - 1];
     }
@@ -65,7 +70,7 @@ static int mtp_step(struct mtp *t, struct model *m, struct kvcache *kv, int best
     int adv = model_forward_spec(m, kv, toks, pos, out);
     *t_draft += s1 - s0;
     *t_verify += now_sec() - s1;
-    *n_draft += LG_MTP_N - 1;
+    *n_draft += g_mtp_n - 1;
     *n_accept += adv - 1;
     return adv;
 }
@@ -276,6 +281,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
     if (mtp_path)
         fprintf(stderr, "mtp: %s%s\n", t ? "speculative decode armed - " : "disabled, plain decode - ", mtp_path);
+    if (t) fprintf(stderr, "mtp: block depth N=%d\n", g_mtp_n);
 
     // The system prefix (-sys): the skills/guidelines turn is prefilled ONCE
     // here and its cache rows saved; every session then starts at position
@@ -546,15 +552,15 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 }
                 // Plain decode while reasoning under a budget: it lets us inject the
                 // <channel|> cleanly (MTP drafts a whole block, awkward to truncate).
-                if (!t || in_think || pos + LG_MTP_N - 1 >= SERVE_SEQ) {
+                if (!t || in_think || pos + g_mtp_n - 1 >= SERVE_SEQ) {
                     best = model_forward_next(&m, &kv, best, pos++);
                     if (in_think && think_n >= think && best != ch_close) best = ch_close;   // budget spent: end the thought
                     continue;
                 }
-                // block-LG_MTP_N speculation: draft LG_MTP_N-1 tokens (chained), verify
-                // the batch in one weight pass — up to LG_MTP_N tokens for one pass's
+                // block-g_mtp_n speculation: draft g_mtp_n-1 tokens (chained), verify
+                // the batch in one weight pass — up to g_mtp_n tokens for one pass's
                 // weight traffic. Greedy verify keeps the streamed text byte-identical.
-                int toks[LG_MTP_N], out[LG_MTP_N];
+                int toks[LG_MTP_N_MAX], out[LG_MTP_N_MAX];
                 int adv = mtp_step(t, &m, &kv, best, pos, toks, out, &t_draft, &t_verify, &n_draft, &n_accept);
                 pos += adv;
                 int brk = 0;
@@ -717,6 +723,7 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
     }
 
     struct mtp *t = mtp_path ? mtp_open(mtp_path, &m) : NULL;
+    if (t) fprintf(stderr, "mtp: block depth N=%d\n", g_mtp_n);
     int pos = 0;
     // Stop at end-of-turn. gemma4's turn end is <turn|>; the gguf eos_token_id is
     // <turn|> on E2B but <eos> on 12B, so stop on either.
@@ -749,11 +756,11 @@ static void generate(const struct gguf_context *ctx, const char *prompt, const c
         if (best == eot || best == eos) break;               // end of turn
         emit_token(tk, best, &in_thought, ch_open, ch_close);
         g++;
-        if (!t || g >= N_GEN || pos + LG_MTP_N - 1 >= kv.max_seq) {
+        if (!t || g >= N_GEN || pos + g_mtp_n - 1 >= kv.max_seq) {
             if (g < N_GEN) best = model_forward_next(&m, &kv, best, pos++);
             continue;
         }
-        int toks[LG_MTP_N], out[LG_MTP_N];
+        int toks[LG_MTP_N_MAX], out[LG_MTP_N_MAX];
         int adv = mtp_step(t, &m, &kv, best, pos, toks, out, &t_draft, &t_verify, &n_draft, &n_accept);
         pos += adv;
         int stop = 0;
@@ -790,6 +797,10 @@ int main(int argc, char **argv) {
     int topk = -1;
     uint64_t seed = 0;
     int think = -1;                                       // -think N: thinking-channel token budget (-1 = unlimited)
+    { const char *e = getenv("LG_MTP_N");                 // runtime block-depth knob (default from -DLG_MTP_N)
+      if (e && *e) { int v = atoi(e);
+          if (v >= 2 && v <= LG_MTP_N_MAX) g_mtp_n = v;
+          else fprintf(stderr, "LG_MTP_N=%s ignored (need 2..%d); block depth %d\n", e, LG_MTP_N_MAX, g_mtp_n); } }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)       model  = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc)  prompt = argv[++i];

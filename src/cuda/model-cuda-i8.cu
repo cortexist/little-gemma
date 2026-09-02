@@ -851,7 +851,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         // loads outnumber the weight load 16:1, so weight caching was never
         // the constraint. Wider loads on both sides are.)
         const float *wr = (const float *)row;
-        if (NB == LG_MTP_N || (k & 3)) {                 // verify (B=LG_MTP_N): decode's order, exactly
+        if (NB <= LG_MTP_N_MAX || (k & 3)) {             // verify (B<=LG_MTP_N_MAX): decode's order, exactly
             for (int i = lane; i < k; i += 32) {
                 float w = wr[i];
                 for (int j = 0; j < NB; j++) s[j] += w * x[(size_t)j * k + i];
@@ -867,7 +867,7 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
         }
     } else {                                             // bf16 / f16
         const uint16_t *wr = (const uint16_t *)row;
-        if (NB == LG_MTP_N || (k & 7)) {                 // one uint32 = 2 elements (verify B=LG_MTP_N: decode order)
+        if (NB <= LG_MTP_N_MAX || (k & 7)) {             // one uint32 = 2 elements (verify B<=LG_MTP_N_MAX: decode order)
             for (int i = 2 * lane; i < k; i += 64) {
                 uint32_t two = ld32(wr + i);
                 float w0 = type == GGML_TYPE_BF16 ? d_bf16((uint16_t)two) : d_fp16((uint16_t)two);
@@ -1595,8 +1595,23 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
     const unsigned char *w = rweight(t, &ts);
     int blocks = (m + 7) / 8;
     int hot = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q4_0;
-    if (hot && mma_integrated())
-        matmul_i8r_s_kernel<LG_MTP_N><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m);
-    else
-        matmul_i8r_n_kernel<LG_MTP_N><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    // The verify kernels are templated on the block width, which is now a runtime
+    // knob (g_mtp_n) — so instantiate them for every N in [2, LG_MTP_N_MAX] and pick
+    // at launch. At the default N=3 this is exactly matmul_i8r_{s,n}_kernel<3> as before.
+    #define LG_SPEC_LAUNCH(NB) do {                                                                        \
+        if (hot && mma_integrated())                                                                       \
+            matmul_i8r_s_kernel<NB><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m); \
+        else                                                                                              \
+            matmul_i8r_n_kernel<NB><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m); \
+    } while (0)
+    switch (g_mtp_n) {
+        case 2: LG_SPEC_LAUNCH(2); break;
+        case 4: LG_SPEC_LAUNCH(4); break;
+        case 5: LG_SPEC_LAUNCH(5); break;
+        case 6: LG_SPEC_LAUNCH(6); break;
+        case 7: LG_SPEC_LAUNCH(7); break;
+        case 8: LG_SPEC_LAUNCH(8); break;
+        default: LG_SPEC_LAUNCH(3); break;   // 3 = compile-time default (g_mtp_n is clamped to [2, LG_MTP_N_MAX])
+    }
+    #undef LG_SPEC_LAUNCH
 }

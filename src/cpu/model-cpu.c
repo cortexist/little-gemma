@@ -53,7 +53,7 @@ int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int
     do {
         out[j] = model_forward_next(m, kv, toks[j], pos + j);
         j++;
-    } while (j < LG_MTP_N && out[j - 1] == toks[j]);
+    } while (j < g_mtp_n && out[j - 1] == toks[j]);
     return j;
 }
 
