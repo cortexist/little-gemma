@@ -1,0 +1,24 @@
+What is the capital of Australia? Answer in one word.
+List the first six prime numbers.
+Explain in two sentences why the sky appears blue during the day.
+Write a Python function that returns the nth Fibonacci number using iteration.
+What is the difference between a stack and a queue? Answer in two sentences.
+A farmer has 17 sheep and all but 9 run away. How many sheep are left? Show your reasoning.
+Translate to French: "The weather is nice today, let's go for a walk."
+Explique en français, en une phrase, ce qu'est la photosynthèse.
+Rewrite this sentence to be more formal: "hey can u send me that file asap thx".
+Summarize the plot of Romeo and Juliet in three sentences.
+Name three renewable energy sources and one advantage of each.
+Convert 45 degrees Celsius to Fahrenheit and show the formula.
+Write a haiku about a rainy morning.
+What does the following code print? for i in range(3): print(i * i)
+Give step-by-step instructions to make a cup of tea.
+Which is heavier: a kilogram of feathers or a kilogram of steel? Explain briefly.
+Describe the water cycle in four steps.
+What are the main differences between HTTP and HTTPS? Answer in two sentences.
+Continue the story: "The old lighthouse keeper noticed a light where there should be none."
+Explain the concept of compound interest to a ten-year-old.
+List three common causes of slow database queries.
+¿Cuál es la capital de Japón? Responde en una palabra.
+Write a SQL query to select the names of employees earning more than 50000.
+What is recursion in programming? Give a one-sentence definition and a simple example.
