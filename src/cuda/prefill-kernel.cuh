@@ -1,3 +1,4 @@
+#include <cuda_pipeline.h>
 // prefill-kernel.cuh — the prompt phase, split from model-cuda.cuh (same
 // single-include unit, included at the point the model_prefill* entries used
 // to sit; declaration order and codegen unchanged). The pure-prefill
@@ -291,7 +292,9 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     const bool KSTAGE = sizeof(KT)==4;           // f32 K: stage once, as in the n-kernel
     extern __shared__ unsigned char rsh[];
     __half *sQ=(__half*)rsh;                                  // [ROWS*HD]
-    __half *sK=(__half*)(rsh + (size_t)ROWS*HD*2);            // [KSTAGE ? 32*(HD+8) : 0]
+    __half *sK=(__half*)(rsh + (size_t)ROWS*(HD+8)*2);            // [KSTAGE ? 32*(HD+8) : 0]
+    __half *sV=(__half*)(rsh + (size_t)ROWS*(HD+8)*2);            // f16 only: 32*HD staged V (shares sK's f32 slot)
+    const bool STAGEV = (sizeof(KT)==2);
     const int head0=blockIdx.x*G, warp=threadIdx.x>>5, lane=threadIdx.x&31, tix=threadIdx.x;
     const int gid=lane>>2, tid=lane&3, kvh=head0/gqa, pos0=*d_pos;
     const int qbase=blockIdx.y*32, qn=(B-qbase<32)?(B-qbase):32;
@@ -301,7 +304,7 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
     for(int n=0;n<NT;n++){acc[n][0]=0.f;acc[n][1]=0.f;acc[n][2]=0.f;acc[n][3]=0.f;}
     float mA=-1e30f,mB=-1e30f,lA=0.f,lB=0.f;             // per-row softmax state, in registers
     for(int t=tix;t<ROWS*HD;t+=128){int b=t/HD,i=t%HD;
-        sQ[t]=((b&31)<qn)?__float2half(q[(size_t)(qbase+(b&31))*n_head*HD+(size_t)(head0+(b>>5))*HD+i]):(__half)0;}
+        sQ[(size_t)b*(HD+8)+i]=((b&31)<qn)?__float2half(q[(size_t)(qbase+(b&31))*n_head*HD+(size_t)(head0+(b>>5))*HD+i]):(__half)0;}
     __syncthreads();
     const int hA=head0+(rA>>5), qAi=rA&31, qBi=rB&31;    // rA/rB share a head (row0 is 16-aligned)
     const int posA=pos0+qbase+qAi, posB=pos0+qbase+qBi;
@@ -315,13 +318,19 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
                 sK[(e/HD)*(HD+8)+e%HD]=__float2half(((const float*)Kc)[(size_t)rr*kv_dim+(size_t)kvh*HD+e%HD]);}
             __syncthreads();
         }
+        if(STAGEV){
+            #pragma unroll
+            for(int c=tix;c<(32*HD)/8;c+=128){int flat=c*8,key=flat/HD,i=flat%HD; int rr=RING?(kb0+key)%seq:(kb0+key);
+                __pipeline_memcpy_async(&sV[(size_t)key*(HD+8)+i], (const __half*)Vc+((size_t)rr*kv_dim+(size_t)kvh*HD+i), 16);}
+            __pipeline_commit();
+        }
         float S[4][4];                                   // 4 key-subtiles x m16n8 C
         #pragma unroll
         for(int kt=0;kt<4;kt++){S[kt][0]=0.f;S[kt][1]=0.f;S[kt][2]=0.f;S[kt][3]=0.f;}
         #pragma unroll
         for(int ks=0;ks<HD;ks+=16){                      // full hd in this warp: no cross-warp reduce
-            uint32_t a0=*(uint32_t*)&sQ[(size_t)rA*HD+ks+tid*2],   a1=*(uint32_t*)&sQ[(size_t)rB*HD+ks+tid*2];
-            uint32_t a2=*(uint32_t*)&sQ[(size_t)rA*HD+ks+tid*2+8], a3=*(uint32_t*)&sQ[(size_t)rB*HD+ks+tid*2+8];
+            uint32_t a0=*(uint32_t*)&sQ[(size_t)rA*(HD+8)+ks+tid*2],   a1=*(uint32_t*)&sQ[(size_t)rB*(HD+8)+ks+tid*2];
+            uint32_t a2=*(uint32_t*)&sQ[(size_t)rA*(HD+8)+ks+tid*2+8], a3=*(uint32_t*)&sQ[(size_t)rB*(HD+8)+ks+tid*2+8];
             #pragma unroll
             for(int kt=0;kt<4;kt++){
                 uint32_t b0,b1;
@@ -370,6 +379,7 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         lA=lA*corrA+sumA; mA=mnA; lB=lB*corrB+sumB; mB=mnB;
         #pragma unroll
         for(int n=0;n<NT;n++){acc[n][0]*=corrA;acc[n][1]*=corrA;acc[n][2]*=corrB;acc[n][3]*=corrB;}
+        if(STAGEV){ __pipeline_wait_prior(0); __syncthreads(); }
         // PV. The P A-fragments come straight out of the S accumulators: kc picks
         // the 16-key half, S[2kc] supplies k=tid*2(+1) and S[2kc+1] k=tid*2+8(+9).
         #pragma unroll
@@ -378,17 +388,21 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
             uint32_t pa1=fa_pk(__float2half(S[2*kc][2]),  __float2half(S[2*kc][3]));
             uint32_t pa2=fa_pk(__float2half(S[2*kc+1][0]),__float2half(S[2*kc+1][1]));
             uint32_t pa3=fa_pk(__float2half(S[2*kc+1][2]),__float2half(S[2*kc+1][3]));
-            int k0=kb0+kc*16+tid*2;
-            int r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
+            int lk=kc*16+tid*2;
+            int k0=kb0+lk, r0=RING?k0%seq:k0, r1=RING?(k0+1)%seq:k0+1, r8=RING?(k0+8)%seq:k0+8, r9=RING?(k0+9)%seq:k0+9;
             #pragma unroll
             for(int n=0;n<NT;n++){                       // this warp owns the FULL hd now
-                const KT *vb=Vc+(size_t)kvh*HD+n*8+gid;
-                uint32_t b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
-                uint32_t b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim));
+                uint32_t b0,b1;
+                if(STAGEV){ const __half *vb=sV+(n*8+gid);
+                    b0=fa_pk(vb[(size_t)lk*(HD+8)], vb[(size_t)(lk+1)*(HD+8)]);
+                    b1=fa_pk(vb[(size_t)(lk+8)*(HD+8)], vb[(size_t)(lk+9)*(HD+8)]); }
+                else{ const KT *vb=Vc+(size_t)kvh*HD+n*8+gid;
+                    b0=fa_pk(fa_rd1<KT>(vb+(size_t)r0*kv_dim), fa_rd1<KT>(vb+(size_t)r1*kv_dim));
+                    b1=fa_pk(fa_rd1<KT>(vb+(size_t)r8*kv_dim), fa_rd1<KT>(vb+(size_t)r9*kv_dim)); }
                 fa_mma(acc[n][0],acc[n][1],acc[n][2],acc[n][3],pa0,pa1,pa2,pa3,b0,b1);
             }
         }
-        if(KSTAGE) __syncthreads();                      // sK is reused next block
+        if(KSTAGE||STAGEV) __syncthreads();              // sK/sV reused next block
     }
     #pragma unroll
     for(int n=0;n<NT;n++){
@@ -397,7 +411,7 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         if(qBi<qn){xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc]=acc[n][2]/lB; xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc+1]=acc[n][3]/lB;}
     }
 }
-static size_t flash_r_shm(int hd, bool kstage){ return (size_t)64*hd*2 + (kstage?(size_t)32*(hd+8)*2:0); }
+static size_t flash_r_shm(int hd, bool kstage){ return (size_t)64*(hd+8)*2 + (kstage?(size_t)32*(hd+8)*2:(size_t)32*(hd+8)*2); }
 
 // The packed launches live in a specialization so the hd-512 packed
 // instantiation (it would spill, and nothing ever launches it) never exists
@@ -679,7 +693,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         mm(dg2, wq_layer(m, L, "ffn_up.weight"), dh, n_embd, nff);
         mm(dg1, wq_layer(m, L, "ffn_gate.weight"), dh, n_embd, nff);
         pf_tick(&g_pf_mm);
-        geglu_n_kernel<<<gridn(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
+        geglu_n_kernel<<<gridn4(B * nff), 256>>>(dg1, dg2, nff, B, nff, actq_for(B * nff));
         pf_tick(&g_pf_elem);
         mm(dout, wq_layer(m, L, "ffn_down.weight"), dg1, nff, n_embd);
         pf_tick(&g_pf_mm);
@@ -691,7 +705,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (has_ple) {
             const int ple = c->n_embd_per_layer;
             mm(dpg, wq_layer(m, L, "inp_gate.weight"), dx, n_embd, ple);
-            geglu_n_kernel<<<gridn(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
+            geglu_n_kernel<<<gridn4(B * ple), 256>>>(dpg, d_ipl + (size_t)L * ple, ple, B, c->n_layer * ple, actq_for(B * ple));
             mm(dout, wq_layer(m, L, "proj.weight"), dpg, ple, n_embd);
             norm_add_n(dx, dout, dW_layer(m, L, "post_norm.weight"), n_embd, eps, os, AQ0, B);
             pf_tick(&g_pf_ple);

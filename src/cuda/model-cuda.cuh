@@ -36,6 +36,7 @@ extern "C" const int model_kv_host = 0;
     exit(1); } } while (0)
 
 static inline int gridn(int n) { return (n + 255) / 256; }
+static inline int gridn4(int n) { return (n + 1023) / 1024; }
 
 // ---- quant block layouts + fp16 helpers (used by the matmul in the .cu) ----
 
@@ -686,15 +687,39 @@ __global__ static void geglu_kernel(float *g, const float *u, int n, struct actq
 // on the widest activation in the model (rows x n_ff); byte-identical, and
 // this kernel is prefill-only so decode's graph never sees the change.
 __global__ static void geglu_n_kernel(float *g, const float *u, int n, int rows, int ustride, struct actq aq) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n * rows) g[i] = d_gelu(g[i]) * u[(size_t)(i / n) * ustride + i % n];
+    // 4 elements/thread (float4). Arithmetic per element is identical to the
+    // scalar form (same d_gelu, same multiply order) -> byte-identical; only the
+    // load/store width changes. Fast path when the 4 elems stay in one row and u
+    // is 16B-aligned; scalar tail otherwise (row cross / end / misalign).
+    long total = (long)n * rows;
+    long i0 = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i0 < total) {
+        long row = i0 / n, col = i0 - row * n;
+        const float *up = u + (size_t)row * ustride + col;
+        if (col + 3 < n && i0 + 3 < total && (((unsigned long long)up & 0xFULL) == 0)) {
+            float4 gv = *(float4 *)(g + i0);
+            float4 uv = *(const float4 *)up;
+            gv.x = d_gelu(gv.x) * uv.x;
+            gv.y = d_gelu(gv.y) * uv.y;
+            gv.z = d_gelu(gv.z) * uv.z;
+            gv.w = d_gelu(gv.w) * uv.w;
+            *(float4 *)(g + i0) = gv;
+        } else {
+            for (int k = 0; k < 4; k++) {
+                long i = i0 + k;
+                if (i < total) g[i] = d_gelu(g[i]) * u[(size_t)(i / n) * ustride + i % n];
+            }
+        }
+    }
     if (!aq.xq) return;
     __syncthreads();
-    int base = blockIdx.x * blockDim.x;
-    int left = n * rows - base, ng = (left < (int)blockDim.x ? left : (int)blockDim.x) / 32;
+    long base = (long)blockIdx.x * blockDim.x * 4;
+    long left = total - base;
+    int span = (int)(left < (long)blockDim.x * 4 ? left : (long)blockDim.x * 4);
+    int ng = span / 32;
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     for (int t = warp; t < ng; t += blockDim.x >> 5)
-        d_quant_group_warp(g + base + t * 32, base / 32 + t, aq, lane);
+        d_quant_group_warp(g + base + (long)t * 32, (int)(base / 32) + t, aq, lane);
 }
 __global__ static void scale_const_kernel(float *a, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] *= s; }
 __global__ static void combine_kernel(float *out, const float *p, const float *t, float c, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = (p[i] + t[i]) * c; }
