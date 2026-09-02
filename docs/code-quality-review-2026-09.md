@@ -162,3 +162,34 @@ the decode graph byte-identical, which they do by construction (template/macro e
 | **total** | **15** | **~500–650 (~5–6%)** |
 
 Second-round targets (not reviewed here): the C headers, `bench/`, `tools/`, `test/`.
+
+---
+
+## Addendum — flash-family re-review (post-rebase onto canonical main, 2026-09-02)
+
+After rebasing `prefill-e4b-flash-pipeline` onto canonical `main` (which already carries the
+register-resident `flash_attn_r_kernel`), both flash kernels sit in one file. Re-review:
+
+**Neither flash kernel is removable.** `flash_attn_n_kernel` covers the HD-512 global layers,
+G=1/4, and the default path; `flash_attn_r_kernel` is HD-256 SWA G=2 only (the register-resident
+winning path). Their divergent core — the warp→data mapping (shared `sS`/`sP` round-trips vs
+register-resident softmax) — is the reason both exist; keep it inline.
+
+**Shared skeleton → `__device__` helpers (behavior-preserving):**
+- `stage_K(...)` — the KSTAGE f32→f16 K loader, same logic in both (n `:178`, r `:316`; differ only
+  by thread count and HD vs HD+8 stride).
+- `ring4(k0, seq)` — the RING index quad `{r0,r1,r8,r9}` (n `:243` ≡ r `:392`).
+- `swa_start(pos, window)` — the window-start ternary (the cross-file helper, also in §1).
+- `stage_Q(...)` — the padded sQ fill (n `:162`, r `:306`).
+
+**Cleanups introduced by the V-stage change:**
+- `flash_r_shm` (`:414`): the ternary is now vacuous — both branches return `32*(hd+8)*2` — so
+  collapse it to `64*(hd+8)*2 + 32*(hd+8)*2`.
+- `sK`/`sV` alias the same shared offset (`:295`/`:296`), correct because the f32 K-stage and the
+  f16 V-stage are mutually exclusive, but it reads as two live buffers; a one-line "union, mutually
+  exclusive" comment (or an actual union) makes the intent obvious.
+
+**Merge-prep:** the r-kernel is the better HD-256 path but still gated behind `LG_FLASH_REG`. To
+ship it as default, flip that for the SWA layers and validate E2B/12B; the n-kernel's HD-256 G=2
+branch then becomes dead (n stays for HD-512, G=1, G=4). Coherence screen on the rebased build:
+**PASS** (0 degenerate, 14/24 exact, 2 known-correct hard divergences — identical to pre-rebase).
