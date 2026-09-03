@@ -457,6 +457,24 @@ arch-string separator, a workaround `mtp_open` no longer needs.)
 | selected-16384, cold | 46.4 | 3.0 | 32.46 | +57% | −2% |
 | **selected-16384, adapted** | **55.5** | 3.0 | **35.49** | **+71%** | **+7.0%** |
 
+**E2B QAT** (measured 2026-09-02, Orin NX, clocks pinned; held-out prompt):
+
+| variant | acc % | draft ms/round | out tok/s | vs plain | vs full head |
+|---|---|---|---|---|---|
+| plain decode | — | — | 34.5 | — | — |
+| full head | 48.0 | 3.3 | 49.1 | +42% | — |
+| selected-16384, cold | 39.6 | 1.5 | 49.3 | +43% | +0.4% |
+| **selected-16384, adapted** | **48.2** | 1.5 | **54.1** | **+57%** | **+10.2%** |
+
+E2B completes the QAT trio and shows the **largest** relative gain. Its draft
+is already the cheapest (3.3 ms/round), so the cold list is a wash (+0.4%):
+acceptance falls to 39.6% because a code/docs corpus covers only ~84% of what
+E2B emits on the held-out domain. One adaptation cycle (base ∪ observed
+traffic) restores coverage, acceptance returns to 48.2% — matching the live
+full head's 48.0% — and the halved draft then lands **+10.2%** over it. Same
+mechanism as 12B/E4B; the smaller the model, the more the draft-time saving
+dominates the fixed verify cost.
+
 Three loops close here:
 
 - The 12B full head's steady-state draft is **21.3 ms/round — exactly** the

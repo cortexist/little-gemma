@@ -12,10 +12,13 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
                           ╰──────────────── append, repeat ◄───────────────╯
 ```
 
-**~6,100 lines of C/CUDA, no vendored dependencies** — and that includes
-multi-turn socket serving, image and audio understanding, a GPU vision
-encoder, tensor-core flash-attention prefill, a ring-buffered f16 KV cache,
-and byte-identical speculative decoding ([MTP](docs/mtp.md)).
+**~9,700 lines of C/CUDA for the shipped int8-CUDA build, no vendored
+dependencies** — 4,908 CPU · 8,282 f32-CUDA · 9,746 int8-CUDA, counted per
+binary as the include closure the compiler actually sees (the three backends
+are mutually exclusive, so no single program is their sum). That 9,746
+includes multi-turn socket serving, image and audio understanding, a GPU
+vision encoder, tensor-core flash-attention prefill, a ring-buffered f16 KV
+cache, and byte-identical speculative decoding ([MTP](docs/mtp.md)).
 
 ## Performance vs llama.cpp
 
@@ -40,6 +43,30 @@ description 31.5, code 40.7, fully predictable output 48.6 (57.8 at
 block-4) — and ahead of `llama-server`'s own `draft-mtp` at every point
 measured (prose 24.5, code 34.1, image 28.8).
 
+**Best-vs-best MTP** (experimental; Orin NX QAT, one prose turn, greedy,
+tokens/s, each config at its optimal block depth). little-gemma runs on its
+serve path, llama.cpp via `--spec-type draft-mtp` **with the same head** — a
+like-for-like engine comparison. Block depth is `LG_MTP_N` (a runtime knob) /
+llama's `--spec-draft-n-max`, shown at its optimum, which climbs with model
+size as acceptance headroom grows. Output stays **byte-identical** to plain
+greedy at every depth:
+
+| model | plain | little-gemma full head | llama.cpp full head | little-gemma reduced-vocab |
+|-------|------:|-----------------------:|--------------------:|---------------------------:|
+| E2B QAT | 34.5 | 49.2 (N=2) | 49.0 (n=2) | **54.1** (N=3) |
+| E4B QAT | 20.7 | 31.9 (N=4) | 30.4 (n=3) | **34.0** (N=4) |
+| 12B QAT |  9.8 | 16.4 (N=4) | — [^12b]   | **17.8** (N=4) |
+
+little-gemma's full head is level-to-ahead of llama's on the identical head;
+its **reduced-vocab** head — the tied draft head trimmed from 262,144 rows to
+16,384, which llama.cpp has no equivalent for — is fastest everywhere, +7–10%
+over our own full head. Content-type breakdowns and the trim study are in
+[docs/mtp-vocab-trim.md](docs/mtp-vocab-trim.md).
+
+[^12b]: llama.cpp's `draft-mtp` degenerates into a control-token loop on this
+12B QAT GGUF in the build tested (its tokenizer marks some control tokens as
+normal type); little-gemma decodes the same model + head cleanly.
+
 **Decode** (tokens/s, batch 1, speculation off) — ahead on the Jetson, the
 device this project targets, and at parity on desktop:
 
@@ -56,6 +83,11 @@ device this project targets, and at parity on desktop:
 |--------|-------|-------------:|----------:|------:|
 | Jetson Orin NX | E4B / 12B / E2B | 474 / 193 / 834 | 553 / 232 / 1,020 | 0.82–0.86× |
 | RTX A5000 | E4B / 12B / E2B | 4,335 / 2,067 / 7,222 | 5,254 / 2,365 / 8,785 | 0.82–0.87× |
+
+*The RTX A5000 rows across all three tables were measured on a separate
+Windows workstation. They will be re-based to the RTX PRO 4500 (Blackwell)
+dev box once identical E4B/E2B GGUFs are in place there; until then they are
+left un-updated.*
 
 The pattern is the project's thesis: decode speed is mostly everything
 *around* the matmul — launch overhead, syncs, norms, the PLE path, how the

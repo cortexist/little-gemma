@@ -48,29 +48,61 @@ is for.
 
 ## Lines of code
 
-| directory | files | code  |
-|-----------|-------|------:|
-| src       | 16    | 5,948 |
-| include   | 6     |   254 |
+| directory | files | code   |
+|-----------|-------|-------:|
+| src       | 18    | 10,140 |
+| include   | 6     |    567 |
 
-~6,200 lines of code in the repository (`tools/` not counted). The core
-vendors **nothing** — pure C/CUDA; media-file decoding lives in `mmcat` in
-the sibling little-gemma-tools repo. The backends are mutually exclusive, so
-no single program is anywhere near that. Each binary is the shared pipeline
-(GGUF parse, dequant, tokenizer, config, multimodal embedders, the MTP draft
-head, CLI + socket server — 2,711 lines) plus exactly one backend:
+~10,700 lines across `src/` and `include/` (`tools/` not counted). But the
+static total is not the number that matters: **the three backends are
+mutually exclusive**, so we count by run path — the include closure each
+binary actually compiles. The core vendors **nothing** — pure C/CUDA;
+media-file decoding lives in `mmcat` in the sibling little-gemma-tools repo.
+Every binary is the shared pipeline (GGUF parse, dequant, tokenizer, config,
+media orchestration and the PLE/vision/audio embedders, the MTP draft head,
+CLI + socket server — 4,382 lines) plus exactly one backend:
 
-| binary        | backend on top of the shared 2,711                         | code lines |
-|---------------|------------------------------------------------------------|-----------:|
-| `run`         | `model-cpu.c`                                              |      3,079 |
-| `run-cuda`    | `model-cuda.cuh` + `model-cuda-f32.cu` + `media-kernel.cu` |      5,128 |
-| `run-cuda-i8` | `model-cuda.cuh` + `model-cuda-i8.cu` + `media-kernel.cu`  |      6,058 |
+| binary        | backend on top of the shared 4,382                                                                    | total |
+|---------------|-------------------------------------------------------------------------------------------------------|------:|
+| `run`         | `model-cpu.c` + `media-gpu-stub.c`                                                                     | 4,908 |
+| `run-cuda`    | `model-cuda.cuh` + `prefill-kernel.cuh` + `mtp-kernel.cuh` + `model-cuda-f32.cu` + `media-kernel.cu`   | 8,282 |
+| `run-cuda-i8` | `model-cuda.cuh` + `prefill-kernel.cuh` + `mtp-kernel.cuh` + `model-cuda-i8.cu` + `media-kernel.cu`    | 9,746 |
 
 (`graph.c`/`graph.h`, the teaching tensor/graph layer, are exercised by
-`graph_test` only.) So the program that decodes ahead of llama.cpp CUDA on the
-Jetson E4B/12B — multi-turn socket serving, batched wide-chunk
-prefill, a ring-buffered f16 KV cache, tensor-core flash-attention prefill,
-split-K decode, image and audio understanding, a GPU vision encoder, an own
-m16n8k32 tensor-core q4_K/q4_0 prefill kernel, and byte-identical speculative
-decoding included — is **about 6,100 lines of C end to end**, tokenizer and
-all, with no vendored dependency.
+`graph_test` only and compile into no run path.) So the program that decodes
+ahead of llama.cpp CUDA on the Jetson E4B/12B — multi-turn socket serving,
+batched wide-chunk prefill, a ring-buffered f16 KV cache, tensor-core
+flash-attention prefill, split-K decode, image and audio understanding, a GPU
+vision encoder, an own m16n8k32 tensor-core q4_K/q4_0 prefill kernel, and
+byte-identical speculative decoding included — is **about 9,700 lines of
+C/CUDA end to end**, tokenizer and all, with no vendored dependency. Of that,
+~2,200 lines are the image/audio path (`media.c` + `media-kernel.cu` and their
+headers); a text-only int8 build is **~7,500 lines**.
+
+## 2026-09-03 — where the i8 path grew (~6,900 → 9,746)
+
+Since 2026-06-15 (pre-reorganization) the shipped `run-cuda-i8` build went from
+~6,900 lines to 9,746 by its include closure — about **+2,850**, in two roughly
+equal halves, both functional rather than churn:
+
+- **+1,134 — the E2B/E4B audio path, re-introduced.** `media.c` (562 → 1,070)
+  and its GPU kernels (`media-cuda.cu` → `media-kernel.cu`, 381 → 955) plus
+  headers. Genuinely new capability — the E-series legacy-encoder audio brought
+  back alongside the 12B's encoder-free path, not a refactor.
+
+- **+1,289 — prefill and MTP kernels.** The 2,012-line `model-cuda.cuh` monolith
+  split into `model-cuda.cuh` + `prefill-kernel.cuh` + `mtp-kernel.cuh` and grew,
+  and the int8 backend (`model-cuda-i8r.cu` → `model-cuda-i8.cu`, 1,108 → 1,602)
+  gained the m16n8k32 tensor-core q4_K/q4_0 kernel and the 2-row MTP verify.
+
+**MTP is the win**: byte-identical speculative decode, level-to-ahead of
+llama.cpp on the *same* head, and the reduced-vocab head — which llama.cpp has
+no equivalent for — faster still; block depth is now a runtime knob whose
+optimum lands per model (E2B N=2 → 12B N=4). **Prefill is the hard one** — it
+runs through llama.cpp's home turf, arch-tuned tensor-core GEMMs — but the
+campaign finally moved the needle on 2026-09-02.
+
+The remaining ~+430 is serving-loop glue (`run.c` 598 → 842: MTP serve
+integration, streaming/barge-in, the think budget) and GGUF/host odds and ends.
+The July monolith split changed structure, not net lines — the growth is real
+encoder and kernel code.
