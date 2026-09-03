@@ -20,7 +20,7 @@
 // un-captured form is ~1030 raw launches/step, where sync MTP died on WDDM).
 static void verify_head_spec(struct model *m) {
     const struct config *c = &m->cfg;
-    const int n_embd = c->n_embd, N = LG_MTP_N;
+    const int n_embd = c->n_embd, N = g_mtp_n;
     rmsnorm_kernel<<<N, NORM_THREADS(n_embd)>>>(dx, dx, dW(m, "output_norm.weight"), n_embd, c->rms_eps, actq_for(N * n_embd));
     matmul_q_spec(d_logits_spec, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
@@ -30,7 +30,7 @@ static void verify_head_spec(struct model *m) {
 }
 static void verify_layers_and_head_spec(struct model *m, struct kvcache *kv, int has_ple) {
     g_chunk_verify = 1;                  // verify uses decode's split-K attn, not prefill flash/share
-    chunk_layers(m, kv, has_ple, LG_MTP_N, matmul_q_spec);
+    chunk_layers(m, kv, has_ple, g_mtp_n, matmul_q_spec);
     g_chunk_verify = 0;
     verify_head_spec(m);
 }
@@ -49,7 +49,7 @@ static void verify_profiled(struct model *m, struct kvcache *kv, int has_ple) {
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     double t0 = now_sec_dev();
     g_chunk_verify = 1;
-    chunk_layers(m, kv, has_ple, LG_MTP_N, matmul_q_spec);
+    chunk_layers(m, kv, has_ple, g_mtp_n, matmul_q_spec);
     g_chunk_verify = 0;
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     double t1 = now_sec_dev();
@@ -81,7 +81,7 @@ static void verify_graph_spec(struct model *m, struct kvcache *kv, int has_ple) 
 
 extern "C" int model_forward_spec(struct model *m, struct kvcache *kv, const int *toks, int pos, int *out) {
     const struct config *c = &m->cfg;
-    const int n_embd = c->n_embd, N = LG_MTP_N;
+    const int n_embd = c->n_embd, N = g_mtp_n;
     float *rows = (float *)malloc((size_t)N * n_embd * 4);
     if (!rows) { fprintf(stderr, "model_forward_spec: out of memory\n"); exit(1); }
     float es = sqrtf((float)n_embd);

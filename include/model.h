@@ -145,12 +145,25 @@ void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
 // first forward. LG_PREFILL_MAX_B caps the width (a deployment's VRAM throttle).
 void model_prefill_reserve(void);
 
-// MTP speculation block depth (verify width), a COMPILE-TIME constant. DEFAULT 3: a
-// chained 2nd draft + triple verify, 1.1-1.3x over block-2 on 12B (A5000 and Orin),
-// output byte-identical. Build -DLG_MTP_N=2 for the conservative one-draft pair verify;
-// N generalizes. Recompile to change.
+// MTP speculation block depth (verify width). RUNTIME knob: env LG_MTP_N picks the
+// depth per run (default 3: a chained 2nd draft + triple verify, 1.1-1.3x over block-2
+// on 12B; deeper pays once drafting is cheap — a trimmed head or a small model, where
+// the optimum differs model to model). Output is byte-identical at every N. -DLG_MTP_N=k
+// sets the compile-time DEFAULT; LG_MTP_N_MAX is the ceiling that sizes the verify
+// buffers and the verify-kernel template dispatch, so the live depth clamps to
+// [2, LG_MTP_N_MAX]. g_mtp_n is the live value (set once from env in main).
 #ifndef LG_MTP_N
 #define LG_MTP_N 3
+#endif
+#ifndef LG_MTP_N_MAX
+#define LG_MTP_N_MAX 8
+#endif
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int g_mtp_n;
+#ifdef __cplusplus
+}
 #endif
 
 // ---- MTP: the gemma4-assistant draft head (src/mtp.c) ----------------------

@@ -761,7 +761,7 @@ static size_t tensor_bytes(const struct gguf_tensor *t) {
 }
 
 static void ensure_weights(struct model *m) {
-    ensure_split(LG_MTP_N * m->cfg.n_head);   // split-K scratch: decode B=1 + the B=LG_MTP_N verify; alloc here (pre-capture, no warmup after a chunked prefill)
+    ensure_split(LG_MTP_N_MAX * m->cfg.n_head);   // split-K scratch: decode B=1 + the B<=LG_MTP_N_MAX verify; size for the max depth (alloc here, pre-capture, no warmup after a chunked prefill)
     if (d_blob || g_dw) return;
     g_ctx = m->ctx;
     // On an integrated GPU (Jetson) host and device share the same DRAM, so
@@ -977,8 +977,8 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaMalloc(&dvb, B * maxkv * 4)); CUDA_CHECK(cudaMalloc(&dg1, B * nff * 4));
     CUDA_CHECK(cudaMalloc(&dg2, B * nff * 4));   CUDA_CHECK(cudaMalloc(&dlogits, (size_t)c->n_vocab * 4));
     CUDA_CHECK(cudaMalloc(&g_hidden, (size_t)ne * 4));
-    CUDA_CHECK(cudaMalloc(&d_logits_spec, (size_t)LG_MTP_N * c->n_vocab * 4));   // MTP verify rows
-    CUDA_CHECK(cudaMalloc(&d_best_spec, LG_MTP_N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_logits_spec, (size_t)LG_MTP_N_MAX * c->n_vocab * 4));   // MTP verify rows (sized for max depth)
+    CUDA_CHECK(cudaMalloc(&d_best_spec, LG_MTP_N_MAX * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(int)));
     if (ple > 0) {
