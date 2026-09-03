@@ -78,3 +78,31 @@ byte-identical speculative decoding included — is **about 9,700 lines of
 C/CUDA end to end**, tokenizer and all, with no vendored dependency. Of that,
 ~2,200 lines are the image/audio path (`media.c` + `media-kernel.cu` and their
 headers); a text-only int8 build is **~7,500 lines**.
+
+## 2026-09-03 — where the i8 path grew (~6,900 → 9,746)
+
+Since 2026-06-15 (pre-reorganization) the shipped `run-cuda-i8` build went from
+~6,900 lines to 9,746 by its include closure — about **+2,850**, in two roughly
+equal halves, both functional rather than churn:
+
+- **+1,134 — the E2B/E4B audio path, re-introduced.** `media.c` (562 → 1,070)
+  and its GPU kernels (`media-cuda.cu` → `media-kernel.cu`, 381 → 955) plus
+  headers. Genuinely new capability — the E-series legacy-encoder audio brought
+  back alongside the 12B's encoder-free path, not a refactor.
+
+- **+1,289 — prefill and MTP kernels.** The 2,012-line `model-cuda.cuh` monolith
+  split into `model-cuda.cuh` + `prefill-kernel.cuh` + `mtp-kernel.cuh` and grew,
+  and the int8 backend (`model-cuda-i8r.cu` → `model-cuda-i8.cu`, 1,108 → 1,602)
+  gained the m16n8k32 tensor-core q4_K/q4_0 kernel and the 2-row MTP verify.
+
+**MTP is the win**: byte-identical speculative decode, level-to-ahead of
+llama.cpp on the *same* head, and the reduced-vocab head — which llama.cpp has
+no equivalent for — faster still; block depth is now a runtime knob whose
+optimum lands per model (E2B N=2 → 12B N=4). **Prefill is the hard one** — it
+runs through llama.cpp's home turf, arch-tuned tensor-core GEMMs — but the
+campaign finally moved the needle on 2026-09-02.
+
+The remaining ~+430 is serving-loop glue (`run.c` 598 → 842: MTP serve
+integration, streaming/barge-in, the think budget) and GGUF/host odds and ends.
+The July monolith split changed structure, not net lines — the growth is real
+encoder and kernel code.
