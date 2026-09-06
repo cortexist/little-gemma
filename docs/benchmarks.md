@@ -5,6 +5,12 @@ all three models, measured in one sitting. **These tables supersede every
 number published before 2026-07-16** (a reconciliation of the older,
 mutually inconsistent figures is at the bottom).
 
+**2026-09-05 update:** the Orin QAT prefill rows now use cache-only prefill,
+validated against the full path on the same binary. E2B improves 2.91x and E4B
+1.75x; decode is unchanged. All other device/quant rows retain their historical
+measurement dates. Details and correctness gates are in the
+[prefill journal](prefill-performance-journal.md#2026-09-05--cache-only-prefill-stop-after-the-last-kv-write).
+
 - **Date / builds:** prefill 2026-07-16, decode 2026-07-17 (after the KV-split
   fix — prefill is untouched by it and was re-measured as the control:
   A5000 E2B 7,260 → 7,307, i.e. unchanged). **E4B/12B QAT rows and the MTP
@@ -104,13 +110,20 @@ rows where llama's arch-tuned matvec leads — on the QAT defaults every
 pair is at parity or ahead. [MTP](mtp.md) multiplies on top of these
 numbers, byte-identical output — see the dedicated section below.
 
-## Prefill (prompt tokens/s, 929-token turns)
+## Prefill (prompt tokens/s)
 
-| device | model | little-gemma | llama.cpp (pp929) | ratio |
+The Orin QAT rows were remeasured on 2026-09-05: 930-token serve turns,
+3-4 warm samples, and same-session `llama-bench -p 930 -n 0 -fa 0,1 -r 3
+-mmp 0` (best attention mode). Engine base `33dce69` plus the cache-only
+change; llama fork `cd5ad883e`; CUDA 12.6/sm_87, pinned MAXN clocks. The
+other rows below remain historical 929-token measurements. The old fixture
+name `line929s.txt` now produces 930 input tokens in serve mode.
+
+| device | model | little-gemma | llama.cpp | ratio |
 |--------|-------|-------------:|------------------:|------:|
-| Orin NX | **E4B QAT** | 474 | 553 | **0.86×** |
-| Orin NX | **12B QAT** | 193 | 232 | 0.84× |
-| Orin NX | E2B QAT | 834 | 1,020 | 0.82× |
+| Orin NX | **E4B QAT** | **853.1** | 554.6 | **1.54×** |
+| Orin NX | **12B QAT** | 201.9 | 231.5 | 0.87× |
+| Orin NX | E2B QAT | **2,543.3** | 1,020.4 | **2.49×** |
 | Orin NX | E4B Q4_K_M *(superseded)* | 426 | 524 | 0.81× |
 | Orin NX | 12B Q4_K_M *(superseded)* | 174 | 217 | 0.80× |
 | A5000 | **E4B QAT** | 4,335 | 5,254 | 0.83× |
@@ -119,16 +132,15 @@ numbers, byte-identical output — see the dedicated section below.
 | A5000 | E4B Q4_K_M *(superseded)* | 3,703 | 4,846 | 0.76× |
 | A5000 | 12B Q4_K_M *(superseded)* | 1,782 | 2,207 | 0.81× |
 
-**Prefill is 0.8× llama.cpp — 0.76–0.82 across six pairs on two devices,
-one consistent number.** The 2026-07 prefill campaign took it from ~0.2× to
-here (A5000 12B 533 → 1,782; Orin E4B 192 → 426) and measured the residual to its floor:
-what remains is llama.cpp's ground-up MMQ instruction schedule and
-flash-attention architecture, priced (wholesale kernel adoption) and
-declined. The full campaign — every kept lever and every falsified one — is
-[prefill-performance-journal.md](prefill-performance-journal.md);
-in interactive serving the gap rarely shows (turns are short, `-sys` removes
-the skills re-prefill, the GPU encoder removed the image one), but on very
-long documents llama.cpp still wins the wait.
+**Orin E2B and E4B now lead this prefill comparison; 12B remains behind.**
+Cache-only prefill stops immediately after the last required KV write. The
+shared-KV suffix of the E-series models has no live output for these prompt
+rows, so its attention and FFN work can be omitted without changing the cache
+or generated tokens. The first chunk still runs fully to initialize allocations
+before graph capture. A cold one-chunk prompt therefore retains its old cost.
+The A5000 has not been remeasured with this change; its rows above predate it.
+The full campaign and rejected experiments are in
+[prefill-performance-journal.md](prefill-performance-journal.md).
 
 ## MTP speculative decoding (2026-07-19, the 2-row verify kernel)
 

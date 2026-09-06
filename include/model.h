@@ -115,9 +115,8 @@ extern int (*model_pick)(const float *logits, int n);
 // norm, the n_vocab×n_embd output projection (~10% of a token's weight
 // traffic), and the argmax/sync. Use it for every prompt token but the last,
 // whose logits pick the first generated token. The CUDA backends process the
-// span in fixed-size chunks so each weight matrix is read from memory once per
-// chunk instead of once per token — prefill is bandwidth-bound, so that factor
-// is most of its cost.
+// span in chunks and, after allocation warmup, stop at the final KV write:
+// later operations (including layers that only reuse KV) have no live output.
 void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0);
 
 // Prefill a span of PRE-COMPUTED embedding rows (media tokens from media.h):

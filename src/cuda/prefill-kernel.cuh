@@ -543,11 +543,21 @@ static double pf_tick(double *acc) {
     return now;
 }
 
-static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B, matmul_fn mm) {
+static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B, matmul_fn mm,
+                         bool cache_only = false) {
     const struct config *c = &m->cfg;
     const int n_embd = c->n_embd, n_head = c->n_head;
     const float eps = c->rms_eps;
     const float *d_rope_freqs = dW(m, "rope_freqs.weight");
+
+    // Prefill consumes only KV: the final prompt token runs separately through
+    // model_forward_next. After the last KV-owning layer writes its cache, no
+    // later operation can affect a future token. Keep the first chunk complete
+    // so every lazy weight repack/allocation precedes decode graph capture.
+    // MTP verify needs every hidden row and leaves cache_only false.
+    static int full_prefill = -1;
+    if (full_prefill < 0) full_prefill = getenv("LG_PREFILL_FULL") != NULL;
+    cache_only = cache_only && g_graph_warmups >= 2 && !full_prefill;
 
     pf_tick(NULL);
     for (int L = 0; L < c->n_layer; L++) {
@@ -557,6 +567,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         const float base = local ? c->rope_freq_base_swa : c->rope_freq_base;
         const float *ff = local ? NULL : d_rope_freqs;
         const float *os = dW_layer(m, L, "layer_output_scale.weight");
+        const bool last_kv = cache_only && L + 1 == c->n_kv_start;
 
         // ---- attention ----
         norm_n(dh, dx, dW_layer(m, L, "attn_norm.weight"), n_embd, eps, actq_for(B * n_embd), B);
@@ -570,10 +581,12 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
             if (wv) mm(dvb, wv, dh, n_embd, kv_dim);
             else    CUDA_CHECK(cudaMemcpyAsync(dvb, dkb, (size_t)B * kv_dim * 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         }
-        mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
+        if (!last_kv) mm(dq, wq_layer(m, L, "attn_q.weight"), dh, n_embd, q_dim);
         pf_tick(&g_pf_mm);
-        rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
-        rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, rope_tab(base, hd), ff, n_head * hd / 2, B);
+        if (!last_kv) {
+            rmsnorm_kernel<<<B * n_head, 256>>>(dq, dq, dW_layer(m, L, "attn_q_norm.weight"), hd, eps, AQ0);
+            rope_n_kernel<<<gridn(B * n_head * hd / 2), 256>>>(dq, hd / 2, hd, d_pos, rope_tab(base, hd), ff, n_head * hd / 2, B);
+        }
         if (has_kv) {
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dkb, dkb, dW_layer(m, L, "attn_k_norm.weight"), hd, eps, AQ0);
             rmsnorm_kernel<<<B * n_head_kv, 256>>>(dvb, dvb, NULL, hd, eps, AQ0);
@@ -592,6 +605,7 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
                 kv_write_n_kernel<<<gridn(B * kv_dim), 256>>>((float *)kv->v[L], dvb, d_pos, kv_dim, B);
             }
         }
+        if (last_kv) { pf_tick(&g_pf_elem); return; }
         const void *Kc = kv->k[src], *Vc = kv->v[src];
         pf_tick(&g_pf_elem);
         int gqa = n_head / n_head_kv;
@@ -733,7 +747,7 @@ static void forward_chunk(struct model *m, struct kvcache *kv, const int *tokens
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));  // kernels add the row index
     build_per_layer_n(m, tokens, B, matmul_q_n);
-    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n, true);
 }
 
 // Embedding form (media tokens): the rows enter exactly as given — media
@@ -751,7 +765,7 @@ static void forward_chunk_embd(struct model *m, struct kvcache *kv, const float 
         int pad[PREFILL_MAX_B] = { 0 };
         build_per_layer_n(m, pad, cols, matmul_q_n);
     }
-    chunk_layers(m, kv, has_ple, cols, matmul_q_n);
+    chunk_layers(m, kv, has_ple, cols, matmul_q_n, true);
 }
 
 // Mixed form: each chunk position is a text token (ids[j] >= 0: looked-up,
@@ -785,7 +799,7 @@ static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float
 
     CUDA_CHECK(cudaMemcpy(d_pos, &pos0, sizeof(int), cudaMemcpyHostToDevice));
     build_per_layer_n(m, toks, B, matmul_q_n);
-    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n);
+    chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n, true);
 }
 
 // Pre-size the int8 activation scratch to the 128-wide max BEFORE any chunk or

@@ -1751,3 +1751,110 @@ rescale FMAs sit in the shadow of those stalls, so removing them frees nothing.
 The lever is aimed at a constraint we don't have. **Re-test on Blackwell/Thor**,
 where the balance flips and it's expected to pay — the ~15-line patch reattaches
 at the `acc *= cA/cB` loop in `flash_attn_n_kernel`.
+
+## 2026-09-05 — cache-only prefill: stop after the last KV write
+
+The public prefill API produces **only KV cache entries**. Both serve and
+one-shot generation feed the final prompt token separately through
+`model_forward_next`, which computes its hidden state and logits. Nevertheless,
+`chunk_layers` ran every layer for every prefill row, stopping only before the
+output head. Gemma's shared-KV suffix does not write any cache entries: its
+attention and FFN outputs were entirely discarded. Even on a model without KV
+sharing, everything after the last layer's K/V write is discarded.
+
+**Change:** the three CUDA prefill chunk wrappers explicitly request cache-only
+execution. In the last KV-owning layer, compute the normalized K/V projections,
+RoPE and cache writes, then return. Its Q projection and everything following
+the write are omitted. All preceding layers and all stored cache values follow
+the original arithmetic. MTP verification leaves the new argument false and
+still computes every hidden row; decode is unchanged. `LG_PREFILL_FULL=1`
+restores the full prefill path for differential testing.
+
+**Warmup exception is necessary:** the first chunk still runs every layer while
+`g_graph_warmups < 2`. It initializes lazy weight repacks and scratch before
+decode graph capture. Consequently a cold one-chunk one-shot prompt retains
+its old cost; warm serving and later chunks benefit. Removing the suffix from
+that allocation warmup would move CUDA allocations into graph capture.
+
+### Orin measurements
+
+Orin NX 16 GB, MAXN, GPU 918 MHz and EMC 3199 MHz pinned. Actual checkout paths
+on this machine are `~/repos/cortexist/{little-gemma,llama.cpp}`. Engine base:
+`33dce6961156b2c3e5f00893a40daf2ac2a59ced` (the local checkout is `765aa5b`;
+the remote also includes runtime MTP depth). CUDA 12.6, Release, sm_87.
+QAT models from `~/gguf`. Isolated build and raw logs:
+`cortex:/tmp/lg-prefill-work-2026-09-05` and
+`cortex:/tmp/lg-prefill-2026-09-05`.
+
+Same-binary full/cache-only/full A/B/A, fresh connection per turn, first turn
+discarded, median of 3 warm turns (4 on E4B). `bench/line929s.txt` actually
+reports **930 input tokens** in this build; these are not silently relabeled
+as the historical 929-token measurements. All warm reply hashes match across
+the three configurations.
+
+| QAT model | full prefill tok/s | cache-only tok/s | speedup | decode before/after |
+|---|---:|---:|---:|---:|
+| E2B | 872.9 / 873.2 | **2543.3** | **2.91x** | 34.1 / 34.1 |
+| E4B | 488.1 / 488.2 | **853.1** | **1.75x** | 20.7 / 20.7 |
+| 12B | 197.3 / 197.3 | **201.9** | **1.023x** | 9.4 / 9.4 |
+
+Same-session llama-bench reference (`cd5ad883e`, `-p 930 -n 0 -fa 0,1 -r 3
+-mmp 0`, page caches dropped before each model; FA=1 wins all three):
+E2B **1020.4**, E4B **554.6**, 12B **231.5** tok/s. New engine/reference
+ratios: **2.49x / 1.54x / 0.87x**. The harness asymmetry remains: our measured
+serve prefill includes its final token's first pick, while llama-bench uses
+random prompt tokens and measures its batch API. These are throughput
+comparisons, not identical-prompt answer-quality comparisons.
+
+The E4B cache-owning prefix is 24 of 42 layers. The 12B has no shared-KV
+suffix, so its smaller gain comes solely from cutting the final layer after
+its cache write. This is removal of unused computation, not faster matmul or
+changed attention numerics. The earlier kernel-level exhaustion verdicts did
+not establish that all those kernel launches were necessary.
+
+### Reproduction and validation tools
+
+`bench/prefill-ab.py` saves raw replies, stderr, binary/prompt SHA-256 hashes,
+environment overrides, measured token counts and warm rates. Example:
+
+```sh
+python3 bench/prefill-ab.py --model "$MODEL" --out /tmp/prefill-ab \
+  --config LG_PREFILL_FULL=1 --config LG_WIDE_CHUNK=768 \
+  --config LG_PREFILL_FULL=1
+```
+
+`prefill_cache_test` is an explicitly built CUDA test, excluded from the
+normal build and CTest because it requires model weights. It compares all
+allocated KV bytes by checksum (unused storage is zeroed first), then emits
+12 continuation token IDs, for cold prefill, long token prefill, mixed text,
+mixed text/media with bidirectional masking, and direct embedding prefill.
+The long fixture has 3,924 prefilled tokens and exercises SWA ring wraps.
+See `test/prefill-cache.c` for the full-vs-cache differential commands.
+
+**Passed on all three QAT models:** every KV checksum and all 12 continuation
+IDs match in all five cases (15 differential cases). This checks cold graph
+warmup and media cache semantics directly, beyond the redundant Paris fixture.
+
+MTP serve A/B also passes on all three matched QAT heads: replies match plain
+decode and the full-prefill control; acceptance remains E2B 39.5%, E4B 38.2%,
+12B 60.9%. Warm speculative decode is unchanged (41.2, ~26.5, 13.2 tok/s on
+this fixture). This specifically guards the shared `chunk_layers` entry point.
+Both CUDA backends build. The f32 backend also passes a full/cache-only E2B
+serve smoke test (21-token Paris prompt, identical replies). Its 930-token
+probe was stopped because the f32 prefill path was too slow for a smoke check;
+no throughput result is claimed for that interrupted run.
+
+### Experiments rejected before the cache audit
+
+- Chunk widths 512/768/1024: 512 and 768 select the same balanced chunks at
+  930 tokens. Width 1024 gained only 0.8% E4B, 0.9% E2B, 0.3% 12B; no
+  default changed on that single-length evidence.
+- `LG_Q4K_SWAPXY=1` on QAT E4B: 488.0 -> 487.9 -> 488.0, identical output.
+  Device-resident q4_0 repacks did not make the launch-order change profitable.
+- Warp count 4: 471.3, slower than 488.0; forced 8: 489.8, a small gain
+  insufficient to replace the general launch policy.
+- Compact q4_0 activation-scale staging (omit unused sums, halve scale shared
+  storage): 487.8 vs 488.1 control, identical output. Patch reverted; experiment
+  preserved locally in `.scratch/prefill-2026-09-05/scale-only.patch`.
+- Existing `LG_FLASH_REG=1`: 502.9 on E4B, reproducing its gain, but a changed
+  greedy reply. It remains opt-in; the cache-only change uses the default flash.
