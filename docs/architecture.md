@@ -77,7 +77,7 @@ bisections included, are [performance-journal.md](performance-journal.md)
 and [prefill-performance-journal.md](prefill-performance-journal.md).
 The complete voice pipeline — mic → whisper → serve → streaming piper, with
 runnable commands and every measurement harness — is
-[voice-pipeline.md](voice-pipeline.md) + [`bench/`](../bench/).
+[voice-pipeline.md](voice-pipeline.md) + [`bench/`](https://github.com/cortexist/research/tree/main/little-gemma/bench/).
 
 ## Validation
 

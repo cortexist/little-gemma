@@ -11,3 +11,7 @@ build-*/
 /CTestTestfile.cmake
 /Makefile
 /cmake_install.cmake
+
+# Benchmark research lives in the protected cortexist/research repository.
+/AGENTS.md
+/bench/

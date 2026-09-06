@@ -34,7 +34,7 @@ python3 -m piper.split ~/voices/en_US-kristin-medium.onnx
 ./build/run-cuda-i8 \
     -m   gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
     -mtp mtp-gemma-4-E2B-it.gguf \
-    -sys docs/voice-sys.txt \
+    -sys ../research/little-gemma/docs/voice-sys.txt \
     -s   /tmp/lg.sock &
 
 # 2. ears | glue | mouth — one shell pipeline, mic to speaker

@@ -4,7 +4,7 @@ Two questions that get to the heart of the decode/prefill split, with honest
 answers. Numbers are the 2026-07-17 state (after the split-K decode fix); the
 full tables and methodology are in [benchmarks.md](benchmarks.md), the prefill
 decomposition in [prefill-performance-journal.md](prefill-performance-journal.md),
-and the upstream comparison in [upstream-llama-study.md](upstream-llama-study.md).
+and the upstream comparison in [upstream-llama-study.md](https://github.com/cortexist/research/blob/main/little-gemma/docs/upstream-llama-study.md).
 
 ## Q1 — What makes little-gemma up to 27% faster at decoding on the Orin? If there are many small tweaks, what's the most remarkable one?
 
