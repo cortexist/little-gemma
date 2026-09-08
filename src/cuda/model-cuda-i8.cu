@@ -98,14 +98,6 @@ __device__ static int nib4(uint32_t w, int half) { return (int)(half ? (w >> 4) 
 
 // d_gsm with the 12 scale bytes read as 3 words instead of 2-3 scattered bytes
 // (same bits, fewer and wider loads); s must be 4-aligned (it is: offset 4).
-__device__ static void d_gsm32(int j, const uint32_t *s, uint8_t *d, uint8_t *m) {
-    if (j < 4) { *d = (s[0] >> (8 * j)) & 63; *m = (s[1] >> (8 * j)) & 63; }
-    else {
-        int b = 8 * (j - 4);
-        *d = ((s[2] >> b) & 0x0F) | (((s[0] >> (b + 6)) & 3) << 4);
-        *m = (((s[2] >> b) >> 4) & 0x0F) | (((s[1] >> (b + 6)) & 3) << 4);
-    }
-}
 // Same bits, the 3 scale words already in registers (the mma kernel loads them
 // once per row rather than re-reading the uncached in-place blob per sub-block).
 __device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, uint8_t *d, uint8_t *m) {
@@ -115,6 +107,13 @@ __device__ static void d_gsm32r(int j, uint32_t s0, uint32_t s1, uint32_t s2, ui
         *d = ((s2 >> b) & 0x0F) | (((s0 >> (b + 6)) & 3) << 4);
         *m = (((s2 >> b) >> 4) & 0x0F) | (((s1 >> (b + 6)) & 3) << 4);
     }
+}
+__device__ static void d_gsm32(int j, const uint32_t *s, uint8_t *d, uint8_t *m) {
+    d_gsm32r(j, s[0], s[1], s[2], d, m);
+}
+__device__ static uint32_t q6w(uint32_t l, uint32_t h, int hin, int sh) {
+    uint32_t lo = hin ? (l >> 4) & 0x0F0F0F0Fu : l & 0x0F0F0F0Fu;
+    return __vsub4(lo | (((h >> sh) & 0x03030303u) << 4), 0x20202020u);
 }
 // d and dmin are adjacent fp16 — one word load covers both.
 __device__ static void d_dm(const ggml_half *dp, float *d, float *mn) {
@@ -181,10 +180,7 @@ __device__ static float sub_q6_Kr(const block_q6_Kr *p, int sj, const int8_t *xq
     const int8_t *xqg = xqb + g_act * 32 + hl * 16;
     int dot = 0;                                   // 6-bit value minus 32 (signed, -32..31)
     for (int i = 0; i < 16; i += 4) {
-        uint32_t l32 = ld32(ql + i);
-        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
-        uint32_t hi = ((ld32(qh + i) >> sh) & 0x03030303u) << 4;
-        int w = (int)__vsub4(lo | hi, 0x20202020u);
+        int w = (int)q6w(ld32(ql + i), ld32(qh + i), hin, sh);
         dot = __dp4a(w, *(const int *)(xqg + i), dot);
     }
     return xds[g_act].x * d_fp16(p->d) * p->scales[ni * 8 + 2 * grp + hl] * dot;
@@ -309,10 +305,7 @@ __device__ static void sub_q6_Kr_n(const block_q6_Kr *p, int sj, const int8_t *x
     int g_act = ni * 4 + grp;
     int w[4];
     for (int i = 0; i < 16; i += 4) {
-        uint32_t l32 = ld32(ql + i);
-        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
-        uint32_t hi = ((ld32(qh + i) >> sh) & 0x03030303u) << 4;
-        w[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+        w[i >> 2] = (int)q6w(ld32(ql + i), ld32(qh + i), hin, sh);
     }
     float dd = d_fp16(p->d);
     float sc8 = p->scales[ni * 8 + 2 * grp + hl];
@@ -414,16 +407,10 @@ __device__ static void sub2_q6_Kr(const block_q6_Kr *pa, const block_q6_Kr *pb, 
     int g_act = ni * 4 + grp;
     int wa[4], wb[4];
     for (int i = 0; i < 16; i += 4) {
-        uint32_t l32 = ld32(qla + i);
-        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
-        uint32_t hi = ((ld32(qha + i) >> sh) & 0x03030303u) << 4;
-        wa[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+        wa[i >> 2] = (int)q6w(ld32(qla + i), ld32(qha + i), hin, sh);
     }
     for (int i = 0; i < 16; i += 4) {
-        uint32_t l32 = ld32(qlb + i);
-        uint32_t lo = hin ? (l32 >> 4) & 0x0F0F0F0Fu : l32 & 0x0F0F0F0Fu;
-        uint32_t hi = ((ld32(qhb + i) >> sh) & 0x03030303u) << 4;
-        wb[i >> 2] = (int)__vsub4(lo | hi, 0x20202020u);
+        wb[i >> 2] = (int)q6w(ld32(qlb + i), ld32(qhb + i), hin, sh);
     }
     float dda = d_fp16(pa->d), ddb = d_fp16(pb->d);
     float sca = pa->scales[ni * 8 + 2 * grp + hl];
@@ -743,8 +730,9 @@ static void q6_build_all(void) {
         size_t bytes = (size_t)nb * sizeof(block_q6_Kr);
         unsigned char *dev;
         if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); free(q6r); continue; }
-        cudaMemcpy(dev, q6r, bytes, cudaMemcpyHostToDevice);
+        cudaError_t copied = cudaMemcpy(dev, q6r, bytes, cudaMemcpyHostToDevice);
         free(q6r);
+        if (copied != cudaSuccess) { cudaFree(dev); cudaGetLastError(); continue; }
         g_rw_q6[(size_t)i] = dev; made += bytes; n_made++;
     }
     fprintf(stderr, "q6_K proj repack: %d tensor(s), %.1f MB -> mma prefill path", n_made, made / 1e6);
@@ -1250,12 +1238,8 @@ static int mma_integrated(void) {
     return integ;
 }
 
-// q4_K mma launcher for a compile-time COLS. Mirrors launch_q6k_mmq: 32 rows/warp,
-// shrink warps-per-CTA to keep the grid over the SMs, carve out the dynamic shared
-// past 48 KB once. The A tile is 2 tiles x 2 halves x 16 rows x SA_ROW per warp.
-template<int COLS, int Q40 = 0>
-static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
-                           int k, int m, int sms, int ncol = 1) {
+struct mma_grid { dim3 blocks; int wpc, swapxy; };
+static mma_grid mma_launch_grid(int m, int sms, int ncol) {
     int wpc = 8;
     // The warps-per-CTA shrink keeps tiny grids over the SMs — an 8-SM Orin
     // tuning. On a discrete card it backfires: a 128-thread CTA still occupies
@@ -1268,25 +1252,28 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
     if (wpc_force > 0) wpc = wpc_force;
     else if (wpc_force == -1 || mma_integrated())
         while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;
+    // Column tiles on x keep weights L2-hot on discrete GPUs. Tegra zero-copy
+    // weights aren't L2-cached. LG_Q4K_SWAPXY overrides this for both kernels.
+    static int swapxy = -2;
+    if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }
+    int blocks = (m + 32 * wpc - 1) / (32 * wpc), swap = swapxy && ncol > 1;
+    return {swap ? dim3(ncol, blocks) : dim3(blocks, ncol), wpc, swap};
+}
+
+// q4_K MMA: 32 rows/warp; A holds 2 tiles x 2 halves x 16 rows per warp.
+template<int COLS, int Q40 = 0>
+static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, const float2 *xds,
+                           int k, int m, int sms, int ncol = 1) {
+    mma_grid g = mma_launch_grid(m, sms, ncol);
     size_t atile = (size_t)2 * 2 * 16 * SA_ROW;
-    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * atile;
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)g.wpc * atile;
     static int carve = 0;
     if (!carve) {
         size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * atile;
         if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q4k_mma_kernel<COLS, Q40>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
         carve = 1;
     }
-    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    // Column-tiles on grid x, row-tiles on y (see the kernel's swapxy note —
-    // one row-tile's weights stay L2-hot across its column-tiles; discrete
-    // only, weights aren't L2-cached on Tegra zero-copy). +6.6% 12B warm serve.
-    // LG_Q4K_SWAPXY=1/0 overrides.
-    static int swapxy = -2;
-    if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }
-    if (swapxy && ncol > 1)
-        matmul_q4k_mma_kernel<COLS, Q40><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, 1);
-    else
-        matmul_q4k_mma_kernel<COLS, Q40><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m);
+    matmul_q4k_mma_kernel<COLS, Q40><<<g.blocks, 32 * g.wpc, shm, g_launch>>>(d_out, w, xq, xds, k, m, g.swapxy);
 }
 
 // ==== the q6_K twin (mma.m16n8k16) ==========================================
@@ -1305,11 +1292,6 @@ static void launch_q4k_mma(float *d_out, const block_q4_K *w, const int8_t *xq, 
 //   linear [row][128] layout has a 32-word row stride, which would land all
 //   eight gid lanes of a fragment read on one bank (8-way serialization);
 //   sub-block-major makes the fragment read's 32 addresses hit 32 banks.
-
-__device__ static uint32_t q6w(uint32_t l, uint32_t h, int hin, int sh) {
-    uint32_t lo = hin ? (l >> 4) & 0x0F0F0F0Fu : l & 0x0F0F0F0Fu;
-    return __vsub4(lo | (((h >> sh) & 0x03030303u) << 4), 0x20202020u);
-}
 
 template<int COLS>
 __global__ static void __launch_bounds__(256)
@@ -1482,27 +1464,31 @@ static void matmul_coverage_print(void) {
 // q6_K share without a 1-tile rewrite).
 template<int COLS>
 static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const int8_t *xq, const float2 *xds, int k, int m, int sms, int ncol = 1) {
-    int wpc = 8;
-    // Same discrete/integrated policy as launch_q4k_mma (shrink + swapxy notes there).
-    static int wpc_force = -2;
-    if (wpc_force == -2) { const char *e = getenv("LG_Q4K_WPC"); wpc_force = e ? atoi(e) : 0; }
-    if (wpc_force > 0) wpc = wpc_force;
-    else if (wpc_force == -1 || mma_integrated())
-        while (wpc > 1 && (long)((m + 32 * wpc - 1) / (32 * wpc)) * ncol < 2 * sms) wpc >>= 1;   // cover SMs (32 rows/warp)
-    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)wpc * 2 * 2048;
+    mma_grid g = mma_launch_grid(m, sms, ncol);
+    size_t shm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)g.wpc * 2 * 2048;
     static int carve = 0;
     if (!carve) {
         size_t maxshm = 2 * COLS * SB_COL + 2 * COLS * SBX * sizeof(float2) + (size_t)8 * 2 * 2048;
         if (maxshm > 48 * 1024) cudaFuncSetAttribute(matmul_q6k_mma_kernel<COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)maxshm);
         carve = 1;
     }
-    int blocks = (m + 32 * wpc - 1) / (32 * wpc);
-    static int swapxy = -2;
-    if (swapxy == -2) { const char *e = getenv("LG_Q4K_SWAPXY"); swapxy = e ? atoi(e) : !mma_integrated(); }  // one knob for both mma kernels
-    if (swapxy && ncol > 1)
-        matmul_q6k_mma_kernel<COLS><<<dim3(ncol, blocks), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m, 1);
-    else
-        matmul_q6k_mma_kernel<COLS><<<dim3(blocks, ncol), 32 * wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m);
+    matmul_q6k_mma_kernel<COLS><<<g.blocks, 32 * g.wpc, shm, g_launch>>>(d_out, w, ts, xq, xds, k, m, g.swapxy);
+}
+
+// Q4_K and repacked Q4_0 differ only in compile-time scale decoding.
+template<int Q40>
+static void matmul_q4_chunk(float *out, const block_q4_K *w, int k, int m, int sms) {
+    if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+        launch_q4k_mma<64, Q40>(out, w, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+        return;
+    }
+    for (int c = 0; c < g_pf_cols; ) {
+        const int8_t *xq = g_xq + (size_t)c * k;
+        const float2 *xds = g_xds + (size_t)c * (k / 32);
+        float *yc = out + (size_t)c * m;
+        if (g_pf_cols - c >= 64) { launch_q4k_mma<64, Q40>(yc, w, xq, xds, k, m, sms); c += 64; }
+        else                    { launch_q4k_mma<32, Q40>(yc, w, xq, xds, k, m, sms); c += 32; }
+    }
 }
 
 // The chunk form. q4_K (the bulk of prefill MACs) and q6_K each go through their
@@ -1527,41 +1513,19 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     // one mma.m16n8k32.s8 per 32-element sub-block, d*sc*acc - dmin*m*sum epilogue,
     // the same wide-tile shape as q6_K. COLS tiles the chunk in 64/32-wide passes.
     if (!no_mma && t->type == GGML_TYPE_Q4_K && PREFILL_B % 32 == 0) {
-        const block_q4_K *q4 = (const block_q4_K *)w;
-        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
-            launch_q4k_mma<64>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
-            return;
-        }
-        for (int c0 = 0; c0 < g_pf_cols; ) {
-            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
-            float *outc = d_out + (size_t)c0 * m;
-            if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
-            else                     { launch_q4k_mma<32>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
-        }
+        matmul_q4_chunk<0>(d_out, (const block_q4_K *)w, k, m, sms);
         return;
     }
 
     // q4_0 (the whole QAT E2B release): the same kernel's Q40 flavor over the
     // repacked q4_K-shaped superblocks (rweight guaranteed k % 256 == 0).
     if (!no_mma && t->type == GGML_TYPE_Q4_0 && PREFILL_B % 32 == 0) {
-        const block_q4_K *q4 = (const block_q4_K *)w;      // layout contract, see block_q4_0m
-        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
-            launch_q4k_mma<64, 1>(d_out, q4, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
-            return;
-        }
-        for (int c0 = 0; c0 < g_pf_cols; ) {
-            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
-            float *outc = d_out + (size_t)c0 * m;
-            if (g_pf_cols - c0 >= 64) { launch_q4k_mma<64, 1>(outc, q4, xqc, xdc, k, m, sms); c0 += 64; }
-            else                     { launch_q4k_mma<32, 1>(outc, q4, xqc, xdc, k, m, sms); c0 += 32; }
-        }
+        matmul_q4_chunk<1>(d_out, (const block_q4_K *)w, k, m, sms);
         return;
     }
 
-    // q6_K (native) and the f32/bf16 PLE q6_K twin share the 2-tile mma kernel,
-    // whose acc[2][COLS/8][4] spills past COLS=32 — so loop the chunk in 32-col
-    // sub-tiles (offset out/xq/xds per slice). At PREFILL_B=32 that's a single
-    // iteration = the old single launch; same float order either way.
+    // q6_K and f32/bf16 PLE twins share the 2-tile MMA kernel, with 64-column
+    // tiles and a 32-column tail. Float order within each column is unchanged.
     const unsigned char *q6src = NULL; int q6ts = 0;
 
     if (t->type == GGML_TYPE_Q6_K) { q6src = w; q6ts = ts; }
@@ -1604,31 +1568,37 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
 // The MTP verify matmul: LG_MTP_N query columns in one launch. Byte-identical to
 // decode per query — the integer sub-block dots are order-independent for any NB,
 // and the NB==LG_MTP_N float-aux guards above keep the float matmuls in decode order.
+template<int NB>
+static void launch_verify(float *d_out, const unsigned char *w, int type, int ts, int blck,
+                          const float *d_x, int k, int m) {
+    int blocks = (m + 7) / 8;
+    bool hot = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_0;
+    if constexpr (NB <= 3) {
+        if (type == GGML_TYPE_Q4_0 && mma_integrated()) {
+            matmul_i8r_s_kernel<NB, GGML_TYPE_Q4_0><<<blocks, 128, 0, g_launch>>>(d_out, w, type, ts, blck, g_xq, g_xds, k, m);
+            return;
+        }
+    }
+    if (hot && mma_integrated())
+        matmul_i8r_s_kernel<NB><<<blocks, 128, 0, g_launch>>>(d_out, w, type, ts, blck, g_xq, g_xds, k, m);
+    else
+        matmul_i8r_n_kernel<NB><<<blocks, 256, 0, g_launch>>>(d_out, w, type, ts, blck, d_x, g_xq, g_xds, k, m);
+}
+
 static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float *d_x, int k, int m) {
     rweight_init_all();
     int blck = rblck(t), ts;
     const unsigned char *w = rweight(t, &ts);
-    int blocks = (m + 7) / 8;
-    int hot = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q4_0;
     // The verify kernels are templated on the block width, which is now a runtime
     // knob (g_mtp_n) — so instantiate them for every N in [2, LG_MTP_N_MAX] and pick
     // at launch. Specialize Q4_0 only at N<=3: wider batches regress on Orin 12B.
-    #define LG_SPEC_LAUNCH(NB) do {                                                                        \
-        if (NB <= 3 && t->type == GGML_TYPE_Q4_0 && mma_integrated())                                        \
-            matmul_i8r_s_kernel<NB, GGML_TYPE_Q4_0><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m); \
-        else if (hot && mma_integrated())                                                                  \
-            matmul_i8r_s_kernel<NB><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m); \
-        else                                                                                              \
-            matmul_i8r_n_kernel<NB><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m); \
-    } while (0)
     switch (g_mtp_n) {
-        case 2: LG_SPEC_LAUNCH(2); break;
-        case 4: LG_SPEC_LAUNCH(4); break;
-        case 5: LG_SPEC_LAUNCH(5); break;
-        case 6: LG_SPEC_LAUNCH(6); break;
-        case 7: LG_SPEC_LAUNCH(7); break;
-        case 8: LG_SPEC_LAUNCH(8); break;
-        default: LG_SPEC_LAUNCH(3); break;   // 3 = compile-time default (g_mtp_n is clamped to [2, LG_MTP_N_MAX])
+        case 2: launch_verify<2>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        case 4: launch_verify<4>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        case 5: launch_verify<5>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        case 6: launch_verify<6>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        case 7: launch_verify<7>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        case 8: launch_verify<8>(d_out, w, t->type, ts, blck, d_x, k, m); break;
+        default: launch_verify<3>(d_out, w, t->type, ts, blck, d_x, k, m); break;
     }
-    #undef LG_SPEC_LAUNCH
 }

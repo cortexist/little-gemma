@@ -198,6 +198,8 @@ struct mtp_cuda {
     int warmups;
 };
 
+static void mtp_cuda_free(struct mtp_cuda *mc, int n_layer);
+
 static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type -> device f16
     size_t n = 1;
     for (uint32_t i = 0; i < t->n_dims; i++) n *= t->dims[i];
@@ -211,13 +213,15 @@ static __half *mtp_up_h(const struct gguf_tensor *t) {            // any type ->
         ok = cudaMemcpy(d, hh, n * 2, cudaMemcpyHostToDevice) == cudaSuccess;
     }
     free(f); free(hh);
-    return ok ? d : NULL;
+    if (!ok) { cudaFree(d); return NULL; }
+    return d;
 }
 
 static float *mtp_up_f(const float *src, size_t n) {
     float *d = NULL;
     if (cudaMalloc(&d, n * 4) != cudaSuccess) return NULL;
-    return cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) == cudaSuccess ? d : NULL;
+    if (cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); return NULL; }
+    return d;
 }
 
 static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
@@ -260,9 +264,9 @@ static struct mtp_cuda *mtp_cuda_init(struct mtp *t) {
             && cudaMalloc(&mc->logits, (size_t)t->n_vocab * 4) == cudaSuccess
             && cudaMalloc(&mc->d_tok, sizeof(int)) == cudaSuccess
             && cudaMalloc(&mc->d_dpos, sizeof(int)) == cudaSuccess;
-    if (!ok) {                                       // startup-OOM only; partial uploads leak, like media-kernel.cu
+    if (!ok) {
         fprintf(stderr, "mtp: device upload failed, drafting disabled\n");
-        free(mc->l); free(mc);
+        mtp_cuda_free(mc, t->n_layer);
         return NULL;
     }
     return mc;
@@ -326,6 +330,25 @@ static void mtp_draft_launches(struct mtp *t, const struct model *m, const struc
     argmax_kernel<<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
 }
 
+// Both draft forms upload the same scaled embedding outside graph capture.
+static bool mtp_embed(struct mtp_cuda *mc, const struct model *m, int token) {
+    int nb = m->cfg.n_embd;
+    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
+    if (!erow) return false;
+    float sc = sqrtf((float)nb);
+    for (int i = 0; i < nb; i++) erow[i] *= sc;
+    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
+    free(erow);
+    return true;
+}
+
+static int mtp_result(const struct mtp *t, const struct mtp_cuda *mc) {
+    int best = -1;
+    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
+    // A trimmed head's argmax is a draft row; map it back to the target ID.
+    return best >= 0 && t->d2t ? t->d2t[best] : best;
+}
+
 extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const struct kvcache *kv,
                                 int token, int pos) {
     if (t->cuda == (void *)-1) return -1;
@@ -337,13 +360,7 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
     }
     const int nb = t->n_bb;
 
-    // uploads stay outside the graph (fixed buffers, varying data)
-    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
-    if (!erow) return -1;
-    float sc = sqrtf((float)nb);
-    for (int i = 0; i < nb; i++) erow[i] *= sc;
-    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
-    free(erow);
+    if (!mtp_embed(mc, m, token)) return -1;
     CUDA_CHECK(cudaMemcpy(mc->d_dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
     // draft 1 chains on the TARGET's hidden (g_hidden); filled here, outside the
     // captured head-pass graph, so the chained draft 2 can reuse the same graph.
@@ -364,10 +381,7 @@ extern "C" int mtp_draft_device(struct mtp *t, const struct model *m, const stru
         CUDA_CHECK(cudaGraphLaunch(mc->graph, cudaStreamPerThread));
     }
 
-    int best = -1;
-    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
-    // trimmed head (LG_MTP_IDS): the argmax is a draft ROW; map to target id
-    return best >= 0 && t->d2t ? t->d2t[best] : best;
+    return mtp_result(t, mc);
 }
 
 // The chained draft for block-3 (LG_MTP_N=3): draft the token after `token` (itself
@@ -383,12 +397,7 @@ extern "C" int mtp_draft_chain_device(struct mtp *t, const struct model *m, cons
     if (!mc || !mc->post) return -1;
     const int nb = t->n_bb, ni = t->n_inner;
 
-    float *erow = dequantize_row(gguf_find_tensor(m->ctx, "token_embd.weight"), token, nb);
-    if (!erow) return -1;
-    float sc = sqrtf((float)nb);
-    for (int i = 0; i < nb; i++) erow[i] *= sc;
-    CUDA_CHECK(cudaMemcpy(mc->cat, erow, (size_t)nb * 4, cudaMemcpyHostToDevice));
-    free(erow);
+    if (!mtp_embed(mc, m, token)) return -1;
     // h_prev = post(previous draft's head hidden in mc->x); runs before the graph's
     // pre-projection overwrites mc->x (same stream -> ordered).
     mtp_matvec_h<<<gridn(nb * 32), 256>>>(mc->cat + nb, mc->post, mc->x, ni, nb);
@@ -397,15 +406,11 @@ extern "C" int mtp_draft_chain_device(struct mtp *t, const struct model *m, cons
     if (mc->graph) CUDA_CHECK(cudaGraphLaunch(mc->graph, cudaStreamPerThread));
     else           mtp_draft_launches(t, m, kv, mc);   // graph not captured yet (warmup rounds)
 
-    int best = -1;
-    CUDA_CHECK(cudaMemcpy(&best, mc->d_tok, sizeof(int), cudaMemcpyDeviceToHost));
-    return best >= 0 && t->d2t ? t->d2t[best] : best;
+    return mtp_result(t, mc);
 }
 
-extern "C" void mtp_free_device(struct mtp *t) {
-    struct mtp_cuda *mc = (struct mtp_cuda *)t->cuda;
-    if (!mc || t->cuda == (void *)-1) return;
-    for (int L = 0; L < t->n_layer; L++) {
+static void mtp_cuda_free(struct mtp_cuda *mc, int n_layer) {
+    for (int L = 0; mc->l && L < n_layer; L++) {
         struct mtp_ld *d = &mc->l[L];
         cudaFree(d->attn_norm); cudaFree(d->q_norm); cudaFree(d->post_attn);
         cudaFree(d->ffn_norm); cudaFree(d->post_ffw);
@@ -418,6 +423,11 @@ extern "C" void mtp_free_device(struct mtp *t) {
     if (mc->graph) cudaGraphExecDestroy(mc->graph);
     free(mc->l);
     free(mc);
+}
+
+extern "C" void mtp_free_device(struct mtp *t) {
+    if (t->cuda && t->cuda != (void *)-1)
+        mtp_cuda_free((struct mtp_cuda *)t->cuda, t->n_layer);
     t->cuda = NULL;
 }
 

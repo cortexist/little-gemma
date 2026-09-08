@@ -20,7 +20,7 @@
 // online-softmax state in registers, exactly like d_attn). Global K/V reads
 // drop ~QT×; the math per query is unchanged (validated in .scratch/
 // attn_kvshare_test.cu vs a double reference). PREFILL ONLY — gated on B>2 so
-// the B=2 MTP verify keeps the per-query path and its decode-matching argmax.
+// MTP verification keeps decode's arithmetic at every supported N.
 // The float combine order differs from the per-query kernel (one warp now sums
 // all timesteps of its query, vs warps splitting them), so this is the same
 // relaxed class as the online-softmax step; the quantize epilogue calls the
@@ -108,8 +108,8 @@ __global__ static void attn_kvshare_n_kernel(float *xb, const float *q, const KT
 // the shipped f16-KV step, ~2e-3 vs an f64 ref, validated in .scratch/flash_test
 // .cu), NOT bit-identical. Writes f32 xb; the dispatch quantizes via act_quantize
 // (the C-tile scatter doesn't give the contiguous 32-groups the epilogue needs).
-// PREFILL ONLY, B>2 — the B<=2 MTP verify keeps the per-query path (bit-exact
-// argmax). LG_NO_FLASH falls back to the attn_*_n kernels.
+// PREFILL ONLY — MTP verification keeps decode's arithmetic at every N.
+// LG_NO_FLASH selects the scalar fallback for text; media retains its mask.
 template<typename KT> __device__ __forceinline__ uint32_t fa_ld2(const KT *p);
 template<> __device__ __forceinline__ uint32_t fa_ld2<__half>(const __half *p){ return *(const uint32_t *)p; }
 template<> __device__ __forceinline__ uint32_t fa_ld2<float>(const float *p){
@@ -411,7 +411,7 @@ flash_attn_r_kernel(float *xb, const float *q, const KT *Kc, const KT *Vc,
         if(qBi<qn){xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc]=acc[n][2]/lB; xb[((size_t)(qbase+qBi)*n_head+hA)*HD+hdc+1]=acc[n][3]/lB;}
     }
 }
-static size_t flash_r_shm(int hd, bool kstage){ return (size_t)64*(hd+8)*2 + (kstage?(size_t)32*(hd+8)*2:(size_t)32*(hd+8)*2); }
+static size_t flash_r_shm(int hd){ return (size_t)96*(hd+8)*sizeof(__half); }
 
 // The packed launches live in a specialization so the hd-512 packed
 // instantiation (it would spill, and nothing ever launches it) never exists
@@ -478,13 +478,13 @@ static void launch_flash(float *dxb, const float *dq, const void *Kc, const void
     if (reg_pol == -2) { const char *e = getenv("LG_FLASH_REG"); reg_pol = e ? atoi(e) : 0; }
     if (reg_pol && HD == 256 && gqa % 2 == 0 && n_head % 2 == 0) {
         dim3 g(n_head / 2, (B + 31) / 32);
-        size_t shm = flash_r_shm(256, !f16);
+        size_t shm = flash_r_shm(256);
         static int rcarve = 0;
         if (!rcarve) {                                     // 32 KB f16 / ~48.5 KB f32 > the 48 KB default
-            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,__half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,false));
-            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, __half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,false));
-            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,true));
-            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)flash_r_shm(256,true));
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,__half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, __half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,false,float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+            cudaFuncSetAttribute(flash_attn_r_kernel<256,true, float >, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
             rcarve = 1;                                    // wiring proof: a zero delta must be visible
             fprintf(stderr, "flash: register-resident kernel engaged (n_head %d, gqa %d, f16 %d)\n", n_head, gqa, (int)f16);
         }
@@ -625,8 +625,8 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         if (g_l2 < 0) { cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); g_l2 = p.l2CacheSize; }
         int ktsz = kv->f16[src] ? 2 : 4;
         // Tensor-core flash for the prefill chunk (B>2): ~40% of TTFT was scalar-
-        // dot attention. hd 256/512 only (Gemma-4 head dims); B<=2 MTP verify and
-        // other hd keep the per-query path. LG_NO_FLASH falls back. Flash writes
+        // dot attention. hd 256/512 only (Gemma-4 head dims); verification stays
+        // on decode's path. LG_NO_FLASH applies to text chunks. Flash writes
         // f32 xb -> act_quantize fills the int8 activation for attn_output.
         static int no_flash = -1;
         if (no_flash < 0) no_flash = getenv("LG_NO_FLASH") != NULL;
@@ -639,12 +639,16 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
         // relieves the L1 wall. Text-prefill only (share path has no bidir mask).
         static int force_share = -1;
         if (force_share < 0) force_share = getenv("LG_FORCE_KVSHARE") != NULL;
-        bool flash = !no_flash && !force_share && B > 2 && !g_chunk_verify && (hd == 256 || hd == 512);   // y-tiled over 32-query blocks, so B>32 (128) is fine
+        // Only flash implements the media mask. Text-only A/B flags must not
+        // silently replace bidirectional attention with a causal kernel.
+        bool flash = (g_pf_seg || (!no_flash && !force_share)) && B > 2 && !g_chunk_verify && (hd == 256 || hd == 512);
+        if (g_pf_seg && !flash) {
+            fprintf(stderr, "prefill: bidirectional media attention requires head dim 256 or 512\n");
+            exit(1);
+        }
         bool share = (B > 2) && !g_chunk_verify && (force_share || window == 0 || 2LL * window * kv_dim * ktsz > (long)g_l2);
-        // The B<=2 MTP verify runs the SAME split-K kernel as decode (one extra
-        // grid axis for the 2 query rows): out[0]/out[1] then byte-match plain
-        // decode's forwards at pos/pos+1 by construction, and verify's attention
-        // gets the split-K parallelism win at high context. Per-query stays as the
+        // Every MTP verify runs the SAME split-K kernel as decode, with an extra
+        // grid axis for its N query rows. Per-query stays as the
         // LG_NO_SPLITK fallback (and there decode is per-query too, so they still
         // match). Mirrors decode's gate (decode-side LG_NO_SPLITK is independent).
         bool splitk = !no_splitk && (B <= 2 || g_chunk_verify) && (hd == 256 || hd == 512);
@@ -667,8 +671,8 @@ static void chunk_layers(struct model *m, struct kvcache *kv, int has_ple, int B
                 attn_kvshare_n_kernel<QT, true, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, kv->seq[src], B, n_head, aq);
             else                                           // full-length float cache
                 attn_kvshare_n_kernel<QT, false, float><<<g, QT * 32, shm>>>(dxb, dq, (const float *)Kc, (const float *)Vc, hd, kv_dim, gqa, d_pos, window, 0, B, n_head, aq);
-        } else if (splitk) {                               // B<=2 MTP verify: decode's split-K kernel, z=B queries
-            ensure_split(B * n_head);                       // no-op (ensure_weights pre-allocated 2*n_head pre-capture)
+        } else if (splitk) {                               // decode's split-K kernel, z=B queries
+            ensure_split(B * n_head);                       // preallocated for the maximum N before capture
             size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
             dim3 gs(n_head, MAXSPLIT, B);
             struct actq aq = actq_for(B * q_dim);
