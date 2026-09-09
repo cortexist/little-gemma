@@ -35,6 +35,14 @@ run -c <socket>
 - `-think N` → bound the reasoning channel. `0` = none, `N` = up to N tokens,
   omitted = unlimited (default). See [Controlling the reasoning
   channel](#controlling-the-reasoning-channel).
+- `-end-on-question` → in serve mode, end the answer after the first token
+  containing `?`, preserving that token in history. Questions inside a hidden
+  reasoning channel are ignored. This is opt-in for conversations whose speaker
+  must ask one question and yield; it also stops at quoted or rhetorical questions
+  in the answer. Reopening a thought channel after the answer has started also
+  ends the turn, including an intentionally silent answer. A reply without a
+  question otherwise ends normally. Ordinary serving is
+  unchanged, and the client receives the usual `<turn|>` delimiter.
 
 ## Controlling the reasoning channel (`-think`)
 
@@ -53,9 +61,10 @@ that turning thinking off by prompt is unreliable.) So `-think` controls it
 **structurally** instead, independent of whether the model obeys:
 
 - **`-think 0`** — seed an empty `<|channel>thought\n<channel|>` onto the model
-  turn. The model cannot open a channel it has already been handed closed, so
-  its first generated token is the answer: no reasoning, best TTFS, no channel
-  in the stream at all. This is the reliable off-switch.
+  turn. Generation starts in the answer channel, avoiding an initial reasoning
+  span. This is not a restriction on later tokens: the model can reopen a
+  channel during a runaway answer. Use an application turn policy such as
+  `-end-on-question` when the speaker must yield after one question.
 - **`-think N`** (N > 0) — let the model reason, but force-inject `<channel|>`
   once the reasoning span reaches N tokens: *a little* thinking, then the
   answer. The dial for the TTFS-vs-reasoning-depth tradeoff.

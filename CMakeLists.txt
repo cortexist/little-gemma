@@ -136,3 +136,7 @@ endif()
 
 enable_testing()
 add_test(NAME graph_test COMMAND graph_test)
+
+add_executable(turn_policy_test test/turn-policy.c)
+target_include_directories(turn_policy_test PRIVATE include)
+add_test(NAME turn_policy_test COMMAND turn_policy_test)
