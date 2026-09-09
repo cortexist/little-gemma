@@ -561,10 +561,15 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                 // the batch in one weight pass — up to g_mtp_n tokens for one pass's
                 // weight traffic. Greedy verify keeps the streamed text byte-identical.
                 int toks[LG_MTP_N_MAX], out[LG_MTP_N_MAX];
+                int block_pos = pos;
                 int adv = mtp_step(t, &m, &kv, best, pos, toks, out, &t_draft, &t_verify, &n_draft, &n_accept);
-                pos += adv;
                 int brk = 0;
                 for (int e = 1; e < adv && !brk; e++) {  // stream the confirmed drafts toks[1..adv-1]
+                    // Verification already cached the whole block, but a turn
+                    // end/cap/barge may stop emission inside it. Keep the logical
+                    // cursor before this token, as in plain decode; the next
+                    // prompt overwrites the unused rows and appends ONE eot.
+                    pos = block_pos + e;
                     int es = client_signal(c);
                     if (es == 2) { send_piece(c, "<turn|>"); barged = 1; brk = 1; break; }
                     if (es || send_piece(c, tokenizer_token_text(tk, toks[e])) != 0) { fail = 1; brk = 1; break; }
@@ -577,6 +582,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     }
                 }
                 if (brk) break;
+                pos = block_pos + adv;
                 best = out[adv - 1];
             }
             double dt = now_sec() - t1;
