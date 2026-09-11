@@ -802,23 +802,10 @@ static void forward_chunk_mixed(struct model *m, struct kvcache *kv, const float
     chunk_layers(m, kv, model_has_ple(m), B, matmul_q_n, true);
 }
 
-// Pre-size the int8 activation scratch to the 128-wide max BEFORE any chunk or
-// the decode-graph capture. Adaptive chunks make a short first turn size g_xq
-// small; a later wider turn would then realloc it — and the captured decode
-// graph references g_xq, so a realloc would leave it dangling. One max-size call
-// up front (no-op on the f32 backend) keeps the pointer stable for the session.
-static void prefill_act_presize(struct model *m) {
-    static int done = 0;
-    if (done) return;
-    actq_for((int)((size_t)g_prefill_max_b * m->cfg.n_ff));   // n_ff is the widest activation (ffn_down input)
-    done = 1;
-}
-
 extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *tokens, int n, int pos0) {
     wide_chunk_init();                                // before ensure_scratch sizes buffers + ring
     ensure_weights(m);
     ensure_scratch(m);
-    prefill_act_presize(m);
     const int CB = g_wide_chunk ? g_wide_chunk : PREFILL_B;
     // Balanced chunks (see model_prefill_mixed): ceil(n/CB) near-equal chunks,
     // each a multiple of 64 above 128 (matmul_q_n's fat single launch) or of 32
@@ -863,7 +850,6 @@ extern "C" void model_prefill(struct model *m, struct kvcache *kv, const int *to
 extern "C" void model_prefill_embd(struct model *m, struct kvcache *kv, const float *rows, int n, int pos0) {
     ensure_weights(m);
     ensure_scratch(m);
-    prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
     int i = 0;
     for (; n - i >= PREFILL_B; i += PREFILL_B)
@@ -899,7 +885,6 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
     wide_chunk_init();                                // before ensure_scratch sizes buffers + ring
     ensure_weights(m);
     ensure_scratch(m);
-    prefill_act_presize(m);
     const int n_embd = m->cfg.n_embd;
     // Text packing budget: LG_WIDE_CHUNK opens serve-path text to wide chunks too
     // (same knob and buffers as model_prefill).

@@ -959,6 +959,10 @@ static void side_sync(void) {                           // main needs the side r
     CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, g_join, 0));
 }
 
+// actq_for(k): backend activation buffers; AQ0 (no quantization) for f32.
+// Declared here so scratch initialization can reserve them before graph capture.
+static struct actq actq_for(int k);
+
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
     wide_chunk_init();            // g_prefill_max_b must be final before B sizes anything
@@ -991,6 +995,12 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
+    // Graphs retain activation pointers. Reserve the widest future prefill here,
+    // even when the first calls are decode/verify, so no later path moves them.
+    int act_width = nff > q_max ? nff : q_max;
+    if (ne > act_width) act_width = ne;
+    if (ple > act_width) act_width = ple;
+    actq_for((int)(B * act_width));
     scratch_ok = 1;
 }
 
@@ -1009,9 +1019,6 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
 // matmul_coverage_print: print the per-kernel coverage counts for the matmul_q variants, 
 //  to verify that the expected kernels are running for each layer and chunk type.
 static void matmul_coverage_print(void);
-// actq_for(k): the backend's epilogue buffers for a k-length activation that is
-//   about to feed matmul_q (the f32 backend returns AQ0 — no quantization).
-static struct actq actq_for(int k);
 // act_quantize: quantize d_x explicitly — for the one activation no kernel
 //   produces (the host-uploaded embedding); no-op for f32.
 static void act_quantize(const float *d_x, int k);

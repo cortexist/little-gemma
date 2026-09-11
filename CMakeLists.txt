@@ -81,8 +81,11 @@ if(CMAKE_CUDA_COMPILER)
     list(REMOVE_ITEM PREFILL_TEST_CORE src/run.c)
     add_executable(prefill_cache_test EXCLUDE_FROM_ALL ${PREFILL_TEST_CORE}
         test/prefill-cache.c src/cuda/model-cuda-i8.cu src/cuda/media-kernel.cu)
+    # GPU-only graph-lifetime gate, without a model file.
+    add_executable(cuda_scratch_test EXCLUDE_FROM_ALL ${PREFILL_TEST_CORE}
+        test/cuda-scratch.cu src/cuda/media-kernel.cu)
     target_include_directories(prefill_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    foreach(tgt run-cuda run-cuda-i8 prefill_cache_test)
+    foreach(tgt run-cuda run-cuda-i8 prefill_cache_test cuda_scratch_test)
         target_include_directories(${tgt} PRIVATE include src)   # src/ for media-internal.h & mtp-internal.h
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
