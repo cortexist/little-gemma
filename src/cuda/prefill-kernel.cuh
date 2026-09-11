@@ -954,9 +954,8 @@ extern "C" void model_prefill_mixed(struct model *m, struct kvcache *kv, const f
             media_hi = a + w - 1;
         }
         if (w < 1) w = 1;
-        // Chunks wider than 128 round to a multiple of 64: matmul_q_n's single
-        // fat launch needs cols%64==0, and a few pad tokens beat falling back
-        // to per-64-column launches for the whole chunk.
+        // Prefer full 64-column tiles; the reserve cap may leave a 32-column
+        // tail, which matmul_q_n dispatches separately from the grouped tiles.
         int cols = w > 128 ? ((w + 63) / 64) * 64 : ((w + 31) / 32) * 32;
         if (cols > g_prefill_max_b) cols = g_prefill_max_b;
         if (pos0 + a + cols > kv->max_seq) break;

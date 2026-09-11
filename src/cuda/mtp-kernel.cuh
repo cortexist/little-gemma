@@ -25,8 +25,7 @@ static void verify_head_spec(struct model *m) {
     matmul_q_spec(d_logits_spec, wq(m, "token_embd.weight"), dx, n_embd, c->n_vocab);
     if (c->logit_softcap > 0.0f)
         softcap_kernel<<<gridn(N * c->n_vocab), 256>>>(d_logits_spec, c->logit_softcap, N * c->n_vocab);
-    for (int j = 0; j < N; j++)
-        argmax_kernel<<<1, 1024>>>(d_logits_spec + (size_t)j * c->n_vocab, c->n_vocab, d_best_spec + j);
+    argmax_kernel<true><<<N, 1024>>>(d_logits_spec, c->n_vocab, d_best_spec);
 }
 static void verify_layers_and_head_spec(struct model *m, struct kvcache *kv, int has_ple) {
     g_chunk_verify = 1;                  // verify uses decode's split-K attn, not prefill flash/share
@@ -327,7 +326,7 @@ static void mtp_draft_launches(struct mtp *t, const struct model *m, const struc
     mtp_matvec_h<<<gridn(t->n_vocab * 32), 256>>>(mc->logits, mc->head, mc->x, ni, t->n_vocab);
     if (t->softcap > 0.0f)
         softcap_kernel<<<gridn(t->n_vocab), 256>>>(mc->logits, t->softcap, t->n_vocab);
-    argmax_kernel<<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
+    argmax_kernel<><<<1, 1024>>>(mc->logits, t->n_vocab, mc->d_tok);
 }
 
 // Both draft forms upload the same scaled embedding outside graph capture.

@@ -726,7 +726,9 @@ __global__ static void softcap_kernel(float *l, float sc, int n) { int i = block
 
 // Greedy pick on the device: one 1024-thread block scans the logits. Ties break
 // toward the lower index, matching the CPU's first-max scan exactly.
+template<bool BATCHED = false>
 __global__ static void argmax_kernel(const float *x, int n, int *out) {
+    if constexpr (BATCHED) { x += (size_t)blockIdx.x * n; out += blockIdx.x; }
     __shared__ float bv[1024]; __shared__ int bi[1024];
     float v = -1e30f; int idx = 0;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -1388,7 +1390,7 @@ extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token
         CUDA_CHECK(cudaMemcpy(row, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
         return model_pick(row, m->cfg.n_vocab);
     }
-    argmax_kernel<<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
+    argmax_kernel<><<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
     int best;
     CUDA_CHECK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
     return best;

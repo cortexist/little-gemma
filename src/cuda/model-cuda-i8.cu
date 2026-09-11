@@ -1478,16 +1478,34 @@ static void launch_q6k_mmq(float *d_out, const unsigned char *w, int ts, const i
 // Q4_K and repacked Q4_0 differ only in compile-time scale decoding.
 template<int Q40>
 static void matmul_q4_chunk(float *out, const block_q4_K *w, int k, int m, int sms) {
-    if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
+    // Group the full tiles even when a wide chunk has a 32-column tail.
+    int c = 0;
+    if (g_pf_cols > 128) {
         launch_q4k_mma<64, Q40>(out, w, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
-        return;
+        c = g_pf_cols / 64 * 64;
     }
-    for (int c = 0; c < g_pf_cols; ) {
+    for (; c < g_pf_cols; ) {
         const int8_t *xq = g_xq + (size_t)c * k;
         const float2 *xds = g_xds + (size_t)c * (k / 32);
         float *yc = out + (size_t)c * m;
         if (g_pf_cols - c >= 64) { launch_q4k_mma<64, Q40>(yc, w, xq, xds, k, m, sms); c += 64; }
         else                    { launch_q4k_mma<32, Q40>(yc, w, xq, xds, k, m, sms); c += 32; }
+    }
+}
+
+// Q6_K uses the same full-tile grouping and separate 32-column tail.
+static void matmul_q6_chunk(float *d_out, const unsigned char *q6src, int q6ts, int k, int m, int sms) {
+    int c0 = 0;
+    if (g_pf_cols > 128) {
+        launch_q6k_mmq<64>(d_out, q6src, q6ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
+        c0 = g_pf_cols / 64 * 64;
+    }
+    for (; c0 < g_pf_cols; ) {
+        const int8_t *xqc = g_xq + (size_t)c0 * k;
+        const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
+        float *outc = d_out + (size_t)c0 * m;
+        if (g_pf_cols - c0 >= 64) { launch_q6k_mmq<64>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 64; }
+        else                     { launch_q6k_mmq<32>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 32; }
     }
 }
 
@@ -1532,21 +1550,7 @@ static void matmul_q_n(float *d_out, const struct gguf_tensor *t, const float *d
     else { const unsigned char *q6 = rweight_q6(t); if (q6) { q6src = q6; q6ts = (int)sizeof(block_q6_Kr); } }
 
     if (!no_mma && q6src && PREFILL_B % 32 == 0) {
-        // Wide chunk: one launch, COLS=64 tiles across gridDim.y -> the row-tile's
-        // q6_K weights stay L2-hot across all its column-tiles (this is q6_K's bigger
-        // win — its 64-col tile re-streams weights twice as often as q4_K's 128).
-        if (g_pf_cols > 128 && g_pf_cols % 64 == 0) {
-            launch_q6k_mmq<64>(d_out, q6src, q6ts, g_xq, g_xds, k, m, sms, g_pf_cols / 64);
-            return;
-        }
-        // 64-wide sub-tiles where the chunk allows (halves weight passes vs 32),
-        // a 32-wide tail for the leftover 32 cols (g_pf_cols in {32,64,96,128}).
-        for (int c0 = 0; c0 < g_pf_cols; ) {
-            const int8_t *xqc = g_xq + (size_t)c0 * k; const float2 *xdc = g_xds + (size_t)c0 * (k / 32);
-            float *outc = d_out + (size_t)c0 * m;
-            if (g_pf_cols - c0 >= 64) { launch_q6k_mmq<64>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 64; }
-            else                     { launch_q6k_mmq<32>(outc, q6src, q6ts, xqc, xdc, k, m, sms); c0 += 32; }
-        }
+        matmul_q6_chunk(d_out, q6src, q6ts, k, m, sms);
         return;
     }
 

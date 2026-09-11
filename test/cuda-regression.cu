@@ -98,8 +98,110 @@ static void check_cache(void) {
     }
 }
 
+
+// Compare grouped dispatch to separate tiles, including narrow and wide tails.
+static void check_mma_tails(void) {
+    const int K = 768, M = 259, B = 1120;
+    std::vector<float> x(K * B);
+    uint32_t rng = 17;
+    for (float &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) - 0x800000) / 8388608.f; }
+    float *xd, *y;
+    CUDA_CHECK(cudaMalloc(&xd, x.size() * 4)); CUDA_CHECK(cudaMalloc(&y, M * B * 4));
+    CUDA_CHECK(cudaMemcpy(xd, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    actq aq = actq_for(K * B);
+    quantize_act_n_kernel<<<(K * B / 32 + 7) / 8, 256>>>(xd, aq, K * B / 32);
+    int types[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q6_K};
+    for (int type : types) {
+        int bl = ggml_blck_size(type), ts = ggml_type_size(type), nb = K * M / bl;
+        std::vector<unsigned char> raw((size_t)nb * ts);
+        for (auto &v : raw) { rng = rng * 1664525u + 1013904223u; v = rng >> 24; }
+        for (int i = 0; i < nb; i++) {
+            void *p = raw.data() + (size_t)i * ts;
+            uint16_t h = __half_as_ushort(__float2half((i % 29 + 1) / 512.f));
+            switch (type) {
+                case GGML_TYPE_Q4_K: ((block_q4_K *)p)->d = h; ((block_q4_K *)p)->dmin = h; break;
+                case GGML_TYPE_Q5_K: ((block_q5_K *)p)->d = h; ((block_q5_K *)p)->dmin = h; break;
+                case GGML_TYPE_Q3_K: ((block_q3_K *)p)->d = h; break;
+                case GGML_TYPE_Q6_K: ((block_q6_K *)p)->d = h; break;
+                case GGML_TYPE_Q4_0: ((block_q4_0 *)p)->d = h; break;
+                case GGML_TYPE_Q8_0: ((block_q8_0 *)p)->d = h; break;
+                case GGML_TYPE_F32: *(float *)p = (i % 37 - 18) / 32.f; break;
+                case GGML_TYPE_F16: *(uint16_t *)p = h; break;
+                case GGML_TYPE_BF16: *(uint16_t *)p = 0x3c00 + i % 512; break;
+            }
+        }
+        std::vector<unsigned char> rep;
+        if (type == GGML_TYPE_Q3_K) {
+            ts = sizeof(block_q3_Kr); rep.resize((size_t)nb * ts);
+            repack_q3_K((block_q3_Kr *)rep.data(), (block_q3_K *)raw.data(), nb);
+        } else if (type == GGML_TYPE_Q6_K) {
+            ts = sizeof(block_q6_Kr); rep.resize((size_t)nb * ts);
+            repack_q6_K((block_q6_Kr *)rep.data(), (block_q6_K *)raw.data(), nb);
+        } else if (type == GGML_TYPE_Q4_0) {
+            bl = 256; nb /= 8; ts = sizeof(block_q4_0m); rep.resize((size_t)nb * ts);
+            repack_q4_0m((block_q4_0m *)rep.data(), (block_q4_0 *)raw.data(), nb);
+        }
+        auto &host = rep.empty() ? raw : rep;
+        unsigned char *w;
+        CUDA_CHECK(cudaMalloc(&w, host.size())); CUDA_CHECK(cudaMemcpy(w, host.data(), host.size(), cudaMemcpyHostToDevice));
+
+        cudaDeviceProp props; CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
+        int sms = props.multiProcessorCount;
+        for (int cols : {32, 64, 96, 128, 160, 192, 288, 1120}) {
+            g_pf_cols = cols;
+            if (type == GGML_TYPE_Q6_K) matmul_q6_chunk(y, w, ts, K, M, sms);
+            else if (type == GGML_TYPE_Q4_K) matmul_q4_chunk<0>(y, (block_q4_K *)w, K, M, sms);
+            else matmul_q4_chunk<1>(y, (block_q4_K *)w, K, M, sms);
+            std::vector<float> got(M * cols), ref(M * cols);
+            CUDA_CHECK(cudaMemcpy(got.data(), y, got.size() * 4, cudaMemcpyDeviceToHost));
+            for (int c = 0; c < cols; ) {
+                #define TILE(C) do { \
+                    float *out = y + (size_t)c * M; \
+                    const int8_t *xq = aq.xq + (size_t)c * K; \
+                    const float2 *ds = aq.xds + (size_t)c * (K / 32); \
+                    if (type == GGML_TYPE_Q6_K) launch_q6k_mmq<C>(out, w, ts, xq, ds, K, M, sms); \
+                    else if (type == GGML_TYPE_Q4_K) launch_q4k_mma<C, 0>(out, (block_q4_K *)w, xq, ds, K, M, sms); \
+                    else launch_q4k_mma<C, 1>(out, (block_q4_K *)w, xq, ds, K, M, sms); \
+                } while (0)
+                if (cols - c >= 64) { TILE(64); c += 64; }
+                else { TILE(32); c += 32; }
+                #undef TILE
+            }
+            CUDA_CHECK(cudaMemcpy(ref.data(), y, ref.size() * 4, cudaMemcpyDeviceToHost));
+            if (memcmp(got.data(), ref.data(), got.size() * 4)) {
+                fprintf(stderr, "MMA tail mismatch: type=%d cols=%d\n", type, cols); exit(2);
+            }
+        }
+        CUDA_CHECK(cudaFree(w));
+    }
+    g_pf_cols = 0;
+    CUDA_CHECK(cudaFree(xd)); CUDA_CHECK(cudaFree(y));
+}
+
+static void check_argmax(void) {
+    for (int n : {1, 31, 1025, 262144}) {
+        std::vector<float> x((size_t)n * LG_MTP_N_MAX);
+        for (int j = 0; j < LG_MTP_N_MAX; j++)
+            for (int i = 0; i < n; i++) x[(size_t)j * n + i] = (i + j) % 17 - 8.f;
+        float *d; int *a, *b;
+        CUDA_CHECK(cudaMalloc(&d, x.size() * 4));
+        CUDA_CHECK(cudaMemcpy(d, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&a, LG_MTP_N_MAX * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&b, LG_MTP_N_MAX * sizeof(int)));
+        for (int count = 2; count <= LG_MTP_N_MAX; count++) {
+            for (int j = 0; j < count; j++) argmax_kernel<><<<1, 1024>>>(d + (size_t)j * n, n, a + j);
+            argmax_kernel<true><<<count, 1024>>>(d, n, b);
+            int ref[LG_MTP_N_MAX], got[LG_MTP_N_MAX];
+            CUDA_CHECK(cudaMemcpy(ref, a, count * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(got, b, count * sizeof(int), cudaMemcpyDeviceToHost));
+            if (memcmp(ref, got, count * sizeof(int))) { fprintf(stderr, "batched argmax mismatch\n"); exit(2); }
+        }
+        CUDA_CHECK(cudaFree(d)); CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b));
+    }
+}
+
 int main(void) {
-    check_half(); check_quant(); check_cache();
+    check_half(); check_quant(); check_cache(); check_mma_tails(); check_argmax();
     CUDA_CHECK(cudaDeviceSynchronize());
     puts("CUDA regression checks passed");
 }
