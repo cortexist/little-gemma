@@ -3,8 +3,10 @@
 A small, from-scratch **C program on CUDA** that loads a Gemma 4 model from
 **GGUF** and runs it — written to *teach* how a modern LLM actually executes,
 in the spirit of Karpathy's `llama2.c`, but covering a current model end to
-end: parse GGUF → BPE tokenize → run the transformer → generate text. Every
-stage validated bit-for-bit against `llama.cpp`.
+end: parse GGUF → BPE tokenize → run the transformer → generate text.
+Tokenization and dequantization are checked for exact agreement; forward
+computations are compared with independent references using numerical
+tolerances. See [validation](docs/architecture.md#validation).
 
 ```
 text ──► tokenizer ──► token ids ──► forward ──► logits ──► argmax ──► next token
@@ -169,7 +171,7 @@ socket clients.
   [docs/prefill-performance-journal.md](docs/prefill-performance-journal.md)
   — the full optimization logs, failed experiments included.
 - [docs/voice-pipeline.md](docs/voice-pipeline.md) — mic → whisper → serve →
-  streaming TTS, with runnable harnesses in [`bench/`](bench/).
+  streaming TTS. Measurement harnesses live in the protected research repository.
 
 ## License
 
