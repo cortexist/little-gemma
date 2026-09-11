@@ -4,8 +4,9 @@
 //   LG_PREFILL_FULL=1 build/prefill_cache_test MODEL TEXT > full.txt
 //   build/prefill_cache_test MODEL TEXT > cache.txt
 //   diff -u full.txt cache.txt
-// Hashes EVERY allocated K/V byte, including padding and wrapped ring slots,
-// after clearing unused storage. Also compares 12 generated token IDs per case.
+// Hashes all logical K/V storage, including wrapped ring slots, after clearing
+// unused rows. Physical tail padding is covered by the CUDA boundary/memcheck
+// gate. Also compares 12 generated token IDs per case.
 // Synthetic media rows exercise bidirectional masking without an encoder/model.
 #include <stdint.h>
 #include <stdlib.h>

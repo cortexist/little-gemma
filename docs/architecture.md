@@ -86,3 +86,37 @@ intermediate tensor): dequantization is bit-exact vs the `gguf` Python package;
 the forward pass matches an independent NumPy f32 reference and llama.cpp's logits
 (within the f32-vs-quantized-matmul gap); the tokenizer matches `llama-tokenize`
 exactly. `test/graph_test.c` (a CTest target) checks the graph kernels.
+
+
+### CUDA buffer lifetime and regression checks
+
+CUDA weights, scratch buffers and captured graphs currently live in process-wide
+state. Use one target model and KV-cache lifetime per process. Freeing the host
+model does not reset that CUDA state. When loading a media projector, call
+`model_prefill_reserve()` before cache initialization or the first forward call.
+Scratch initialization reserves activation storage for the widest permitted
+prefill, including when decoding or speculative verification happens first;
+later prefill must retain the pointers already captured by those graphs.
+
+Prefill groups a wide chunk's complete 64-column matrix tiles into one launch
+and handles a remaining 32-column tail separately. MTP verification selects
+each row's best token in a separate block of one launch. Both changes retain
+the existing per-column arithmetic and first-index tie handling.
+
+The optional `cuda_scratch_test` target checks activation-pointer stability and
+graph replay without a GGUF. `cuda_regression_test` covers float conversions,
+activation quantization, flash-attention cache boundaries, Q4_K/Q4_0/Q6_K tile
+grouping and MTP token-selection ties. These require an Ampere-or-newer GPU and
+are excluded from ordinary builds and CTest:
+
+```sh
+cmake --build build --target cuda_scratch_test cuda_regression_test
+build/cuda_scratch_test
+build/cuda_regression_test
+compute-sanitizer --tool memcheck --error-exitcode 1 build/cuda_regression_test
+```
+
+Bitwise preservation against the same backend is a different check from
+numerical agreement with an independent engine. The model-backed
+`prefill_cache_test` additionally compares logical cache storage and generated
+tokens with full-layer prefill; its source documents the invocation.

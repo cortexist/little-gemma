@@ -98,7 +98,6 @@ static void check_cache(void) {
     }
 }
 
-
 // Compare grouped dispatch to separate tiles, including narrow and wide tails.
 static void check_mma_tails(void) {
     const int K = 768, M = 259, B = 1120;
@@ -120,25 +119,16 @@ static void check_mma_tails(void) {
             uint16_t h = __half_as_ushort(__float2half((i % 29 + 1) / 512.f));
             switch (type) {
                 case GGML_TYPE_Q4_K: ((block_q4_K *)p)->d = h; ((block_q4_K *)p)->dmin = h; break;
-                case GGML_TYPE_Q5_K: ((block_q5_K *)p)->d = h; ((block_q5_K *)p)->dmin = h; break;
-                case GGML_TYPE_Q3_K: ((block_q3_K *)p)->d = h; break;
                 case GGML_TYPE_Q6_K: ((block_q6_K *)p)->d = h; break;
                 case GGML_TYPE_Q4_0: ((block_q4_0 *)p)->d = h; break;
-                case GGML_TYPE_Q8_0: ((block_q8_0 *)p)->d = h; break;
-                case GGML_TYPE_F32: *(float *)p = (i % 37 - 18) / 32.f; break;
-                case GGML_TYPE_F16: *(uint16_t *)p = h; break;
-                case GGML_TYPE_BF16: *(uint16_t *)p = 0x3c00 + i % 512; break;
             }
         }
         std::vector<unsigned char> rep;
-        if (type == GGML_TYPE_Q3_K) {
-            ts = sizeof(block_q3_Kr); rep.resize((size_t)nb * ts);
-            repack_q3_K((block_q3_Kr *)rep.data(), (block_q3_K *)raw.data(), nb);
-        } else if (type == GGML_TYPE_Q6_K) {
+        if (type == GGML_TYPE_Q6_K) {
             ts = sizeof(block_q6_Kr); rep.resize((size_t)nb * ts);
             repack_q6_K((block_q6_Kr *)rep.data(), (block_q6_K *)raw.data(), nb);
         } else if (type == GGML_TYPE_Q4_0) {
-            bl = 256; nb /= 8; ts = sizeof(block_q4_0m); rep.resize((size_t)nb * ts);
+            nb /= 8; ts = sizeof(block_q4_0m); rep.resize((size_t)nb * ts);
             repack_q4_0m((block_q4_0m *)rep.data(), (block_q4_0 *)raw.data(), nb);
         }
         auto &host = rep.empty() ? raw : rep;
