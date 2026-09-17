@@ -51,8 +51,8 @@ is for.
 **Current include-closure count:** 5,003 CPU, 8,410
 f32-CUDA, 9,880 int8-CUDA. These are physical source lines, including comments
 and blank lines, in each binary's transitive local include closure, counting
-each file once. Compiler-generated dependency files independently produced the
-same closures and totals. Benchmark code, tests, CMake and tools are outside
+each file once. The closures and totals were extracted from compiler-generated dependency
+files. Benchmark code, tests, CMake and tools are outside
 this count.
 
 | directory | files | code   |

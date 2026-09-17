@@ -112,9 +112,8 @@ ID-list hashes, and llama-bench metadata:
 matrix-vector kernel improves Orin's three-prompt serving mean from
 36.10 -> 44.03 tok/s (E2B), 21.53 -> 25.93 (E4B), and 10.33 -> 11.70 (12B).
 This is a separate workload from the historical sustained-decode tables below;
-those tables have not been relabeled with these newer rates. Fixed-context
-A/B/A, full-logit checks, and a fresh llama-bench reference are in the
-[protected research journal](https://github.com/cortexist/research/blob/main/little-gemma/docs/performance-journal.md#2026-09-06--plain-decode-specialize-format-arithmetic-keep-the-kernel).
+those tables have not been relabeled with these newer rates. Fixed-context checks and a fresh llama-bench reference are described in the
+[combined results above](#2026-09-06-combined-prefill-decode-and-mtp).
 
 **2026-09-05 update:** the Orin QAT prefill rows now use cache-only prefill,
 validated against the full path on the same binary. E2B improves 2.91x and E4B
