@@ -5,11 +5,10 @@ project(little-gemma C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# MTP speculation block depth (verify width), the same constant the code reads via
-# include/model.h. DEFAULT 3 = a chained 2nd draft + triple verify (1.1-1.3x over 2 on
-# 12B, A5000 and Orin); -DLG_MTP_N=2 builds the conservative one-draft pair verify.
-# Compile-time so the verify kernel/loop stay one tight parameterized path.
-set(LG_MTP_N 3 CACHE STRING "MTP speculation block depth (3 = chained default; 2 = pair verify)")
+# MTP speculation block depth (verify width): this sets the build default.
+# Runtime LG_MTP_N can override it within the range in include/model.h.
+# Default 3 = two chained drafts + triple verify; 2 = one draft + pair verify.
+set(LG_MTP_N 3 CACHE STRING "Default MTP block depth (runtime LG_MTP_N overrides it)")
 add_compile_definitions(LG_MTP_N=${LG_MTP_N})
 
 # Warning flags for C only (so they don't reach nvcc). The genex must be
@@ -81,8 +80,13 @@ if(CMAKE_CUDA_COMPILER)
     list(REMOVE_ITEM PREFILL_TEST_CORE src/run.c)
     add_executable(prefill_cache_test EXCLUDE_FROM_ALL ${PREFILL_TEST_CORE}
         test/prefill-cache.c src/cuda/model-cuda-i8.cu src/cuda/media-kernel.cu)
+    # GPU-only helper and graph-lifetime gates; no model files required.
+    add_executable(cuda_regression_test EXCLUDE_FROM_ALL ${PREFILL_TEST_CORE}
+        test/cuda-regression.cu src/cuda/media-kernel.cu)
+    add_executable(cuda_scratch_test EXCLUDE_FROM_ALL ${PREFILL_TEST_CORE}
+        test/cuda-scratch.cu src/cuda/media-kernel.cu)
     target_include_directories(prefill_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    foreach(tgt run-cuda run-cuda-i8 prefill_cache_test)
+    foreach(tgt run-cuda run-cuda-i8 prefill_cache_test cuda_regression_test cuda_scratch_test)
         target_include_directories(${tgt} PRIVATE include src)   # src/ for media-internal.h & mtp-internal.h
         if(WIN32)
             target_link_libraries(${tgt} PRIVATE ws2_32)   # AF_UNIX sockets (-s/-c)
@@ -97,7 +101,8 @@ if(CMAKE_CUDA_COMPILER)
             target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_C)
         endif()
         # dev box A5000 = sm_86; Orin NX: cmake -DLG_CUDA_ARCH=87
-        set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "${LG_CUDA_ARCH}")
+        set_target_properties(${tgt} PROPERTIES CUDA_ARCHITECTURES "${LG_CUDA_ARCH}"
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         # per-thread default stream: required to stream-capture the forward into a CUDA graph
         # (the legacy default stream is not capturable). model_forward always replays a graph.
         target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -130,3 +135,7 @@ endif()
 
 enable_testing()
 add_test(NAME graph_test COMMAND graph_test)
+
+add_executable(turn_policy_test test/turn-policy.c)
+target_include_directories(turn_policy_test PRIVATE include)
+add_test(NAME turn_policy_test COMMAND turn_policy_test)

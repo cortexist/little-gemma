@@ -15,7 +15,7 @@ struct config {
     int   n_head_kv;          // key/value heads (< n_head for grouped-query)
     int   head_dim_swa;       // head size on sliding-window (local) layers
     int   head_dim_full;      // head size on full (global) layers
-    int   n_ff;               // feed-forward hidden size (per-layer; assumed uniform)
+    int   n_ff;               // maximum feed-forward width across elastic layers
     int   n_vocab;            // vocabulary size
     int   n_ctx;              // max context length the file was trained for
     int   sliding_window;     // local-attention window
@@ -58,17 +58,15 @@ void model_free(struct model *m);
 // layers keep the full max_seq (seq[L] == max_seq, and the ring index is then
 // the identity). At a long context the cache cost is dominated by the few
 // global KV-owning layers, not the layer count.
-// Global layers store their rows as f16: at a long context the cache cost —
-// capacity and the per-token read — is almost entirely theirs, and halving it
-// is worth one round-to-nearest per stored value (the only step in this
-// project's pipeline that changes the KV numbers; everything else is exact or
-// reassociated). The sliding-window rings stay f32: a few hundred rows save
-// nothing meaningful in f16, so they keep the exact values.
+// CUDA stores both global and sliding-window rows as f16 by default, rounding
+// once when writing the cache. LG_SWA_F32 restores f32 sliding-window rows.
+// The CUDA allocation may have zeroed tail padding for flash's 32-key loads;
+// max_seq and seq remain logical capacities, including for ring detection.
 struct kvcache {
     int     n_layer;
     int     max_seq;   // logical capacity (positions); ring rows may be fewer
     int    *kv_dim;    // per layer: n_head_kv * head_dim(layer)
-    int    *seq;       // per layer: rows allocated (ring length); 0 if reusing
+    int    *seq;       // per layer: logical rows (ring length), excluding padding; 0 if reusing
     int    *f16;       // per layer: 1 if rows are stored as f16 (global layers)
     void  **k;         // per layer: [seq * kv_dim] f32 or f16, NULL if reusing
     void  **v;
@@ -141,7 +139,9 @@ void model_prefill_mixed(struct model *m, struct kvcache *kv, const float *rows,
 // Tell the engine a media projector is loaded, so it sizes the prefill activation
 // buffers for a whole image span (up to the model's patch budget) before the decode
 // graph captures their pointers. Call once at startup after media_open, before the
-// first forward. LG_PREFILL_MAX_B caps the width (a deployment's VRAM throttle).
+// first forward. LG_PREFILL_MAX_B sets the media reserve, rounded up to 32 rows;
+// wider LG_WIDE_CHUNK text chunks can raise it. Media spans should fit the
+// reserve: an oversized span is split and loses cross-chunk bidirectionality.
 void model_prefill_reserve(void);
 
 // MTP speculation block depth (verify width). RUNTIME knob: env LG_MTP_N picks the

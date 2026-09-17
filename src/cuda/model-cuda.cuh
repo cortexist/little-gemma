@@ -23,9 +23,7 @@ extern "C" {
 #include "mtp-internal.h"
 }
 
-// kvcache rows live on the device here, and so will the draft head: the CUDA
-// MTP port (device-side assistant + batched verify + async overlap) is the
-// in-progress follow-up — until it lands, drafting on this backend declines.
+// Both the target cache and the MTP draft head live on the device.
 extern "C" const int model_kv_host = 0;
 
 // The device draft is implemented at the end of this file (it needs d_attn,
@@ -51,6 +49,8 @@ typedef struct { ggml_half d; int8_t qs[32]; } block_q8_0;
 typedef struct { ggml_half d; uint8_t qs[16]; } block_q4_0;   // elem j low nibble, j+16 high
 
 __device__ static float d_fp16(uint16_t h) {
+    // Preserve every encoding, including NaN payloads. Replacing this hot
+    // helper also requires checking register allocation in the matmul kernels.
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu, bits;
     if (exp == 0) {
         if (mant == 0) bits = sign;
@@ -59,7 +59,7 @@ __device__ static float d_fp16(uint16_t h) {
     else bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
     float f; memcpy(&f, &bits, 4); return f;
 }
-__device__ static float d_bf16(uint16_t h) { uint32_t b = (uint32_t)h << 16; float f; memcpy(&f, &b, 4); return f; }
+__device__ static float d_bf16(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
 // q4_K / q5_K 6-bit sub-block scale+min unpack.
 __device__ static void d_gsm(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
@@ -105,8 +105,7 @@ __device__ static void d_quant_group_warp(const float *xb, int g, struct actq aq
     float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
     int q = __float2int_rn(v * id);
     aq.xq[(size_t)g * 32 + lane] = (int8_t)q;
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    q = __reduce_add_sync(0xffffffffu, q);  // exact integer sum; all 32 lanes participate
     if (lane == 0) aq.xds[g] = make_float2(d, (float)q);
 }
 
@@ -498,7 +497,7 @@ __global__ static void attn_swa_h_n_kernel(float *xb, const float *q, const __ha
 // graph-captured launch (grid is always n_head x MAXSPLIT) covers every context;
 // splits beyond n_split early-exit. Same online-softmax math as d_attn,
 // deterministic (fixed split order), relaxed class (reassociated). The per-query
-// d_attn stays for the B=2 MTP verify and LG_NO_SPLITK fallback.
+// d_attn stays for the LG_NO_SPLITK fallback in decode and verification.
 //
 // SPLIT_KEYS is a cap on the KEYS ONE BLOCK WALKS, and that is the whole point:
 // it must be small enough that per-block work stays flat as the context grows,
@@ -608,7 +607,7 @@ __global__ static void combine_attn_kernel(float *xb, const float *pacc, const f
         for (int g = threadIdx.x; g < hd / 32; g += blockDim.x) d_quant_group(outh + g * 32, (int)(qoff / 32) + (hh * hd) / 32 + g, aq); }
 }
 // split-K scratch (partials), grown once during warmup (no mid-capture malloc).
-// Sized in (query,head) slots: decode needs n_head (B=1), the B=2 verify 2*n_head.
+// Sized in (query,head) slots: decode needs n_head, verification N*n_head.
 static float *g_pacc = NULL; static float2 *g_pml = NULL; static int g_split_cap = 0;
 static void ensure_split(int slots) {
     if (slots <= g_split_cap) return;
@@ -727,7 +726,9 @@ __global__ static void softcap_kernel(float *l, float sc, int n) { int i = block
 
 // Greedy pick on the device: one 1024-thread block scans the logits. Ties break
 // toward the lower index, matching the CPU's first-max scan exactly.
+template<bool BATCHED = false>
 __global__ static void argmax_kernel(const float *x, int n, int *out) {
+    if constexpr (BATCHED) { x += (size_t)blockIdx.x * n; out += blockIdx.x; }
     __shared__ float bv[1024]; __shared__ int bi[1024];
     float v = -1e30f; int idx = 0;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -877,7 +878,8 @@ extern "C" void model_prefill_reserve(void) {
     int w = PREFILL_MAX_B;
     const char *e = getenv("LG_PREFILL_MAX_B");
     if (e) { w = atoi(e); if (w < PREFILL_B) w = PREFILL_B; if (w > PREFILL_MAX_B) w = PREFILL_MAX_B; }
-    g_prefill_max_b = w;
+    // Kernels consume complete 32-column tiles, even at the media budget's end.
+    g_prefill_max_b = (w + 31) / 32 * 32;
 }
 
 // LG_WIDE_CHUNK=<N>: prefill TEXT in up-to-N-token chunks (a multiple of 64)
@@ -902,22 +904,15 @@ static void wide_chunk_init(void) {
     if (w > g_prefill_max_b) g_prefill_max_b = w;  // size float buffers + KV ring for the wide chunk
 }
 
-// Adaptive prefill chunk width. Full chunks use PREFILL_B (128) so long prefills
-// (system prompt, media) keep the wide-tile win; the short TAIL of a turn rounds
-// up to a multiple of 32 instead of padding to 128 — a 16-token serve turn pays
-// a 32-wide chunk, not a 128-wide one (the fat q4_K kernel is templated on COLS,
-// and flash / the q6+dp4a sub-tile loops already take the width at runtime).
-// matmul_q_n reads this to pick the COLS instantiation; set per chunk by
-// forward_chunk*. Buffers stay allocated for the 128 max (see the pre-size in
-// model_prefill — g_xq must never realloc after the decode graph is captured).
+// Actual padded width of the current chunk; matmul_q_n chooses its tile shape
+// from this. Short tails round to 32 columns, wide chunks to 64 where possible.
+// Buffers retain the resolved g_prefill_max_b capacity throughout graph replay.
 static int g_pf_cols = PREFILL_B;
-// 1 while a B=3 MTP verify chunk is being issued: forces decode's byte-identical
-// split-K attention instead of the prefill flash / K-sharing kernels that a B>2
-// chunk would otherwise pick (those relax float order and would diverge from plain
-// greedy). The B<=2 verify already dodges them via the B<=2 split-K gate.
+// Verification at every N uses decode's split-K arithmetic. Prefill flash and
+// K-sharing relax float order and must not be selected merely because N > 2.
 static int g_chunk_verify = 0;
 // Media-span attention context for the current chunk (set by forward_chunk_mixed,
-// read where chunk_layers launches flash). g_pf_seg = kv->seg when this chunk holds
+// read where chunk_layers launches flash). g_pf_seg points at the segment table when a chunk holds
 // a whole image span (bidirectional within it), NULL otherwise (causal — text,
 // decode, verify all leave it NULL). g_pf_bidir_hi = that span's last abs position.
 static const int *g_pf_seg = NULL;
@@ -959,6 +954,10 @@ static void side_sync(void) {                           // main needs the side r
     CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, g_join, 0));
 }
 
+// actq_for(k): backend activation buffers; AQ0 (no quantization) for f32.
+// Declared here so scratch initialization can reserve them before graph capture.
+static struct actq actq_for(int k);
+
 static void ensure_scratch(struct model *m) {
     if (scratch_ok) return;
     wide_chunk_init();            // g_prefill_max_b must be final before B sizes anything
@@ -991,6 +990,12 @@ static void ensure_scratch(struct model *m) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
+    // Graphs retain activation pointers. Reserve the widest future prefill here,
+    // even when the first calls are decode/verify, so no later path moves them.
+    int act_width = nff > q_max ? nff : q_max;
+    if (ne > act_width) act_width = ne;
+    if (ple > act_width) act_width = ple;
+    actq_for((int)(B * act_width));
     scratch_ok = 1;
 }
 
@@ -1009,9 +1014,6 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
 // matmul_coverage_print: print the per-kernel coverage counts for the matmul_q variants, 
 //  to verify that the expected kernels are running for each layer and chunk type.
 static void matmul_coverage_print(void);
-// actq_for(k): the backend's epilogue buffers for a k-length activation that is
-//   about to feed matmul_q (the f32 backend returns AQ0 — no quantization).
-static struct actq actq_for(int k);
 // act_quantize: quantize d_x explicitly — for the one activation no kernel
 //   produces (the host-uploaded embedding); no-op for f32.
 static void act_quantize(const float *d_x, int k);
@@ -1068,7 +1070,10 @@ extern "C" int kvcache_init(struct kvcache *kv, const struct model *m, int max_s
         static int swa_f32 = -1;
         if (swa_f32 < 0) swa_f32 = getenv("LG_SWA_F32") != NULL;
         kv->f16[L] = swa_f32 ? !m->is_local[L] : 1;
-        size_t bytes = (size_t)seq * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
+        // Flash reads whole 32-key tiles before masking. Keep zeroed physical
+        // tail padding without changing logical capacity or ring classification.
+        size_t rows = seq == max_seq ? ((size_t)seq + 31) / 32 * 32 : (size_t)seq;
+        size_t bytes = rows * kv->kv_dim[L] * (kv->f16[L] ? 2 : 4);
         CUDA_CHECK(cudaMalloc(&kv->k[L], bytes)); CUDA_CHECK(cudaMemset(kv->k[L], 0, bytes));
         CUDA_CHECK(cudaMalloc(&kv->v[L], bytes)); CUDA_CHECK(cudaMemset(kv->v[L], 0, bytes));
     }
@@ -1233,7 +1238,7 @@ static void forward_layers(struct model *m, struct kvcache *kv) {
         // shmem holds each warp's partial output row: (256/32)*hd floats, ctx-independent
         size_t shm = (size_t)(256 / 32) * hd * sizeof(float);
         // Split-K decode attention (parallelism, the high-ctx win); d_attn falls
-        // back via LG_NO_SPLITK and stays for the B=2 MTP verify. Static grids
+        // back via LG_NO_SPLITK in decode and verification. Static grids
         // (graph-capturable); n_split adapts to context on-device.
         static int no_splitk = -1;
         if (no_splitk < 0) no_splitk = getenv("LG_NO_SPLITK") != NULL;
@@ -1385,7 +1390,7 @@ extern "C" int model_forward_next(struct model *m, struct kvcache *kv, int token
         CUDA_CHECK(cudaMemcpy(row, dlogits, (size_t)m->cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
         return model_pick(row, m->cfg.n_vocab);
     }
-    argmax_kernel<<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
+    argmax_kernel<><<<1, 1024>>>(dlogits, m->cfg.n_vocab, d_best);
     int best;
     CUDA_CHECK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
     return best;

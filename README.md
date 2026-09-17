@@ -3,8 +3,10 @@
 A small, from-scratch **C program on CUDA** that loads a Gemma 4 model from
 **GGUF** and runs it — written to *teach* how a modern LLM actually executes,
 in the spirit of Karpathy's `llama2.c`, but covering a current model end to
-end: parse GGUF → BPE tokenize → run the transformer → generate text. Every
-stage validated bit-for-bit against `llama.cpp`.
+end: parse GGUF → BPE tokenize → run the transformer → generate text.
+Tokenization and dequantization are checked for exact agreement; forward
+computations are compared with independent references using numerical
+tolerances. See [validation](docs/architecture.md#validation).
 
 ```
 text ──► tokenizer ──► token ids ──► forward ──► logits ──► argmax ──► next token
@@ -12,91 +14,77 @@ text ──► tokenizer ──► token ids ──► forward ──► logits 
                           ╰──────────────── append, repeat ◄───────────────╯
 ```
 
-**~9,700 lines of C/CUDA for the shipped int8-CUDA build, no vendored
-dependencies** — 4,908 CPU · 8,282 f32-CUDA · 9,746 int8-CUDA, counted per
+**~9,900 lines of C/CUDA for the shipped int8-CUDA build, no vendored
+dependencies** — 5,003 CPU · 8,410 f32-CUDA · 9,880 int8-CUDA, counted per
 binary as the include closure the compiler actually sees (the three backends
-are mutually exclusive, so no single program is their sum). That 9,746
+are mutually exclusive, so no single program is their sum). That 9,880
 includes multi-turn socket serving, image and audio understanding, a GPU
 vision encoder, tensor-core flash-attention prefill, a ring-buffered f16 KV
 cache, and byte-identical speculative decoding ([MTP](docs/mtp.md)).
 
 ## Performance vs llama.cpp
 
-Same day, same GGUFs, same machines; little-gemma measured on its serving
-path, llama.cpp with `llama-bench` (best of `-fa 0/1`, decode at matched
-context depth). Full tables, methodology, and history:
+**Orin NX 16GB, 2026-09-06:** cache-only prefill and Q4_0 decode
+specialization together, MAXN with pinned clocks. Same QAT GGUFs on both
+engines. Full methodology, depth sweeps, and historical measurements:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-**Generation with [MTP](docs/mtp.md) on** (tokens/s) — the shipped
-configuration, and the number that matters in use; output is
-**byte-identical to plain greedy decoding, always**:
+**Warm generation** (tokens/s, socket serving, greedy). Means give equal
+weight to prose, C code, and French; each prompt uses the median of two warm
+turns after a discarded warmup cycle. MTP depths 2–5 were swept independently
+for full and selected heads; each column shows its best three-prompt mean.
 
-| device | model | plain | +MTP chat | +MTP structured |
-|--------|-------|------:|----------:|----------------:|
-| Jetson Orin NX | E4B QAT | 20.7 | **29.9** | **48.6** |
-| Jetson Orin NX | 12B QAT | 9.8 | **14.5** | **20.4** |
-| RTX A5000 | E4B QAT | 134 | **168.8** | **282** |
-| RTX A5000 | 12B QAT | 70.7 | **101.5** | **143.7** |
+| QAT model | Plain mean | Full-head MTP mean (N) | Selected 16K MTP mean (N) | Selected prose | Selected C code |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | 44.0 | 54.5 (3) | **60.4 (3)** | 61.5 | 63.3 |
+| E4B | 25.9 | 35.4 (4) | **38.1 (4)** | 33.0 | 48.5 |
+| 12B | 11.7 | 17.5 (4) | **19.4 (4)** | 17.7 | 22.9 |
 
-The gain is content-dependent — Orin E4B by turn type: prose 29.9, image
-description 31.5, code 40.7, fully predictable output 48.6 (57.8 at
-block-4) — and ahead of `llama-server`'s own `draft-mtp` at every point
-measured (prose 24.5, code 34.1, image 28.8).
+Selected heads use **16,384 FP16 rows** from the matched assistant, chosen by
+`LG_MTP_IDS`; see [vocabulary selection](docs/mtp-vocab-trim.md). Set runtime
+`LG_MTP_N=3` for E2B, `LG_MTP_N=4` for E4B/12B with these selected heads.
+The default remains N=3. On the separate 930-token fixture, the best tested
+depths are **E2B N=3, E4B/12B N=2**. These choices depend on the prompt;
+the full sweeps are in the benchmarks. Packed selected Q4_0 was dropped
+because its small gain did not justify the extra code.
 
-**Best-vs-best MTP** (experimental; Orin NX QAT, one prose turn, greedy,
-tokens/s, each config at its optimal block depth). little-gemma runs on its
-serve path, llama.cpp via `--spec-type draft-mtp` **with the same head** — a
-like-for-like engine comparison. Block depth is `LG_MTP_N` (a runtime knob) /
-llama's `--spec-draft-n-max`, shown at its optimum, which climbs with model
-size as acceptance headroom grows. Output stays **byte-identical** to plain
-greedy at every depth:
+**Warm prefill** (tokens/s, 930 input tokens per fresh serving connection;
+first turn discarded, median of four). MTP uses selected heads at N=3/4/4
+for E2B/E4B/12B. llama.cpp is the best of
+`llama-bench -p 930 -n 0 -fa 0,1 -r 3`.
 
-| model | plain | little-gemma full head | llama.cpp full head | little-gemma reduced-vocab |
-|-------|------:|-----------------------:|--------------------:|---------------------------:|
-| E2B QAT | 34.5 | 49.2 (N=2) | 49.0 (n=2) | **54.1** (N=3) |
-| E4B QAT | 20.7 | 31.9 (N=4) | 30.4 (n=3) | **34.0** (N=4) |
-| 12B QAT |  9.8 | 16.4 (N=4) | — [^12b]   | **17.8** (N=4) |
+| QAT model | little-gemma plain | With selected MTP | llama.cpp | Plain / llama |
+| --- | ---: | ---: | ---: | ---: |
+| E2B | 2,578.8 | 2,578.7 | 1,021.8 | 2.52× |
+| E4B | 858.0 | 858.0 | 554.6 | 1.55× |
+| 12B | 202.5 | 202.4 | 231.6 | 0.87× |
 
-little-gemma's full head is level-to-ahead of llama's on the identical head;
-its **reduced-vocab** head — the tied draft head trimmed from 262,144 rows to
-16,384, which llama.cpp has no equivalent for — is fastest everywhere, +7–10%
-over our own full head. Content-type breakdowns and the trim study are in
-[docs/mtp-vocab-trim.md](docs/mtp-vocab-trim.md).
+Warmup is per process; these rates do not require reusing a conversation's
+prefix cache. The first turn also performs lazy allocation and graph setup.
 
-[^12b]: llama.cpp's `draft-mtp` degenerates into a control-token loop on this
-12B QAT GGUF in the build tested (its tokenizer marks some control tokens as
-normal type); little-gemma decodes the same model + head cleanly.
+**Plain decode reference** (tokens/s, 64 generated tokens starting at context
+32, median of two warm runs for little-gemma; llama-bench mean of three,
+best of flash attention off/on):
 
-**Decode** (tokens/s, batch 1, speculation off) — ahead on the Jetson, the
-device this project targets, and at parity on desktop:
+| QAT model | little-gemma | llama-bench |
+| --- | ---: | ---: |
+| E2B | 44.32 | 37.87 |
+| E4B | 25.83 | 18.95 |
+| 12B | 11.83 | 9.24 |
 
-| device | model | little-gemma | llama.cpp | ratio |
-|--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B QAT q4_0 | **20.7** | 18.7 | **1.11×** |
-| Jetson Orin NX | 12B QAT q4_0 | **9.8** | 9.05 | **1.08×** |
-| Jetson Orin NX | E2B QAT q4_0 | 34.5 | 37.4 | 0.92× |
-| RTX A5000 | E4B / 12B / E2B | 134 / 70.7 / **213.9** | 136.6 / 70.7 / 209.3 | 0.98× / **1.00×** / **1.02×** |
+The little-gemma API probe includes greedy argmax and token readback;
+llama-bench feeds random tokens without sampling. Context and work count
+match, but this is not an identical serving workload. Use the serving table
+above for application rates. Context-930 results are in the benchmarks.
 
-**Prefill** (929-token prompts) — **0.8×** llama.cpp, consistently:
+**Historical RTX A5000** results remain 134 / 70.7 / 213.9 tok/s plain decode
+and 4,335 / 2,067 / 7,222 tok/s prefill for E4B / 12B / E2B. The combined
+changes have not been timed on that workstation. Earlier llama-server MTP
+and media time-to-first-token comparisons remain in the benchmark history.
 
-| device | model | little-gemma | llama.cpp | ratio |
-|--------|-------|-------------:|----------:|------:|
-| Jetson Orin NX | E4B / 12B / E2B | 474 / 193 / 834 | 553 / 232 / 1,020 | 0.82–0.86× |
-| RTX A5000 | E4B / 12B / E2B | 4,335 / 2,067 / 7,222 | 5,254 / 2,365 / 8,785 | 0.82–0.87× |
-
-*The RTX A5000 rows across all three tables were measured on a separate
-Windows workstation. They will be re-based to the RTX PRO 4500 (Blackwell)
-dev box once identical E4B/E2B GGUFs are in place there; until then they are
-left un-updated.*
-
-The pattern is the project's thesis: decode speed is mostly everything
-*around* the matmul — launch overhead, syncs, norms, the PLE path, how the
-KV walk is split across the GPU — which a few thousand readable lines can do
-leanly. Prefill runs through llama.cpp's home turf (arch-tuned tensor-core
-GEMMs); the 2026-07 campaign closed it from ~0.2× to 0.8× and measured the
-rest to its structural floor. On media turns,
-time-to-first-token **inverts in our favor** (1.5–2.4×) — GPU encoder plus
-arrival-overlapped prefill; see [docs/benchmarks.md](docs/benchmarks.md).
+Both improvements keep the existing kernels readable: prefill stops after
+the last required KV write, and Q4_0 decode gives the compiler constant
+format and block strides. MTP verification still runs the full transformer.
 
 ## Build
 
@@ -169,7 +157,7 @@ socket clients.
   [docs/prefill-performance-journal.md](docs/prefill-performance-journal.md)
   — the full optimization logs, failed experiments included.
 - [docs/voice-pipeline.md](docs/voice-pipeline.md) — mic → whisper → serve →
-  streaming TTS, with runnable harnesses in [`bench/`](bench/).
+  streaming TTS. Measurement harnesses live in the protected research repository.
 
 ## License
 

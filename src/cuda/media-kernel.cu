@@ -361,15 +361,15 @@ static __half *up_h(const struct gguf_tensor *t) {     // weight -> device f16
     __half *d = NULL;
     if (cudaMalloc(&d, n * 2) != cudaSuccess) return NULL;
     if (t->type == GGML_TYPE_F16) {
-        if (cudaMemcpy(d, t->data, n * 2, cudaMemcpyHostToDevice) != cudaSuccess) return NULL;
+        if (cudaMemcpy(d, t->data, n * 2, cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); return NULL; }
     } else {                                            // f32 (or any) -> f16 on host
         float *f = (float *)malloc(n * 4);
         __half *h = (__half *)malloc(n * 2);
-        if (!f || !h || !dequantize_into(t->type, t->data, f, (int64_t)n)) { free(f); free(h); return NULL; }
+        if (!f || !h || !dequantize_into(t->type, t->data, f, (int64_t)n)) { free(f); free(h); cudaFree(d); return NULL; }
         for (size_t i = 0; i < n; i++) h[i] = __float2half(f[i]);
         cudaError_t e = cudaMemcpy(d, h, n * 2, cudaMemcpyHostToDevice);
         free(f); free(h);
-        if (e != cudaSuccess) return NULL;
+        if (e != cudaSuccess) { cudaFree(d); return NULL; }
     }
     return d;
 }
@@ -377,9 +377,11 @@ static __half *up_h(const struct gguf_tensor *t) {     // weight -> device f16
 static float *up_f(const float *src, size_t n) {       // norm weights -> device f32
     float *d = NULL;
     if (cudaMalloc(&d, n * 4) != cudaSuccess) return NULL;
-    if (cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) != cudaSuccess) return NULL;
+    if (cudaMemcpy(d, src, n * 4, cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); return NULL; }
     return d;
 }
+
+static void vcuda_free(struct vcuda *vc, int n_layer);
 
 static struct vcuda *vcuda_init(struct media *md) {
     if (md->v_embd / md->v_head != 64) {                // kernels assume dh = 64
@@ -406,8 +408,8 @@ static struct vcuda *vcuda_init(struct media *md) {
     }
     if (!ok) {
         fprintf(stderr, "media-kernel: weight upload failed, using the host encoder\n");
-        free(vc->vl); free(vc);                        // leaked partial uploads are acceptable here:
-        return NULL;                                   // this only happens out-of-memory at startup
+        vcuda_free(vc, md->v_layer);
+        return NULL;
     }
     return vc;
 }
@@ -422,9 +424,11 @@ static int ensure_bufs(struct vcuda *vc, int np, int ne, int n_embd) {
                     (size_t)(np / 9 + 1) * ne, (size_t)(np / 9 + 1) * n_embd };
     for (int i = 0; i < 11; i++) {
         cudaFree(*bufs[i]);
+        *bufs[i] = NULL;
         if (cudaMalloc(bufs[i], sz[i] * 4) != cudaSuccess) { vc->np_cap = 0; return -1; }
     }
     cudaFree(vc->rgb);
+    vc->rgb = NULL;
     if (cudaMalloc(&vc->rgb, (size_t)np * ne) != cudaSuccess) { vc->np_cap = 0; return -1; }
     vc->np_cap = np;
     return 0;
@@ -515,6 +519,8 @@ struct uvcuda {
     float *A, *arows;               // [af][frame], [af][ne]
 };
 
+static void uvcuda_free(struct uvcuda *vc);
+
 static struct uvcuda *uvcuda_init(struct media *md) {
     struct uvcuda *vc = (struct uvcuda *)calloc(1, sizeof *vc);
     if (!vc) return NULL;
@@ -530,7 +536,7 @@ static struct uvcuda *uvcuda_init(struct media *md) {
     if (ok && md->mm_a) ok = (vc->aw = up_h(md->mm_a)) != NULL;
     if (!ok) {
         fprintf(stderr, "media-kernel: weight upload failed, using the host encoder\n");
-        free(vc);                                      // leaked partial uploads: OOM at startup only
+        uvcuda_free(vc);
         return NULL;
     }
     return vc;
@@ -555,6 +561,7 @@ extern "C" float *uv_embed_image_gpu(struct media *md, const uint8_t *rgb, int w
     if (n_cols > md->pos_size || n_rows > md->pos_size) return NULL;   // host prints the error
     if (n > vc->np_cap) {
         cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->E); cudaFree(vc->rows);
+        vc->rgb = NULL; vc->F = vc->E = vc->rows = NULL;
         if (cudaMalloc(&vc->rgb, (size_t)n * pin) != cudaSuccess ||
             cudaMalloc(&vc->F, (size_t)n * pin * 4) != cudaSuccess ||
             cudaMalloc(&vc->E, (size_t)n * ne * 4) != cudaSuccess ||
@@ -588,6 +595,7 @@ extern "C" float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n
     int n = n_samples / F;
     if (n > vc->af_cap) {
         cudaFree(vc->pcm); cudaFree(vc->A); cudaFree(vc->arows);
+        vc->pcm = NULL; vc->A = vc->arows = NULL;
         if (cudaMalloc(&vc->pcm, (size_t)n * F * 2) != cudaSuccess ||
             cudaMalloc(&vc->A, (size_t)n * F * 4) != cudaSuccess ||
             cudaMalloc(&vc->arows, (size_t)n * ne * 4) != cudaSuccess) { vc->af_cap = 0; return NULL; }
@@ -608,22 +616,17 @@ extern "C" float *uv_embed_audio_gpu(struct media *md, const int16_t *pcm, int n
 
 static void a_gpu_free_state(struct media *md);   // gemma4a conformer state, below
 
-extern "C" void v_gpu_free(struct media *md) {
-    a_gpu_free_state(md);                          // audio state has its own pointer
-    if (!md->gpu || md->gpu == (void *)-1) return;
-    if (!md->legacy_v) {
-        struct uvcuda *vc = (struct uvcuda *)md->gpu;
-        cudaFree(vc->pw); cudaFree(vc->mmv); cudaFree(vc->aw);
-        cudaFree(vc->pb); cudaFree(vc->n1w); cudaFree(vc->n1b); cudaFree(vc->n2w); cudaFree(vc->n2b);
-        cudaFree(vc->n3w); cudaFree(vc->n3b); cudaFree(vc->vpos);
-        cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->E); cudaFree(vc->rows);
-        cudaFree(vc->pcm); cudaFree(vc->A); cudaFree(vc->arows);
-        free(vc);
-        md->gpu = NULL;
-        return;
-    }
-    struct vcuda *vc = (struct vcuda *)md->gpu;
-    for (int L = 0; L < md->v_layer; L++) {
+static void uvcuda_free(struct uvcuda *vc) {
+    cudaFree(vc->pw); cudaFree(vc->mmv); cudaFree(vc->aw);
+    cudaFree(vc->pb); cudaFree(vc->n1w); cudaFree(vc->n1b); cudaFree(vc->n2w); cudaFree(vc->n2b);
+    cudaFree(vc->n3w); cudaFree(vc->n3b); cudaFree(vc->vpos);
+    cudaFree(vc->rgb); cudaFree(vc->F); cudaFree(vc->E); cudaFree(vc->rows);
+    cudaFree(vc->pcm); cudaFree(vc->A); cudaFree(vc->arows);
+    free(vc);
+}
+
+static void vcuda_free(struct vcuda *vc, int n_layer) {
+    for (int L = 0; vc->vl && L < n_layer; L++) {
         struct vld *d = &vc->vl[L];
         cudaFree(d->ln1); cudaFree(d->ln2); cudaFree(d->attn_post); cudaFree(d->ffn_post);
         cudaFree(d->qn); cudaFree(d->kn);
@@ -636,6 +639,14 @@ extern "C" void v_gpu_free(struct media *md) {
     cudaFree(vc->G); cudaFree(vc->U); cudaFree(vc->pooled); cudaFree(vc->rows);
     free(vc->vl);
     free(vc);
+}
+
+extern "C" void v_gpu_free(struct media *md) {
+    a_gpu_free_state(md);
+    if (md->gpu && md->gpu != (void *)-1) {
+        if (md->legacy_v) vcuda_free((struct vcuda *)md->gpu, md->v_layer);
+        else uvcuda_free((struct uvcuda *)md->gpu);
+    }
     md->gpu = NULL;
 }
 
@@ -772,6 +783,8 @@ static __global__ void k_local_attn(float *Dout, const float *Q, const float *K,
 
 // ---- audio upload / init ----------------------------------------------------
 
+static void acuda_free(struct acuda *ac);
+
 static struct acuda *acuda_init(struct media *md) {
     int ne = md->a_embd, nh = md->a_head, dh = ne / nh;
     int ao = (int)md->a_out_proj->dims[1];
@@ -813,7 +826,7 @@ static struct acuda *acuda_init(struct media *md) {
     }
     if (!ok) {
         fprintf(stderr, "media-cuda: audio weight upload failed, using the host conformer\n");
-        free(ac->al); free(ac);                    // partial uploads leaked (startup OOM only)
+        acuda_free(ac);
         return NULL;
     }
     return ac;
@@ -829,6 +842,7 @@ static int ensure_abufs(struct acuda *ac, int T) {
                     (size_t)13 * ne, (size_t)T * ao, (size_t)T * ce, (size_t)T * ne };
     for (int i = 0; i < 12; i++) {
         cudaFree(*bufs[i]);
+        *bufs[i] = NULL;
         if (cudaMalloc(bufs[i], sz[i] * 4) != cudaSuccess) { ac->t_cap = 0; return -1; }
     }
     ac->t_cap = T;
@@ -932,10 +946,8 @@ extern "C" float *a_blocks_gpu(struct media *md, const float *F, int T, int n_fe
     return out;
 }
 
-static void a_gpu_free_state(struct media *md) {
-    struct acuda *ac = (struct acuda *)md->audio_gpu;
-    if (!ac || md->audio_gpu == (void *)-1) { md->audio_gpu = NULL; return; }
-    for (int L = 0; L < ac->n_layer; L++) {
+static void acuda_free(struct acuda *ac) {
+    for (int L = 0; ac->al && L < ac->n_layer; L++) {
         struct ald *d = &ac->al[L];
         cudaFree(d->ffn_norm); cudaFree(d->ffn_post); cudaFree(d->ffn_norm1); cudaFree(d->ffn_post1);
         cudaFree(d->attn_pre); cudaFree(d->attn_post); cudaFree(d->pds);
@@ -951,5 +963,10 @@ static void a_gpu_free_state(struct media *md) {
     cudaFree(ac->rows); cudaFree(ac->S);
     free(ac->al);
     free(ac);
+}
+
+static void a_gpu_free_state(struct media *md) {
+    if (md->audio_gpu && md->audio_gpu != (void *)-1)
+        acuda_free((struct acuda *)md->audio_gpu);
     md->audio_gpu = NULL;
 }
