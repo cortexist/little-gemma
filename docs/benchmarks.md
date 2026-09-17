@@ -1,9 +1,120 @@
 # Benchmarks
 
-Canonical performance numbers vs llama.cpp — one methodology, both devices,
-all three models, measured in one sitting. **These tables supersede every
-number published before 2026-07-16** (a reconciliation of the older,
-mutually inconsistent figures is at the bottom).
+Harnesses and raw results are in the [protected research checkout](https://github.com/cortexist/research/tree/main/little-gemma) (access required). Run `bench/` commands below from its `little-gemma/` directory; engine binaries remain in the separate engine checkout.
+
+Current Orin measurements are below. The later sections retain historical
+workloads, device results, and optimization comparisons.
+
+## 2026-09-06 combined prefill, decode, and MTP
+
+Cache-only prefill and Q4_0 specialization were measured together using the
+same QAT GGUFs as the earlier comparisons. The figures below describe the
+September 6 implementation and workload, not a fresh measurement of every
+later CUDA change. Raw provenance remains in the protected research checkout.
+
+Orin NX 16GB, MAXN, GPU 918 MHz, CPU 1,984 MHz, EMC 3,199 MHz, CUDA 12.6,
+sm_87 Release build. Same E2B/E4B/12B QAT GGUFs; selected heads use
+the existing adapted 16K ID lists and the FP16 projection. No packed-head
+experiment or extra tuning environment variables are enabled. MTP's runtime
+default stays 3; the recommended selected-head settings remain **E2B N=3,
+E4B/12B N=4** on the three-prompt mean.
+
+Each model/config starts a fresh server, and every turn uses a fresh socket
+connection. The three prompts below run in three identical cycles; discard
+the first cycle, take the two-run median per prompt, then the arithmetic mean
+of the three rates. This gives each content type equal weight, rather than
+weighting the result by answer length. Server-reported rates have 0.1 tok/s
+resolution. Full and selected heads each sweep N=2,3,4,5.
+
+1. `Explain in about 100 words how a refrigerator moves heat from its interior to the room.`
+2. `Write a compact C function that parses an unsigned decimal integer with overflow checking. Include the function only.`
+3. `En environ 100 mots, explique comment fonctionne un moteur a quatre temps.`
+
+| QAT model | Plain mean | Full-head MTP mean (N) | Selected 16K MTP mean (N) | Selected prose | Selected C code |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | 44.0 | 54.5 (3) | **60.4 (3)** | 61.5 | 63.3 |
+| E4B | 25.9 | 35.4 (4) | **38.1 (4)** | 33.0 | 48.5 |
+| 12B | 11.7 | 17.5 (4) | **19.4 (4)** | 17.7 | 22.9 |
+
+Three-prompt mean at every depth (tok/s):
+
+| QAT model / head | N=2 | N=3 | N=4 | N=5 |
+| --- | ---: | ---: | ---: | ---: |
+| E2B / full | 53.63 | 54.52 | 51.55 | 45.48 |
+| E2B / selected | 57.27 | 60.42 | 58.67 | 52.77 |
+| E4B / full | 32.67 | 34.82 | 35.38 | 31.15 |
+| E4B / selected | 33.83 | 36.60 | 38.05 | 33.52 |
+| 12B / full | 15.68 | 16.73 | 17.53 | 16.07 |
+| 12B / selected | 16.27 | 17.57 | 19.37 | 17.47 |
+
+Warm prefill uses `bench/line929s.txt`, which produces **930 input tokens**,
+five turns per fresh server with the first discarded. The MTP column uses
+the best selected-head depth from the three-prompt mean, and the plain column
+disables MTP. Both use cache-only prefill automatically after warmup. Repeated
+prompts on fresh connections measure warm execution, not prefix-cache reuse.
+
+| QAT model | little-gemma plain | With selected MTP | llama.cpp | Plain / llama |
+| --- | ---: | ---: | ---: | ---: |
+| E2B | 2,578.8 | 2,578.7 | 1,021.8 | 2.52× |
+| E4B | 858.0 | 858.0 | 554.6 | 1.55× |
+| 12B | 202.5 | 202.4 | 231.6 | 0.87× |
+
+The same long prompt's **decode** rate at each selected-head depth is below.
+This is a different output/content/context from the three-prompt sweep, so
+its best N need not be the same. Median of four warm turns (tok/s):
+
+| QAT model | Plain | N=2 | N=3 | N=4 | N=5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | 41.10 | 44.60 | 46.00 | 41.65 | 35.95 |
+| E4B | 24.70 | 27.80 | 27.30 | 25.10 | 21.50 |
+| 12B | 10.80 | 13.00 | 12.30 | 12.20 | 10.30 |
+
+Best tested depths on this fixture: **E2B N=3, E4B/12B N=2**. N=5 falls
+below plain decoding on all three; the shorter-prompt recommendation of
+N=4 for E4B/12B does not generalize to every prompt.
+
+Fixed-work plain decoding uses the existing deterministic-token API probe,
+64 next-token calls after prefill, three repetitions with the first discarded.
+The separate logits mode hashes every float byte for eight steps at each
+depth; it is a correctness gate, not a throughput measurement.
+
+| QAT model | Context | little-gemma | llama-bench |
+| --- | ---: | ---: | ---: |
+| E2B | 32 | 44.320 | 37.871 |
+| E2B | 930 | 40.591 | 37.226 |
+| E4B | 32 | 25.833 | 18.949 |
+| E4B | 930 | 24.294 | 18.556 |
+| 12B | 32 | 11.833 | 9.243 |
+| 12B | 930 | 10.631 | 8.950 |
+
+llama.cpp `83efbcc79`: `llama-bench -p 0 -n 64 -d 32,930 -fa 0,1 -r 3 -mmp 0
+-o json` for decode; `-p 930 -n 0 -fa 0,1 -r 3 -mmp 0 -o json` for prefill.
+Flash-attention choice is selected separately per case. llama-bench uses
+random tokens without greedy selection; our probe includes argmax/readback.
+These are engine references with matched depth/work count, not identical
+serving comparisons. Older sustained-decode and desktop measurements below
+retain their original workloads and dates.
+
+Correctness: all 318 serving replies match their historical
+plain-greedy references, including every tested head/depth and the long prompt.
+All 15 full-versus-cache-only KV/continuation cases pass (cold, text, mixed
+text, synthetic media, and embedding-only on all three models). Full-logit
+hashes match the original generic-kernel reference at both contexts on all
+three models. Local CPU, f32-CUDA, and int8-CUDA builds and the graph test pass;
+Cortex int8-CUDA and the model-backed prefill test build and run successfully.
+
+Machine-readable results, exact per-turn rates, reply hashes, binary hash,
+ID-list hashes, and llama-bench metadata:
+[`bench/results/orin-combined-20260906.jsonl`](https://github.com/cortexist/research/blob/main/little-gemma/bench/results/orin-combined-20260906.jsonl).
+## Earlier measurements
+
+**2026-09-06 plain-decode update:** Q4_0 format specialization in the existing
+matrix-vector kernel improves Orin's three-prompt serving mean from
+36.10 -> 44.03 tok/s (E2B), 21.53 -> 25.93 (E4B), and 10.33 -> 11.70 (12B).
+This is a separate workload from the historical sustained-decode tables below;
+those tables have not been relabeled with these newer rates. Fixed-context
+A/B/A, full-logit checks, and a fresh llama-bench reference are in the
+[protected research journal](https://github.com/cortexist/research/blob/main/little-gemma/docs/performance-journal.md#2026-09-06--plain-decode-specialize-format-arithmetic-keep-the-kernel).
 
 **2026-09-05 update:** the Orin QAT prefill rows now use cache-only prefill,
 validated against the full path on the same binary. E2B improves 2.91x and E4B
@@ -59,7 +170,7 @@ best-of-two attention configs. The ratios below are therefore conservative.
 ## Decode (tokens/s, batch 1)
 
 Post the **2026-07-17 KV-split fix** (`SPLIT_KEYS 1024 → 64`; see
-[upstream-llama-study.md §4](upstream-llama-study.md) and the journal):
+[upstream-llama-study.md §4](https://github.com/cortexist/research/blob/main/little-gemma/docs/upstream-llama-study.md) and the journal):
 
 | device | model | little-gemma (serve) | llama.cpp (tg128@d512) | ratio | was |
 |--------|-------|---------------------:|-----------------------:|------:|----:|
@@ -239,7 +350,7 @@ which *"inadvertently broke Gemma 4 E4B MTP"* (fixed in #25148, 2026-06-30).
 
 A source-level study of what upstream changed, and which mechanisms transfer
 to little-gemma, is in
-[upstream-llama-study.md](upstream-llama-study.md).
+[upstream-llama-study.md](https://github.com/cortexist/research/blob/main/little-gemma/docs/upstream-llama-study.md).
 
 ## TTFT / TTFS (2026-07-02 campaign)
 
@@ -248,7 +359,7 @@ streamed token (TTFT) / first speakable sentence (TTFS), warm server, first
 turn discarded, prompt caching off, same GGUFs, token parity checked,
 medians of warm turns, vs `llama-server`. (Why prefill rate and TTFT are
 deliberately not 1:1 — first-decode step, chunk padding, encoders, arrival
-overlap — is walked through in [prefill-vs-ttft.md](prefill-vs-ttft.md).)
+overlap — is walked through in [prefill-vs-ttft.md](https://github.com/cortexist/research/blob/main/little-gemma/docs/prefill-vs-ttft.md).)
 
 | device | model | turn | little-gemma ttft (s) / prefill (tok/s) | llama-server ttft (s) / prefill (tok/s) | input tokens (lg / llama) |
 |--------|-----|------|----------------------------:|----------------------------:|:-------------------------:|

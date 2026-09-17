@@ -34,7 +34,8 @@ describing an image — every one ahead of `llama-server`'s `draft-mtp` on
 the same model, same day; Orin 12B QAT 9.8 → 14.5 prose. The 12B's
 1024-wide head lands ~51% of prose drafts vs E4B's ~37% — MTP helps chat
 more as the model grows. Block-depth sweep and llama pairs in
-[benchmarks.md](benchmarks.md).) Block depth is `-DLG_MTP_N` (default 3):
+[benchmarks.md](benchmarks.md).) Block depth is the runtime environment variable
+`LG_MTP_N=2..8` (default 3; `-DLG_MTP_N` sets the build default):
 prose peaks at 2–3, code at 4, counting at 4–5.
 
 **A measurement trap worth recording:** the draft head pays a one-time ~3.6 s
@@ -44,3 +45,10 @@ that and wrongly concluded *"MTP loses on Windows."* Benchmark MTP in serve
 mode with the first turn discarded. The full story, including the
 uncached-zero-copy bug the verify exposed in the chunk matmul, is in the
 [performance journal](performance-journal.md).
+
+Selected-16K heads retain the FP16 CUDA projection. The 2026-09-06 combined
+branch sweep of N=2–5 favors N=3 for E2B and N=4 for E4B/12B on the
+three-prompt mean. The best depth depends on the prompt; see the
+[combined results](benchmarks.md#2026-09-06-combined-prefill-decode-and-mtp)
+for the separate 930-token fixture and full-head sweep.
+See [vocabulary selection](mtp-vocab-trim.md) for `LG_MTP_IDS`.
