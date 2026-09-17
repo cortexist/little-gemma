@@ -937,9 +937,14 @@ __global__ static void matmul_i8r_n_kernel(float *out, const unsigned char *wbas
 // verdicts split by model — E4B verify -8%, 12B +7% (same-session pairs) — so
 // the discrete path keeps the n-kernel. (Parked: a shape-aware gate could
 // reclaim the A5000 E4B win.)
-template <int NB>
+template <int NB, int TYPE = -1>
 __global__ static void matmul_i8r_s_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
                                            const int8_t *xq, const float2 *xds, int k, int m) {
+    if (TYPE == GGML_TYPE_Q4_0) {
+        type = TYPE;
+        ts = sizeof(block_q4_0m);
+        blck = QK_K;
+    }
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     int r0 = 2 * warp;
@@ -1607,9 +1612,11 @@ static void matmul_q_spec(float *d_out, const struct gguf_tensor *t, const float
     int hot = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q4_0;
     // The verify kernels are templated on the block width, which is now a runtime
     // knob (g_mtp_n) — so instantiate them for every N in [2, LG_MTP_N_MAX] and pick
-    // at launch. At the default N=3 this is exactly matmul_i8r_{s,n}_kernel<3> as before.
+    // at launch. Specialize Q4_0 only at N<=3: wider batches regress on Orin 12B.
     #define LG_SPEC_LAUNCH(NB) do {                                                                        \
-        if (hot && mma_integrated())                                                                       \
+        if (NB <= 3 && t->type == GGML_TYPE_Q4_0 && mma_integrated())                                        \
+            matmul_i8r_s_kernel<NB, GGML_TYPE_Q4_0><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m); \
+        else if (hot && mma_integrated())                                                                  \
             matmul_i8r_s_kernel<NB><<<blocks, 128, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, g_xq, g_xds, k, m); \
         else                                                                                              \
             matmul_i8r_n_kernel<NB><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m); \
