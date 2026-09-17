@@ -482,9 +482,16 @@ __device__ static void sub2_q4_0m(const block_q4_0m *pa, const block_q4_0m *pb, 
 // (2 rows per warp — an ILP twist on the empirically-dead split-k idea — was
 // tried here and also regressed, uniform, adaptive, and template-specialized
 // alike; the one-row shape stays.)
+// Fix Q4_0's format and strides at compile time; other formats share the fallback.
+template <int TYPE = -1>
 __global__ static void __launch_bounds__(256, 6)
 matmul_i8r_kernel(float *out, const unsigned char *wbase, int type, int ts, int blck,
                   const float *x, const int8_t *xq, const float2 *xds, int k, int m) {
+    if (TYPE == GGML_TYPE_Q4_0) {
+        type = TYPE;
+        ts = sizeof(block_q4_0m);
+        blck = QK_K;
+    }
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (warp >= m) return;
@@ -793,7 +800,10 @@ static void matmul_q(float *d_out, const struct gguf_tensor *t, const float *d_x
     const unsigned char *w = rweight(t, &ts);
     int rows_per_block = 256 / 32;
     int blocks = (m + rows_per_block - 1) / rows_per_block;
-    matmul_i8r_kernel<<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    if (t->type == GGML_TYPE_Q4_0)
+        matmul_i8r_kernel<GGML_TYPE_Q4_0><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
+    else
+        matmul_i8r_kernel<><<<blocks, 256, 0, g_launch>>>(d_out, w, (int)t->type, ts, blck, d_x, g_xq, g_xds, k, m);
 }
 
 // The chunk form: one warp per output row, all PREFILL_B activation columns at
