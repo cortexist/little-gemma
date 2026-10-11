@@ -4,6 +4,7 @@
 .benchmarks/
 build/
 build-*/
+__pycache__/
 
 # stray in-source CMake artifacts (the real build is out-of-source in build/)
 /CMakeCache.txt

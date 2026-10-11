@@ -15,6 +15,12 @@
 // out[i] = x[i] / rms(x) * w[i]. Safe in place (out == x).
 const int model_kv_host = 1;     // this backend's kvcache rows are host memory
 
+int model_copy_hidden(const struct model *m, float *dst, int n) {
+    if (!dst || !m->last_hidden || n != m->cfg.n_embd) return -1;
+    memcpy(dst, m->last_hidden, (size_t)n * sizeof(float));
+    return 0;
+}
+
 void kvcache_save_prefix(struct kvcache *kv, int n) {
     kv->px_k = calloc((size_t)kv->n_layer, sizeof(void *));
     kv->px_v = calloc((size_t)kv->n_layer, sizeof(void *));

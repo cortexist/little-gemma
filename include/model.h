@@ -100,6 +100,13 @@ void model_forward(struct model *m, struct kvcache *kv, int token, int pos, floa
 // 4 bytes cross the bus per token instead of the whole vocabulary's logits.
 int model_forward_next(struct model *m, struct kvcache *kv, int token, int pos);
 
+// Copy the most recent post-output-norm hidden state into caller-owned host
+// memory. Call on the forward's owning thread, after a logits-producing forward
+// and before decode/MTP overwrites it. Does not run a forward or mutate KV/MTP.
+// Returns -1 for a missing state or wrong destination width. CUDA completes the
+// copy before returning; consumers may then run independently on the CPU.
+int model_copy_hidden(const struct model *m, float *dst, int n);
+
 // Optional pick hook (-temp): when set, every backend picks generated tokens by
 // calling it on the softcapped logits row instead of taking the argmax — plain
 // decode and the MTP verify alike (the draft head still drafts greedily; drafts

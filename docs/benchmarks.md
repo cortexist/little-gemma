@@ -5,6 +5,72 @@ Harnesses and raw results are in the [protected research checkout](https://githu
 Current Orin measurements are below. The later sections retain historical
 workloads, device results, and optimization comparisons.
 
+## 2026-09-25 Orin Nano 8GB Super: E4B
+
+Measured engine `29789eebbde481c6453d83991e4b11d6edca78c0`, native Release
+`sm_87`, CUDA 13.2.86 / GCC 13.3.0, Jetson Linux R39.2.1. Orin Nano 8GB,
+MAXN_SUPER, CPU/GPU/EMC pinned at 1728/1020/3199 MHz, headless Ubuntu 24.04,
+no swap. E4B `gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`, matching assistant,
+8192-token cache capacity, text only. These are new Nano measurements, not
+remeasurements of the historical NX or llama.cpp results below.
+
+**Warm serving** (tok/s): the same prose, C-code and French prompts listed in
+the September 6 section, a fresh connection per turn, one discarded cycle
+and three retained cycles per configuration. Each prompt uses its median;
+the mean gives the three prompts equal weight. Prefill chunks are 768 tokens.
+
+| Head / depth | Prose | C code | French | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| Plain | 28.1 | 28.0 | 27.9 | 28.0 |
+| Full / N=2 | 35.8 | 40.2 | 33.8 | 36.6 |
+| Full / N=3 | 34.1 | 47.3 | 34.2 | 38.5 |
+| Full / N=4 | 32.6 | 48.8 | 33.0 | 38.1 |
+| Selected 16K / N=2 | 37.4 | 41.7 | 35.5 | 38.2 |
+| Selected 16K / N=3 | 36.4 | 49.1 | 36.1 | 40.5 |
+| **Selected 16K / N=4** | **35.6** | **52.3** | **35.2** | **41.0** |
+
+Selected N=4 is the best tested mean (+46.5% versus plain, +6.5% versus best
+full head), not the best depth for every prompt. The selection is the existing
+immutable Cortex `e4b-16k-cues.bin` list supplied through `LG_MTP_IDS` with the
+**full** assistant GGUF. Its SHA-256 is
+`f7cf2e4ec8c208f1a9060647cf00b6323f54048e0e9cb370cd27179548c4dfbf`.
+The old offline `k16384.gguf` instead keeps token IDs 0–16383; that prefix
+control achieved means of 32.6/32.3/30.8 at N=2/3/4 and should not be confused
+with corpus-selected MTP. Gemma's vocabulary is not frequency-ordered.
+
+All 156 serving replies (including warmups, prefix controls and repeat plain
+baselines) match their corresponding plain reply byte-for-byte. Opening and
+final plain means were 28.00 and 28.17 tok/s, a 0.60% difference. Warm client
+first-text medians with selected N=4 were about 85 ms on these short prompts;
+this is local-socket text latency, not voice/PCM latency.
+
+**Fixed-work API throughput**: one discarded repetition followed by five
+retained measurements per shape, CUDA-synchronized wall clock. Prefill counts
+N−1 cache-only tokens and excludes the final prompt token/head. Plain decode
+includes 128 next-token calls with GPU argmax/readback, ignoring EOS.
+
+| Input tokens | Prefill, chunk 128 | Prefill, chunk 768 | Plain decode, chunk 768 |
+| ---: | ---: | ---: | ---: |
+| 32 | 617.4 | 619.3 | 27.90 |
+| 128 | 807.0 | 809.1 | 27.63 |
+| 512 | 793.1 | 1,013.6 | 26.44 |
+| 930 | 741.3 | 949.5 | 26.08 |
+| 2048 | 756.8 | 951.4 | 25.25 |
+
+All units are tok/s. Repeated generated IDs match exactly within and across
+chunk widths. For example, 930-input-token prefill through the first output
+pick took 1.017 s at chunk 768; the cache-only column uses a narrower timing
+boundary than the older serving-prefill table below. Chunk widths ran
+sequentially, so small decode differences are not causal estimates.
+
+Sampled clocks stayed at their targets, peak temperature was 70.6 C, and
+selected N=4 retained at least 2.06 GiB system MemAvailable. The 8192-token
+cache was allocated; full-context and complete voice-stack operation are not
+established by these short workloads. Normal clock scaling was restored after
+measurement with MAXN_SUPER retained. Exact identities, configuration, raw
+results, telemetry and reproduction scripts are in the protected research
+checkout at `little-gemma/bench/cortex1-super-e4b-20260925/`.
+
 ## 2026-09-06 combined prefill, decode, and MTP
 
 Cache-only prefill and Q4_0 specialization were measured together using the

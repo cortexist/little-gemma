@@ -24,6 +24,8 @@
 #include <winsock2.h>   // must precede windows.h
 #include <windows.h>
 #include <afunix.h>     // AF_UNIX on Windows 10 1803+
+#include <io.h>
+#include <fcntl.h>
 typedef SOCKET sock_t;
 #define sock_close closesocket
 #define SHUT_SEND SD_SEND
@@ -57,19 +59,28 @@ static int send_all(sock_t s, const char *buf, int n) {
     return 0;
 }
 
-// stdin -> socket. fgets, not fread: a turn should reach the server when the
-// user hits enter, and a console read in text mode already hands us clean \n
-// line endings. EOF half-closes so the server finishes the turn in flight.
+// stdin -> socket. Forward available bytes immediately, including binary frame
+// headers and open-turn commits without newlines. stdio line/string operations
+// delay commits and truncate the NULs in typed frames. EOF half-closes input.
 THREAD_FN(pump_in, arg) {
     sock_t s = *(sock_t *)arg;
-    char line[8192];
-    while (fgets(line, sizeof line, stdin))
-        if (send_all(s, line, (int)strlen(line)) != 0) break;
+    char buf[8192];
+    int n;
+#ifdef _WIN32
+    while ((n = _read(_fileno(stdin), buf, sizeof buf)) > 0)
+#else
+    while ((n = (int)read(STDIN_FILENO, buf, sizeof buf)) > 0)
+#endif
+        if (send_all(s, buf, n) != 0) break;
     shutdown(s, SHUT_SEND);
     return THREAD_RET;
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     if (argc != 2) {
         fprintf(stderr, "usage: %s <socket-path>\n", argv[0]);
         return 1;

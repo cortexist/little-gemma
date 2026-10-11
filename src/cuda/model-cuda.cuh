@@ -1312,6 +1312,16 @@ static void forward_layers_and_head(struct model *m, struct kvcache *kv) {
     forward_head(m);
 }
 
+int model_copy_hidden(const struct model *m, float *dst, int n) {
+    if (!dst || !g_hidden || n != m->cfg.n_embd) return -1;
+    // Same owning thread/stream as forward and MTP. The host copy is immutable
+    // before the next graph can overwrite g_hidden; no concurrent GPU forward.
+    CUDA_CHECK(cudaMemcpyAsync(dst, g_hidden, (size_t)n * sizeof(float),
+                               cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return 0;
+}
+
 static int model_has_ple(struct model *m) {
     return m->cfg.n_embd_per_layer > 0 &&
            gguf_find_tensor(m->ctx, "per_layer_token_embd.weight") != NULL;

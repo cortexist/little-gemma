@@ -34,6 +34,7 @@ static int sock_err(void) { return errno; }
 #include "tokenizer.h"
 #include "media.h"
 #include "turn-policy.h"
+#include "turn-control.h"
 
 #define N_GEN 256  // max tokens to generate (stops early on EOS)
 
@@ -90,6 +91,33 @@ int (*model_pick)(const float *logits, int n) = NULL;
 
 #define TOPK_CAP 256
 static struct { float temp, topp; int topk; uint64_t rng; } g_smp;
+
+// Pay the draft head's lazy upload and the draft/verify CUDA graph captures
+// before accepting a client. These three speculative steps are disposable:
+// the next real prompt overwrites their rows, and a saved system prefix is
+// restored below. Keep sampling's RNG at its original state too.
+static void mtp_prewarm(struct mtp *t, struct model *m, struct kvcache *kv,
+                        struct tokenizer *tk, int n_sys) {
+    const char *enabled = getenv("LG_MTP_PREWARM");
+    if (!t || (enabled && !strcmp(enabled, "0"))) return;
+    int pos = n_sys ? n_sys : 2; // no -sys: the existing engine warmup filled 0..1
+    if (pos + 1 + 3 * g_mtp_n >= kv->max_seq) return;
+    uint64_t rng = g_smp.rng;
+    double start = now_sec(), draft = 0, verify = 0;
+    int n_draft = 0, n_accept = 0;
+    int best = model_forward_next(m, kv, tokenizer_bos(tk), pos++);
+    for (int i = 0; i < 3; i++) {
+        int toks[LG_MTP_N_MAX], out[LG_MTP_N_MAX];
+        int adv = mtp_step(t, m, kv, best, pos, toks, out,
+                           &draft, &verify, &n_draft, &n_accept);
+        pos += adv;
+        best = out[adv - 1];
+    }
+    kvcache_restore_prefix(kv, n_sys);
+    g_smp.rng = rng;
+    fprintf(stderr, "mtp prewarm: 3 disposable steps in %.2fs (draft %.2fs, verify %.2fs)\n",
+            now_sec() - start, draft, verify);
+}
 
 static double rng_uniform(void) {                      // xorshift64*, in [0,1)
     g_smp.rng ^= g_smp.rng >> 12;
@@ -243,6 +271,43 @@ static int recv_n(sock_t s, void *buf, int n) {
     return 0;
 }
 
+// The head normally takes <3 ms. Bound missing/partial control without ever
+// treating it as permission to speak. The default serving path never calls this.
+static int recv_turn_control(sock_t s, struct turn_control *control, uint32_t turn) {
+    unsigned char buf[TURN_CONTROL_BYTES];
+    int n = 0;
+    double deadline = now_sec() + 5.0;
+    while (n < TURN_CONTROL_BYTES) {
+        double left = deadline - now_sec();
+        if (left <= 0) return -1;
+        struct timeval timeout;
+        timeout.tv_sec = (long)left;
+        timeout.tv_usec = (long)((left - timeout.tv_sec)*1e6);
+        fd_set reads; FD_ZERO(&reads); FD_SET(s, &reads);
+        if (select((int)s+1, &reads, NULL, NULL, &timeout) <= 0) return -1;
+        int k = (int)recv(s, (char *)buf+n, TURN_CONTROL_BYTES-n, 0);
+        if (k <= 0) return -1;
+        n += k;
+        if (buf[0] != 3) return -1;
+    }
+    return turn_control_parse(control, buf, turn);
+}
+
+// Append a private, externally selected assistant prefix to the SAME KV turn.
+// tokenizer_encode inserts BOS, which must not be appended mid-conversation.
+static int seed_reply(sock_t c, struct tokenizer *tk, struct model *m,
+                      struct kvcache *kv, int *pos, int *best, const char *text) {
+    int ids[64], n = tokenizer_encode(tk, text, ids, 64);
+    if (n < 2 || n >= 64 || *pos+n >= SERVE_SEQ) return -1;
+    if (n > 2) {
+        model_prefill_mixed(m, kv, NULL, ids+1, n-2, *pos);
+        *pos += n-2;
+    }
+    *best = model_forward_next(m, kv, ids[n-1], (*pos)++);
+    if (send_all(c, text, (int)strlen(text))) return -1;
+    return n-1;
+}
+
 static void serve(const struct gguf_context *ctx, const char *path, const char *mmproj,
                   const char *syspath, const char *mtp_path, int think, int question_turn) {
     struct tokenizer *tk = tokenizer_init(ctx);
@@ -276,6 +341,25 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
     // -think is a clean no-op on them instead of confusing them with a stray marker.
     int ch_open  = tokenizer_token_id(tk, "<|channel>");
     int ch_close = tokenizer_token_id(tk, "<channel|>");
+
+    // Explicit research opt-in: a binary hidden-state frame precedes each
+    // reply. Ordinary text clients and the default fast path are unchanged.
+    const char *hidden_env = getenv("LG_SNAPSHOT_HIDDEN");
+    int hidden_on = hidden_env && strcmp(hidden_env, "1") == 0;
+    const char *control_env = getenv("LG_TURN_CONTROL");
+    int control_on = control_env && !strcmp(control_env, "1");
+    if (control_on && (!hidden_on || think > 0)) {
+        fprintf(stderr, "turn control requires hidden snapshots and no reasoning budget\n");
+        kvcache_free(&kv); if (md) media_free(md); model_free(&m); tokenizer_free(tk); return;
+    }
+    if (control_on) fprintf(stderr, "turn control: same-turn prefix protocol v1; missing decisions fail closed\n");
+    size_t hidden_bytes = (size_t)m.cfg.n_embd * sizeof(float);
+    float *hidden_copy = hidden_on ? malloc(hidden_bytes) : NULL;
+    if (hidden_on && (!hidden_copy || sizeof(float) != 4)) {
+        fprintf(stderr, "hidden snapshot allocation/float format failed\n");
+        free(hidden_copy); kvcache_free(&kv); model_free(&m); tokenizer_free(tk); return;
+    }
+    if (hidden_on) fprintf(stderr, "hidden snapshot: protocol LGH1, %d float32 values, before decode\n", m.cfg.n_embd);
 
     // The draft head (-mtp): block-2 speculative decode, same as generate().
     // A failed open falls back to plain greedy (NULL) — log either way so the
@@ -342,6 +426,8 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
         fprintf(stderr, "engine warmup: %.2fs\n", now_sec() - t0);
     }
 
+    mtp_prewarm(t, &m, &kv, tk, n_sys);
+
     sock_t ls = INVALID_SOCKET;
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
@@ -383,6 +469,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                                                          // restore repairs ring rows a long previous
                                                          // session may have wrapped over
         int saw_think = 0;                               // has this model ever opened a thought channel? (gates the seed)
+        uint32_t hidden_turn = 0;
         char line[8192], chat[8704];
         int promptv[4096];
         for (;;) {
@@ -458,6 +545,11 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                             n = tokenizer_encode(tk, chat, promptv, 4096);
                             double f0 = now_sec();
                             model_prefill_mixed(&m, &kv, NULL, promptv + skip, n - skip, pos);
+                            if (getenv("LG_TRACE_PREFILL")) {
+                                fprintf(stderr, "prefill_open at=%.6f pos=%d ids=", now_sec(), pos);
+                                for (int j = skip; j < n; j++) fprintf(stderr, "%s%d", j == skip ? "" : ",", promptv[j]);
+                                fputc('\n', stderr); fflush(stderr);
+                            }
                             pos += n - skip; total += n - skip; skip = 1;
                             tp += now_sec() - f0;
                             chat[split] = ' ';
@@ -514,8 +606,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             }
             double t0 = now_sec();
             snprintf(chat + tl, sizeof chat - tl, "%s<turn|>\n<|turn>model\n%s", line,
-                     think == 0 && saw_think ? "<|channel>thought\n<channel|>" : "");
+                     think == 0 && saw_think && !control_on ? "<|channel>thought\n<channel|>" : "");
             n = tokenizer_encode(tk, chat, promptv, 4096);
+            if (getenv("LG_TRACE_PREFILL")) {
+                fprintf(stderr, "prefill_close at=%.6f pos=%d ids=", now_sec(), pos);
+                for (int j = skip; j < n; j++) fprintf(stderr, "%s%d", j == skip ? "" : ",", promptv[j]);
+                fputc('\n', stderr); fflush(stderr);
+            }
             if (pend) {                                  // pack the held span with the tail:
                 int *ids = realloc(pend, ((size_t)pend_n + n) * sizeof *ids);
                 if (!ids) { free(pend); free(prow); fprintf(stderr, "turn buffer: out of memory\n"); break; }
@@ -531,15 +628,64 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
             best = model_forward_next(&m, &kv, promptv[n - 1], pos++);
             double t1 = now_sec();                       // prefill done (incl. the first pick)
             tp += t1 - t0;
+            if (hidden_on) {
+                double begin = now_sec();
+                if (model_copy_hidden(&m, hidden_copy, m.cfg.n_embd) != 0) break;
+                double copied = now_sec() - begin;
+                // All supported targets are little-endian IEEE754. Explicit
+                // fields avoid struct padding: magic, payload bytes, six u32,
+                // two f64, then n_embd f32. Socket order binds frame to reply.
+                const char magic[4] = {'L', 'G', 'H', '1'};
+                uint32_t size = (uint32_t)(40 + hidden_bytes);
+                uint32_t fields[6] = {1, ++hidden_turn, (uint32_t)m.cfg.n_embd,
+                    (uint32_t)m.cfg.n_layer, (uint32_t)(pos - 1),
+                    (uint32_t)(think == 0 && saw_think && !control_on)};
+                double clocks[2] = {begin, copied};
+                if (send_all(c, "\x01H", 2) || send_all(c, magic, 4) ||
+                    send_all(c, (const char *)&size, 4) ||
+                    send_all(c, (const char *)fields, sizeof fields) ||
+                    send_all(c, (const char *)clocks, sizeof clocks) ||
+                    send_all(c, (const char *)hidden_copy, (int)hidden_bytes)) break;
+            }
             int g = 0, fail = 0, barged = 0;              // g = tokens streamed this turn
+            struct turn_control control = {0};
+            if (control_on) {
+                double ready = now_sec();
+                int seeded = 0;
+                // Prepare an empty answer channel while the CPU head runs.
+                // The snapshot above stays at the original unseeded boundary.
+                if (best == ch_open) {
+                    int count = seed_reply(c, tk, &m, &kv, &pos, &best, "<|channel>thought\n<channel|>");
+                    if (count < 0) break;
+                    seeded += count; saw_think = 1;
+                }
+                double wait_begin = now_sec();
+                if (recv_turn_control(c, &control, hidden_turn)) {
+                    fprintf(stderr, "turn control missing, invalid or stale for turn %u; connection closed\n", hidden_turn);
+                    break;
+                }
+                double selected = now_sec();
+                char prefix[80];
+                snprintf(prefix, sizeof prefix, "%s%s", control.action == TURN_CONTROL_SPEAK ? "[speak]" : "[defer]",
+                         control.name ? "<speaker_name>" : "");
+                int count = seed_reply(c, tk, &m, &kv, &pos, &best, prefix);
+                if (count < 0) break;
+                seeded += count;
+                // Silent turns without a requested identity update require no
+                // generated answer, and leave no unheard candidate in history.
+                if (control.action != TURN_CONTROL_SPEAK && !control.name) best = eot;
+                fprintf(stderr, "turn_control turn=%u action=%u name=%u wait_ms=%.3f prefix_ms=%.3f channel_ms=%.3f forced_tokens=%d\n",
+                        hidden_turn, control.action, control.name, (selected-wait_begin)*1e3,
+                        (now_sec()-selected)*1e3, (wait_begin-ready)*1e3, seeded);
+            }
             double t_draft = 0, t_verify = 0;
             int n_draft = 0, n_accept = 0;
-            struct question_turn question = {0, think == 0 && saw_think};
+            struct question_turn question = {0, control_on || (think == 0 && saw_think)};
             int in_think = 0, think_n = 0;                // -think N>0: reasoning-span state
             for (;;) {                                   // stream raw token text, turn end included
                 int sig = client_signal(c);
                 if (sig == 2) { send_piece(c, "<turn|>"); barged = 1; break; }
-                if (!sig && question_turn && question_turn_reopens(&question, tokenizer_token_text(tk, best),
+                if (!sig && (control_on || question_turn) && question_turn_reopens(&question, tokenizer_token_text(tk, best),
                                                                    tokenizer_is_special(tk, best))) {
                     send_piece(c, "<turn|>");
                     fprintf(stderr, "turn ended before repeated answer channel\n");
@@ -554,13 +700,14 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     if (best == ch_close) in_think = 0;
                 }
                 if (best == eot || best == eos || pos + 1 >= SERVE_SEQ) break;
-                if (question_turn && question_turn_feed(&question, tokenizer_token_text(tk, best),
-                                                        tokenizer_is_special(tk, best))) {
+                if (turn_control_name_done(&control, tokenizer_token_text(tk, best)) ||
+                    (question_turn && question_turn_feed(&question, tokenizer_token_text(tk, best),
+                                                        tokenizer_is_special(tk, best)))) {
                     // This outer-loop token was emitted but not yet cached.
                     // Keep the question in history before the next user turn.
                     model_forward_next(&m, &kv, best, pos++);
                     send_piece(c, "<turn|>");
-                    fprintf(stderr, "turn ended after question\n");
+                    fprintf(stderr, "turn ended after question or silent identity update\n");
                     break;
                 }
                 if (g >= SERVE_GEN) {                    // runaway turn: end it ourselves
@@ -590,7 +737,7 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     pos = block_pos + e;
                     int es = client_signal(c);
                     if (es == 2) { send_piece(c, "<turn|>"); barged = 1; brk = 1; break; }
-                    if (!es && question_turn && question_turn_reopens(&question, tokenizer_token_text(tk, toks[e]),
+                    if (!es && (control_on || question_turn) && question_turn_reopens(&question, tokenizer_token_text(tk, toks[e]),
                                                                       tokenizer_is_special(tk, toks[e]))) {
                         send_piece(c, "<turn|>");
                         fprintf(stderr, "turn ended before repeated answer channel\n");
@@ -599,12 +746,13 @@ static void serve(const struct gguf_context *ctx, const char *path, const char *
                     if (es || send_piece(c, tokenizer_token_text(tk, toks[e])) != 0) { fail = 1; brk = 1; break; }
                     g++;
                     if (toks[e] == eot || toks[e] == eos || pos + 1 >= SERVE_SEQ) { brk = 1; break; }
-                    if (question_turn && question_turn_feed(&question, tokenizer_token_text(tk, toks[e]),
-                                                            tokenizer_is_special(tk, toks[e]))) {
+                    if (turn_control_name_done(&control, tokenizer_token_text(tk, toks[e])) ||
+                        (question_turn && question_turn_feed(&question, tokenizer_token_text(tk, toks[e]),
+                                                            tokenizer_is_special(tk, toks[e])))) {
                         // Verified already: retain this token, discard later drafts.
                         pos = block_pos + e + 1;
                         send_piece(c, "<turn|>");
-                        fprintf(stderr, "turn ended after question\n");
+                        fprintf(stderr, "turn ended after question or silent identity update\n");
                         brk = 1; break;
                     }
                     if (g >= SERVE_GEN) {

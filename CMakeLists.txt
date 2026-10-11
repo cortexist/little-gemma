@@ -113,6 +113,28 @@ else()
 endif()
 
 # --- tools -------------------------------------------------------------------
+# Reusable, CPU-only decision-head runner. The numerical core can be embedded
+# by hosts with their own tensor loader; the GGUF adapter reuses our reader.
+add_library(decision_head_core STATIC src/decision-head.c)
+target_include_directories(decision_head_core PUBLIC include)
+if(UNIX)
+    target_link_libraries(decision_head_core PUBLIC m)
+endif()
+add_library(decision_head_gguf STATIC src/decision-head-gguf.c src/gguf.c src/quant.c)
+target_include_directories(decision_head_gguf PUBLIC include)
+target_link_libraries(decision_head_gguf PUBLIC decision_head_core)
+add_executable(decision-head tools/decision-head.c)
+target_link_libraries(decision-head PRIVATE decision_head_gguf)
+
+# Resident FFI host support (CDLL/cdecl on Windows too). Compile separately
+# from static libraries so Windows exports and ELF PIC are unambiguous.
+add_library(decision_head SHARED src/decision-head.c src/decision-head-gguf.c src/gguf.c src/quant.c)
+target_include_directories(decision_head PUBLIC include)
+target_compile_definitions(decision_head PRIVATE DECISION_HEAD_SHARED)
+if(UNIX)
+    target_link_libraries(decision_head PRIVATE m)
+endif()
+
 # socket_cat: AF_UNIX stdin/stdout client for talking to `run -s` on systems
 # without socat (native Windows, most of all).
 add_executable(socket_cat tools/socket_cat.c)
@@ -139,3 +161,28 @@ add_test(NAME graph_test COMMAND graph_test)
 add_executable(turn_policy_test test/turn-policy.c)
 target_include_directories(turn_policy_test PRIVATE include)
 add_test(NAME turn_policy_test COMMAND turn_policy_test)
+
+add_executable(turn_control_test test/turn-control.c)
+target_include_directories(turn_control_test PRIVATE include)
+add_test(NAME turn_control_test COMMAND turn_control_test)
+
+add_executable(decision_head_test test/decision-head.c)
+target_link_libraries(decision_head_test PRIVATE decision_head_core)
+add_test(NAME decision_head_test COMMAND decision_head_test)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+        RESULT_VARIABLE LG_HAVE_NUMPY OUTPUT_QUIET ERROR_QUIET)
+    if(LG_HAVE_NUMPY EQUAL 0)
+        add_test(NAME decision_head_gguf_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/decision-head-gguf.py $<TARGET_FILE:decision-head>)
+    endif()
+endif()
+
+if(UNIX)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME socket_cat_stream COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/socket-cat.py $<TARGET_FILE:socket_cat>)
+    endif()
+endif()
